@@ -18,6 +18,8 @@
   - 延时阶段 (P3/P7): 当前阶段持续时间 >= 配置延时
 """
 
+from __future__ import annotations
+
 from enum import Enum, auto
 from crane_model import CraneState, CraneConfig
 
