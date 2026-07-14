@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from ros_bridge import get_latest_pose
 from visualizer import CraneVisualizer
 
 
@@ -71,6 +73,10 @@ def build_live_payload(
             'yMax': max(ys),
             'zMin': min(zs),
             'zMax': max(zs),
+        },
+        'velocityLimits': {
+            'xy': config.max_velocity_xy,
+            'z': config.max_velocity_z,
         },
         'phaseBoundaries': [
             {'t': round(t, 3), 'axis': axis, 'label': f'{axis.upper()} arrived'}
@@ -209,6 +215,14 @@ def render_live_html() -> str:
       font-size: 18px;
       font-variant-numeric: tabular-nums;
     }
+    .velo-label {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-top: 14px;
+      margin-bottom: 8px;
+    }
     .command {
       padding: 14px;
       border-bottom: 1px solid var(--line);
@@ -260,9 +274,36 @@ def render_live_html() -> str:
       cursor: pointer;
     }
     .apply-target:hover { background: #283b4d; }
-    .timeline {
-      padding: 14px;
+    .bottom-panel {
+      padding: 0;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      overflow: hidden;
     }
+    .tab-bar {
+      display: flex;
+      border-bottom: 1px solid var(--line);
+      background: #0f161d;
+    }
+    .tab {
+      padding: 10px 18px;
+      border: 0;
+      border-bottom: 2px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    .tab:hover { color: var(--text); }
+    .tab.active {
+      color: var(--amber);
+      border-bottom-color: var(--amber);
+    }
+    .tab-panel { display: none; padding: 14px; overflow-y: auto; }
+    .tab-panel.active { display: block; }
     .track {
       height: 16px;
       border-radius: 3px;
@@ -299,6 +340,145 @@ def render_live_html() -> str:
       border-bottom: 1px solid rgba(52, 70, 87, 0.55);
       padding-bottom: 7px;
     }
+    .loco-status {
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 12px;
+      color: var(--muted);
+    }
+    .loco-table {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 1px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      overflow: hidden;
+      background: var(--line);
+    }
+    .loco-table > div {
+      padding: 8px 10px;
+      background: #131c25;
+    }
+    .loco-hdr {
+      color: var(--muted);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      background: #0f161d;
+    }
+    .loco-axis {
+      color: var(--amber);
+      font-size: 12px;
+      font-weight: 700;
+      text-align: center;
+    }
+    .loco-val {
+      font-size: 15px;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      text-align: right;
+    }
+    .loco-timestamp {
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+    }
+    .plc-status-bar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 12px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .plc-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+      background: var(--red);
+      flex-shrink: 0;
+    }
+    .plc-dot.on { background: var(--green); animation: plc-blink 1.2s ease-in-out infinite; }
+    @keyframes plc-blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.25; }
+    }
+    .plc-sep { color: var(--line); margin: 0 4px; font-weight: 400; }
+    .ctrl-grid-2x4 {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      overflow: hidden;
+      background: var(--line);
+      margin-bottom: 10px;
+    }
+    .ctrl-grid-2x4 > div {
+      padding: 8px 6px;
+      background: #131c25;
+      text-align: center;
+    }
+    .ctrl-hdr {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--amber);
+      font-weight: 700;
+      background: #0f161d !important;
+    }
+    .ctrl-val {
+      font-size: 18px;
+      font-variant-numeric: tabular-nums;
+      font-weight: 700;
+      color: var(--text);
+      transition: color 0.3s, background 0.3s;
+    }
+    .ctrl-val.flash { color: #000; background: var(--amber); }
+    .ctrl-val.gripper { font-size: 12px; color: var(--muted); font-style: italic; }
+    .btn-row {
+      display: flex;
+      gap: 8px;
+    }
+    .btn-row .btn-stop { flex: 1; }
+    .btn-row .btn-reset { flex: 1; }
+    .ctrl-action-msg {
+      margin-top: 12px;
+      font-size: 12px;
+      font-weight: 600;
+      min-height: 18px;
+    }
+    .btn-stop {
+      margin-top: 10px;
+      padding: 12px 10px;
+      border: 2px solid var(--red);
+      border-radius: 4px;
+      background: rgba(224, 90, 71, 0.18);
+      color: var(--red);
+      font: inherit;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-stop:hover { background: rgba(224, 90, 71, 0.35); }
+    .btn-reset {
+      margin-top: 10px;
+      padding: 10px;
+      border: 1px solid #45637a;
+      border-radius: 4px;
+      background: #203040;
+      color: var(--text);
+      font: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-reset:hover { background: #283b4d; }
     @media (max-width: 980px) {
       .shell { grid-template-columns: 1fr; }
       canvas { min-height: 520px; }
@@ -327,6 +507,12 @@ def render_live_html() -> str:
           <div class="coord"><span>Y Trolley</span><strong id="y">0.00</strong></div>
           <div class="coord"><span>Z Hoist</span><strong id="z">0.00</strong></div>
         </div>
+        <div class="velo-label">Velocity</div>
+        <div class="coords">
+          <div class="coord" id="coordVx"><span>Vx Bridge</span><strong id="vx" style="color:#5ebd72">0.00</strong></div>
+          <div class="coord" id="coordVy"><span>Vy Trolley</span><strong id="vy" style="color:#5ebd72">0.00</strong></div>
+          <div class="coord" id="coordVz"><span>Vz Hoist</span><strong id="vz" style="color:#5ebd72">0.00</strong></div>
+        </div>
       </section>
       <section class="command">
         <div class="command-title">Target Command</div>
@@ -337,10 +523,59 @@ def render_live_html() -> str:
         </div>
         <button class="apply-target" id="applyTarget" type="button">Apply Target</button>
       </section>
-      <section class="timeline">
-        <div class="track"><div class="progress" id="progress"></div></div>
-        <div class="ticks"><span id="startTime">0.0s</span><span id="endTime">0.0s</span></div>
-        <div class="log" id="phaseLog"></div>
+      <section class="bottom-panel">
+        <nav class="tab-bar">
+          <button class="tab active" data-tab="progress">Progress</button>
+          <button class="tab" data-tab="localization">Localization</button>
+          <button class="tab" data-tab="control">Control</button>
+        </nav>
+        <div class="tab-panel active" id="tab-progress">
+          <div class="track"><div class="progress" id="progress"></div></div>
+          <div class="ticks"><span id="startTime">0.0s</span><span id="endTime">0.0s</span></div>
+          <div class="log" id="phaseLog"></div>
+        </div>
+        <div class="tab-panel" id="tab-localization">
+          <div class="loco-status" id="locoStatus">Waiting for /localization_pose...</div>
+          <div class="loco-table">
+            <div class="loco-hdr"></div>
+            <div class="loco-hdr">Position (m)</div>
+            <div class="loco-hdr">Velocity (m/s)</div>
+            <div class="loco-axis">X</div>
+            <div class="loco-val" id="locoX">--</div>
+            <div class="loco-val" id="locoVx">--</div>
+            <div class="loco-axis">Y</div>
+            <div class="loco-val" id="locoY">--</div>
+            <div class="loco-val" id="locoVy">--</div>
+            <div class="loco-axis">Z</div>
+            <div class="loco-val" id="locoZ">--</div>
+            <div class="loco-val" id="locoVz">--</div>
+          </div>
+          <div class="loco-timestamp" id="locoTimestamp">--</div>
+        </div>
+        <div class="tab-panel" id="tab-control">
+          <div class="plc-status-bar">
+            <span class="plc-dot" id="plcDot"></span>
+            <span id="plcStatusText">PLC</span>
+            <span class="plc-sep"></span>
+            <span class="plc-dot" id="hbDot"></span>
+            <span id="hbStatusText">Heartbeat</span>
+          </div>
+          <div class="ctrl-grid-2x4">
+            <div class="ctrl-hdr">X Bridge</div>
+            <div class="ctrl-hdr">Y Trolley</div>
+            <div class="ctrl-hdr">Z Hoist</div>
+            <div class="ctrl-hdr">Gripper</div>
+            <div class="ctrl-val" id="ctrlVx">--</div>
+            <div class="ctrl-val" id="ctrlVy">--</div>
+            <div class="ctrl-val" id="ctrlHz">--</div>
+            <div class="ctrl-val gripper" id="ctrlGrip">--</div>
+          </div>
+          <div class="ctrl-action-msg" id="ctrlMsg"></div>
+          <div class="btn-row">
+            <button class="btn-stop" id="btnStop">STOP ALL</button>
+            <button class="btn-reset" id="btnReset">Reset Control</button>
+          </div>
+        </div>
       </section>
     </aside>
   </main>
@@ -360,6 +595,12 @@ def render_live_html() -> str:
       x: document.getElementById('x'),
       y: document.getElementById('y'),
       z: document.getElementById('z'),
+      vx: document.getElementById('vx'),
+      vy: document.getElementById('vy'),
+      vz: document.getElementById('vz'),
+      coordVx: document.getElementById('coordVx'),
+      coordVy: document.getElementById('coordVy'),
+      coordVz: document.getElementById('coordVz'),
       targetX: document.getElementById('targetX'),
       targetY: document.getElementById('targetY'),
       targetZ: document.getElementById('targetZ'),
@@ -368,6 +609,25 @@ def render_live_html() -> str:
       startTime: document.getElementById('startTime'),
       endTime: document.getElementById('endTime'),
       phaseLog: document.getElementById('phaseLog'),
+      locoStatus: document.getElementById('locoStatus'),
+      locoX: document.getElementById('locoX'),
+      locoY: document.getElementById('locoY'),
+      locoZ: document.getElementById('locoZ'),
+      locoVx: document.getElementById('locoVx'),
+      locoVy: document.getElementById('locoVy'),
+      locoVz: document.getElementById('locoVz'),
+      locoTimestamp: document.getElementById('locoTimestamp'),
+      ctrlVx: document.getElementById('ctrlVx'),
+      ctrlVy: document.getElementById('ctrlVy'),
+      ctrlHz: document.getElementById('ctrlHz'),
+      ctrlGrip: document.getElementById('ctrlGrip'),
+      ctrlMsg: document.getElementById('ctrlMsg'),
+      plcDot: document.getElementById('plcDot'),
+      hbDot: document.getElementById('hbDot'),
+      plcStatusText: document.getElementById('plcStatusText'),
+      hbStatusText: document.getElementById('hbStatusText'),
+      btnStop: document.getElementById('btnStop'),
+      btnReset: document.getElementById('btnReset'),
     };
 
     function resize() {
@@ -612,6 +872,13 @@ def render_live_html() -> str:
       drawHoistProfile(boxes.zbox, r, current);
     }
 
+    function speedColor(absV, limit) {
+      const ratio = absV / (limit || 1);
+      if (ratio < 0.33) return '#5ebd72';
+      if (ratio < 0.66) return '#f0a83b';
+      return '#e05a47';
+    }
+
     function renderStatus() {
       const f = payload.frames[frame];
       const total = payload.frames[payload.frames.length - 1].t;
@@ -623,6 +890,28 @@ def render_live_html() -> str:
       els.y.textContent = f.y.toFixed(2);
       els.z.textContent = f.z.toFixed(2);
       els.progress.style.width = `${Math.min(100, (f.t / total) * 100)}%`;
+
+      const xyLimit = payload.velocityLimits.xy;
+      const zLimit = payload.velocityLimits.z;
+      els.vx.textContent = f.vx.toFixed(2);
+      els.vy.textContent = f.vy.toFixed(2);
+      els.vz.textContent = f.vz.toFixed(2);
+
+      const vxColor = speedColor(Math.abs(f.vx), xyLimit);
+      const vyColor = speedColor(Math.abs(f.vy), xyLimit);
+      const vzColor = speedColor(Math.abs(f.vz), zLimit);
+      els.coordVx.style.borderColor = vxColor;
+      els.coordVy.style.borderColor = vyColor;
+      els.coordVz.style.borderColor = vzColor;
+      els.vx.style.color = vxColor;
+      els.vy.style.color = vyColor;
+      els.vz.style.color = vzColor;
+
+      // Control tab — update values from replay frame (no flash)
+      els.ctrlVx.textContent = f.vxCmd.toFixed(3) + ' m/s';
+      els.ctrlVy.textContent = f.vyCmd.toFixed(3) + ' m/s';
+      els.ctrlHz.textContent = f.z.toFixed(3) + ' m';
+      els.ctrlGrip.textContent = '--';
     }
 
     function renderTargetControls() {
@@ -684,6 +973,128 @@ def render_live_html() -> str:
       });
 
     window.addEventListener('resize', resize);
+
+    // Tab switching
+    document.querySelectorAll('.tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.tab, .tab-panel').forEach(el => el.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+      });
+    });
+
+    // SSE stream for real-time localization data
+    const locoSource = new EventSource('/localization/stream');
+    locoSource.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      els.locoX.textContent = data.x.toFixed(3);
+      els.locoY.textContent = data.y.toFixed(3);
+      els.locoZ.textContent = data.z.toFixed(3);
+      els.locoVx.textContent = data.vx.toFixed(3);
+      els.locoVy.textContent = data.vy.toFixed(3);
+      els.locoVz.textContent = data.vz.toFixed(3);
+      const stamp = data.stamp_sec + data.stamp_nsec * 1e-9;
+      els.locoTimestamp.textContent = 'Stamp: ' + new Date(stamp * 1000).toLocaleTimeString();
+      els.locoStatus.textContent = 'Connected — /localization_pose';
+      els.locoStatus.style.color = '#5ebd72';
+    };
+    locoSource.onerror = () => {
+      els.locoStatus.textContent = 'Disconnected — waiting for data...';
+      els.locoStatus.style.color = '#e05a47';
+    };
+
+    // Control tab — PLC status polling (2 Hz), flash on PLC command change
+    let _lastPlcVx = null, _lastPlcVy = null, _lastPlcHz = null;
+    function pollPlcStatus() {
+      fetch('/api/plc-status')
+        .then(r => r.json())
+        .then(s => {
+          // PLC connection — green when connected, red when not
+          if (s.connected) {
+            els.plcDot.classList.add('on');
+            els.plcStatusText.textContent = 'PLC';
+            els.plcStatusText.style.color = 'var(--green)';
+          } else {
+            els.plcDot.classList.remove('on');
+            els.plcStatusText.textContent = 'PLC';
+            els.plcStatusText.style.color = 'var(--red)';
+          }
+          // Heartbeat — green when healthy, red when not
+          if (s.heartbeat) {
+            els.hbDot.classList.add('on');
+            els.hbStatusText.textContent = 'Heartbeat';
+            els.hbStatusText.style.color = 'var(--green)';
+          } else {
+            els.hbDot.classList.remove('on');
+            els.hbStatusText.textContent = 'Heartbeat';
+            els.hbStatusText.style.color = 'var(--red)';
+          }
+          // Flash cells only when PLC actually sent a new command
+          function maybeFlash(el, newVal, lastVal) {
+            const txt = newVal.toFixed(3) + ' m/s';
+            if (lastVal !== null && Math.abs(newVal - lastVal) > 0.001) {
+              el.textContent = txt;
+              el.classList.add('flash');
+              setTimeout(() => el.classList.remove('flash'), 400);
+              return newVal;
+            }
+            return lastVal;
+          }
+          _lastPlcVx = maybeFlash(els.ctrlVx, s.last_vx, _lastPlcVx);
+          _lastPlcVy = maybeFlash(els.ctrlVy, s.last_vy, _lastPlcVy);
+          // Z height flash (m)
+          {
+            const txt = s.last_hz.toFixed(3) + ' m';
+            if (_lastPlcHz !== null && Math.abs(s.last_hz - _lastPlcHz) > 0.001) {
+              els.ctrlHz.textContent = txt;
+              els.ctrlHz.classList.add('flash');
+              setTimeout(() => els.ctrlHz.classList.remove('flash'), 400);
+            }
+            _lastPlcHz = s.last_hz;
+          }
+        })
+        .catch(() => {
+          els.plcDot.classList.remove('on');
+          els.plcStatusText.style.color = 'var(--red)';
+          els.hbDot.classList.remove('on');
+          els.hbStatusText.style.color = 'var(--red)';
+        });
+    }
+    pollPlcStatus();
+    setInterval(pollPlcStatus, 500);
+
+    // Control tab — STOP ALL / Reset buttons
+    els.btnStop.addEventListener('click', () => {
+      els.btnStop.disabled = true;
+      els.btnStop.textContent = 'STOPPING...';
+      fetch('/api/stop')
+        .then(r => r.json())
+        .then(() => {
+          els.ctrlMsg.textContent = 'STOPPED — All axes set to zero';
+          els.ctrlMsg.style.color = '#e05a47';
+          els.btnStop.textContent = 'STOP ALL';
+          els.btnStop.disabled = false;
+        })
+        .catch(() => {
+          els.ctrlMsg.textContent = 'Failed to send stop command';
+          els.ctrlMsg.style.color = '#e05a47';
+          els.btnStop.textContent = 'STOP ALL';
+          els.btnStop.disabled = false;
+        });
+    });
+
+    els.btnReset.addEventListener('click', () => {
+      els.btnReset.disabled = true;
+      els.btnReset.textContent = 'RESETTING...';
+      fetch('/api/reset')
+        .then(r => r.json())
+        .then(() => {
+          els.ctrlMsg.textContent = 'RESET — Control restored';
+          els.ctrlMsg.style.color = '#5ebd72';
+          els.btnReset.textContent = 'Reset Control';
+          els.btnReset.disabled = false;
+        });
+    });
   </script>
 </body>
 </html>"""
@@ -711,18 +1122,86 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                 return
             body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
             self._write(200, 'application/json; charset=utf-8', body)
+        elif parsed.path == '/localization/stream':
+            self._stream_localization()
+        elif parsed.path == '/api/stop':
+            self._handle_stop()
+        elif parsed.path == '/api/reset':
+            self._handle_reset()
+        elif parsed.path == '/api/plc-status':
+            self._handle_plc_status()
         else:
             self._write(404, 'text/plain; charset=utf-8', b'not found')
+
+    def _stream_localization(self):
+        """SSE endpoint that streams the latest /localization_pose data at ~10 Hz."""
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'keep-alive')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        try:
+            while True:
+                pose = get_latest_pose()
+                if pose is not None:
+                    data = json.dumps(pose, ensure_ascii=False)
+                    self.wfile.write(f'data: {data}\n\n'.encode('utf-8'))
+                    self.wfile.flush()
+                else:
+                    # Heartbeat comment to keep connection alive
+                    self.wfile.write(': waiting for /localization_pose\n\n'.encode('utf-8'))
+                    self.wfile.flush()
+                time.sleep(0.1)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _handle_stop(self):
+        """STOP ALL: send zero velocity to all three axes (matches demo.cpp pattern)."""
+        plc = self.server.plc
+        if plc is not None:
+            plc.big_car_ctrl(0.0)
+            plc.small_car_ctrl(0.0)
+            plc.lift_ctrl(0.0)
+        self._write(200, 'application/json; charset=utf-8', b'{"ok":true}')
+
+    def _handle_reset(self):
+        """Reset PLC control after emergency stop."""
+        plc = self.server.plc
+        if plc is not None:
+            plc.reset()
+        self._write(200, 'application/json; charset=utf-8', b'{"ok":true}')
+
+    def _handle_plc_status(self):
+        """Return PLC connection, heartbeat, and last-sent command values."""
+        plc = self.server.plc
+        if plc is None:
+            body = json.dumps({
+                'connected': False, 'heartbeat': False, 'mode': 'none',
+                'last_vx': 0.0, 'last_vy': 0.0, 'last_hz': 0.0, 'last_vz': 0.0,
+            })
+        else:
+            body = json.dumps({
+                'connected': plc.check_connection(),
+                'heartbeat': plc.heartbeat_healthy,
+                'mode': 'mock' if type(plc).__name__ == 'MockPLC' else 'real',
+                'last_vx': getattr(plc, 'last_vx', 0.0),
+                'last_vy': getattr(plc, 'last_vy', 0.0),
+                'last_hz': getattr(plc, 'last_hz', 0.0),
+                'last_vz': getattr(plc, 'last_vz', 0.0),
+            })
+        self._write(200, 'application/json; charset=utf-8', body.encode('utf-8'))
 
     def log_message(self, format, *args):
         return
 
 
 class CraneLiveServer(ThreadingHTTPServer):
-    def __init__(self, server_address, payload, payload_factory=None):
+    def __init__(self, server_address, payload, payload_factory=None, plc=None):
         super().__init__(server_address, _LiveRequestHandler)
         self.payload = payload
         self.payload_factory = payload_factory
+        self.plc = plc  # PLC instance for interactive control (stop/reset)
 
     def build_payload(self, query: dict[str, list[str]]) -> dict[str, Any]:
         if self.payload_factory is None:
@@ -744,10 +1223,11 @@ def serve_live_view(
     host: str = '127.0.0.1',
     port: int = 8000,
     payload_factory=None,
+    plc=None,
 ):
     """Start a blocking browser live-view server."""
     selected_port = _find_available_port(host, port)
-    server = CraneLiveServer((host, selected_port), payload, payload_factory=payload_factory)
+    server = CraneLiveServer((host, selected_port), payload, payload_factory=payload_factory, plc=plc)
     actual_host, actual_port = server.server_address
     url = f'http://{actual_host}:{actual_port}'
     print(f'Live view: {url}')

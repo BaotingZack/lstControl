@@ -1,5 +1,7 @@
 """Velocity estimation from noisy position measurements."""
 
+from __future__ import annotations
+
 import math
 
 

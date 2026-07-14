@@ -11,6 +11,8 @@
 再根据位置误差和滤波后的差分速度生成速度模式伺服的速度设定值。
 """
 
+from __future__ import annotations
+
 
 class PositionPDController:
     """位置目标到速度指令的控制器。

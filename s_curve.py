@@ -33,6 +33,8 @@ S曲线 (S-Curve) 是工业伺服系统中广泛使用的轨迹规划方法,
     Machines and Robots", Springer, 2008.
 """
 
+from __future__ import annotations
+
 import math
 
 
