@@ -22,6 +22,8 @@ import threading
 import time
 from typing import Any
 
+from crane_model import CraneState
+
 
 # ---------------------------------------------------------------------------
 # Common interface
@@ -379,3 +381,95 @@ def create_plc(lib_path: str = 'plc_lib/lib/libsscarctrl.so', verbose: bool = Fa
         print(f'[PLC] Cannot load {lib_path}: {exc}')
         print('[PLC] Falling back to MockPLC (print-based)')
         return MockPLC(verbose=verbose)
+
+
+# ============================================================================
+# PlcActuator — 适配统一 PD 控制循环的 Actuator 接口
+# ============================================================================
+
+class PlcActuator:
+    """PLC 执行器 — 封装真实 PLC 指令发送。
+
+    实现 Actuator 接口，用于 PLC 模式的 run_pd_control()。
+
+    职责:
+      - 速度指令通过 deadband 过滤后发送到 PLC
+      - Z 轴: 将速度指令积分为绝对高度, 再调用 liftctrl()
+      - 始终更新 plc.last_vx/vy/vz/hz 供前端轮询
+      - 紧急停止
+    """
+
+    _DEADBAND = 0.005  # [m/s or m] 最小变化阈值
+    _Z_CLAMP_MARGIN = 1.0  # [m] Z 轴高度上限 (当前位置 + 此值)
+
+    def __init__(self, plc: PLCInterface, initial_z: float = 0.0):
+        self._plc = plc
+        self._z_height = initial_z          # Z 轴绝对高度积分值
+        self._last_vx: float | None = None
+        self._last_vy: float | None = None
+        self._last_vz_cmd: float | None = None
+        self._last_log: float = 0.0          # 上次 PD 日志时间
+
+    _log_interval = 1.0  # [s] PD 输出日志最小间隔
+
+    def apply(self, vx: float, vy: float, vz: float, dt: float) -> None:
+        """发送速度指令到 PLC。
+
+        X/Y 轴: 直接发送速度指令 (含 deadband 过滤)
+        Z 轴:   vz * dt 积分 → 绝对高度 → liftctrl()
+        """
+        # 定期打印 PD 输出 (每秒最多一次, 避免刷屏)
+        now = time.time()
+        if not hasattr(self, '_last_log') or now - self._last_log > self._log_interval:
+            print(f'[PD] v_cmd=(x={vx:+.4f}, y={vy:+.4f}, z={vz:+.4f}) m/s  z_h={self._z_height:.3f}m')
+            self._last_log = now
+
+        # X 轴
+        self._plc.last_vx = vx  # 始终更新, 供前端轮询
+        if self._last_vx is None or abs(vx - self._last_vx) > self._DEADBAND:
+            self._plc.big_car_ctrl(vx)
+            self._last_vx = vx
+
+        # Y 轴
+        self._plc.last_vy = vy
+        if self._last_vy is None or abs(vy - self._last_vy) > self._DEADBAND:
+            self._plc.small_car_ctrl(vy)
+            self._last_vy = vy
+
+        # Z 轴 — 积分速度 → 绝对高度
+        self._z_height += vz * dt
+        self._z_height = max(0.0, self._z_height)
+        self._plc.last_vz = vz
+        self._plc.last_hz = self._z_height
+        if self._last_vz_cmd is None or abs(vz - self._last_vz_cmd) > self._DEADBAND:
+            self._plc.lift_ctrl(self._z_height)
+            self._last_vz_cmd = vz
+
+    def update_state(self, state: CraneState, position: dict) -> None:
+        """从 /localization_pose 数据更新 CraneState。
+
+        位置直接来自定位, 速度使用 Odometry 原生速度 (若可用) 或 PD 指令速度。
+        """
+        state.x.position = position['x']
+        state.y.position = position['y']
+        state.z.position = position['z']
+
+        # 优先使用 Odometry 原生速度, 若不可用则保留 PD cmd (在 run_pd_control 中设置)
+        if position.get('vx') is not None:
+            state.x.velocity = position['vx']
+            state.y.velocity = position['vy']
+            state.z.velocity = position['vz']
+
+    def emergency_stop(self) -> None:
+        """安全停止 — 匹配 demo.cpp STOP ALL 模式。"""
+        self._plc.big_car_ctrl(0.0)
+        self._plc.small_car_ctrl(0.0)
+        self._plc.lift_ctrl(0.0)
+        self._plc.last_vx = 0.0
+        self._plc.last_vy = 0.0
+        self._plc.last_vz = 0.0
+        self._last_vx = self._last_vy = self._last_vz_cmd = None
+
+    def cleanup(self) -> None:
+        """控制结束后的清理 (PLC 连接保持, 仅重置内部状态)。"""
+        pass
