@@ -6,7 +6,19 @@ PLC 每个周期读取位置反馈，估计并滤波速度，使用 PD 输出速
 
   v_cmd = Kp * (target_position - measured_position) - Kd * filtered_velocity
 
-被控对象模拟速度模式伺服的一阶响应，并叠加低频扰动和测量噪声。
+两种运行模式 (通过 --plc-ip 自动切换):
+
+  仿真模式 (无 --plc-ip):
+    - 位置反馈来自仿真对象模型 (CranePlant)
+    - 100 Hz 固定步长
+    - 命令行动目标, 启动后自动运行
+    - --live 时浏览器回放已完成的仿真
+
+  PLC 模式 (指定 --plc-ip):
+    - 位置反馈来自 ROS /localization_pose (10 Hz)
+    - 10 Hz 事件驱动, 跟随定位数据节奏
+    - 开 UI 后设置 Target → Apply Target → 开始 PD 控制
+    - SSE 实时推送状态到浏览器
 """
 
 from __future__ import annotations
@@ -18,32 +30,23 @@ matplotlib.use('Agg')
 import argparse
 import time
 
-from crane_model import CraneConfig, CranePlant, CraneState
+from crane_model import (
+    CraneConfig,
+    CranePlant,
+    CraneState,
+    PlantActuator,
+    SimPositionSource,
+    run_pd_control,
+)
 from live_server import build_live_payload, serve_live_view
-from pd_controller import PositionPDController
-from plc_interface import create_plc, PLCInterface
-from ros_bridge import get_latest_pose, start_ros_bridge
-from velocity_filter import LowPassVelocityEstimator
+from plc_interface import PlcActuator, create_plc
+from ros_bridge import RosPositionSource, get_latest_pose, start_ros_bridge
 from visualizer import CraneVisualizer
 
 
-def _axis_arrived(axis, target: float, config: CraneConfig) -> bool:
-    pos_ok = abs(axis.position - target) < config.arrival_pos_tol
-    vel_ok = abs(axis.velocity) < config.arrival_vel_tol
-    return pos_ok and vel_ok
-
-
-def _copy_state(initial_state: CraneState) -> CraneState:
-    crane = CraneState(
-        x0=initial_state.x.position,
-        y0=initial_state.y.position,
-        z0=initial_state.z.position,
-    )
-    crane.x.velocity = initial_state.x.velocity
-    crane.y.velocity = initial_state.y.velocity
-    crane.z.velocity = initial_state.z.velocity
-    return crane
-
+# ============================================================================
+# 兼容旧接口 — 仿真模式一键运行
+# ============================================================================
 
 def run_simulation(
     target_pos: tuple[float, float, float],
@@ -51,169 +54,30 @@ def run_simulation(
     config: CraneConfig,
     verbose: bool = True,
     max_time: float | None = 180.0,
-    plc: PLCInterface | None = None,
 ) -> tuple[list[dict], list[tuple[float, str]]]:
-    """Run one dispatch target command until all three axes arrive.
+    """仿真模式: 使用 plant model 运行一次 PD 控制到完成。
 
-    When *plc* is provided, velocity commands are sent to the real PLC
-    instead of the simulated plant.  Z-axis velocity is integrated to an
-    absolute height for ``liftctrl``.
+    此函数是对 run_pd_control() 的薄封装, 保持与旧代码/测试的兼容性。
+    PLC 模式请直接使用 run_pd_control() + RosPositionSource + PlcActuator。
     """
-    dt = config.dt
-    crane = _copy_state(initial_state)
     plant = CranePlant(config)
-    target_x, target_y, target_z = target_pos
+    source = SimPositionSource(plant, initial_state, config)
+    actuator = PlantActuator(plant, initial_state, config)
+    return run_pd_control(
+        source=source,
+        actuator=actuator,
+        config=config,
+        target_pos=target_pos,
+        initial_state=initial_state,
+        verbose=verbose,
+        max_time=max_time,
+        is_simulation=True,
+    )
 
-    controllers = {
-        'x': PositionPDController(config.kp_pos, config.kd_pos, config.max_velocity_xy),
-        'y': PositionPDController(config.kp_pos, config.kd_pos, config.max_velocity_xy),
-        'z': PositionPDController(config.kp_pos, config.kd_pos, config.max_velocity_z),
-    }
-    filters = {
-        'x': LowPassVelocityEstimator(config.velocity_filter_tau, crane.x.position, crane.x.velocity),
-        'y': LowPassVelocityEstimator(config.velocity_filter_tau, crane.y.position, crane.y.velocity),
-        'z': LowPassVelocityEstimator(config.velocity_filter_tau, crane.z.position, crane.z.velocity),
-    }
 
-    history: list[dict] = []
-    arrival_events: list[tuple[float, str]] = []
-    locked = {'x': False, 'y': False, 'z': False}
-    t = 0.0
-
-    # Initial PD outputs (updated each cycle, or held when localization unchanged)
-    vx_cmd = vy_cmd = vz_cmd = 0.0
-    vx_raw = vy_raw = vz_raw = 0.0
-    vx_filtered = vy_filtered = vz_filtered = 0.0
-
-    # Z-axis height tracking for liftctrl (which takes absolute height, not velocity)
-    z_target_height = crane.z.position  # current hoist height as starting point
-
-    # Per-axis last-sent values — only send when change exceeds deadband.
-    _last_vx: float | None = None
-    _last_vy: float | None = None
-    _last_vz_cmd: float | None = None
-    _DEADBAND = 0.005  # m/s or m — minimum change to trigger PLC send
-
-    # Localization tracking — /localization_pose is 10 Hz, only update PD on new data
-    _last_pose_stamp: float | None = None
-
-    mode_label = 'PLC' if plc is not None else '仿真'
-    if verbose:
-        print(f"=== 起重机 PD 速度控制{mode_label} ===")
-        print(f"初始位置: X={crane.x.position:.2f}, Y={crane.y.position:.2f}, Z={crane.z.position:.2f}")
-        print(f"目标位置: X={target_x:.2f}, Y={target_y:.2f}, Z={target_z:.2f}")
-        print("=" * 50)
-
-    while not all(locked.values()):
-        if max_time is not None and t > max_time:
-            raise TimeoutError(f"Simulation did not finish within {max_time:.2f}s (t={t:.2f}s)")
-
-        # --- STEP 1: Measure positions ---
-        has_localization = False
-        new_pose_arrived = False
-        if plc is not None:
-            pose = get_latest_pose()
-            if pose is not None:
-                stamp = pose['stamp_sec'] + pose['stamp_nsec'] * 1e-9
-                if stamp != _last_pose_stamp:
-                    x_measured = pose['x']
-                    y_measured = pose['y']
-                    z_measured = pose['z']
-                    _last_pose_stamp = stamp
-                    has_localization = True
-                    new_pose_arrived = True
-
-        if not has_localization:
-            x_measured = plant.measure_position('x', crane.x.position)
-            y_measured = plant.measure_position('y', crane.y.position)
-            z_measured = plant.measure_position('z', crane.z.position)
-
-        # --- STEP 2-3: PD update — only on new data when using localization ---
-        if has_localization and not new_pose_arrived:
-            # Localization hasn't updated yet — keep previous velocity command
-            pass
-        else:
-            vx_raw, vx_filtered = filters['x'].update(x_measured, dt)
-            vy_raw, vy_filtered = filters['y'].update(y_measured, dt)
-            vz_raw, vz_filtered = filters['z'].update(z_measured, dt)
-
-            vx_cmd = 0.0 if locked['x'] else controllers['x'].update(target_x, x_measured, vx_filtered)
-            vy_cmd = 0.0 if locked['y'] else controllers['y'].update(target_y, y_measured, vy_filtered)
-            vz_cmd = 0.0 if locked['z'] else controllers['z'].update(target_z, z_measured, vz_filtered)
-
-        # --- STEP 4: Send PLC commands (if connected) ---
-        if plc is not None:
-            if _last_vx is None or abs(vx_cmd - _last_vx) > _DEADBAND:
-                plc.big_car_ctrl(vx_cmd)
-                plc.last_vx = vx_cmd
-                _last_vx = vx_cmd
-            if _last_vy is None or abs(vy_cmd - _last_vy) > _DEADBAND:
-                plc.small_car_ctrl(vy_cmd)
-                plc.last_vy = vy_cmd
-                _last_vy = vy_cmd
-            if not locked['z']:
-                z_target_height += vz_cmd * dt
-                z_target_height = max(0.0, min(z_target_height, crane.z.position + 1.0))
-            if _last_vz_cmd is None or abs(vz_cmd - _last_vz_cmd) > _DEADBAND:
-                plc.lift_ctrl(z_target_height)
-                plc.last_hz = z_target_height
-                plc.last_vz = vz_cmd
-                _last_vz_cmd = vz_cmd
-
-        # --- STEP 4b: Update position ---
-        if has_localization:
-            # Real localization — position comes from /localization_pose
-            crane.x.position = x_measured
-            crane.y.position = y_measured
-            crane.z.position = z_measured
-            crane.x.velocity = vx_cmd
-            crane.y.velocity = vy_cmd
-            crane.z.velocity = vz_cmd
-            disturbance_x = disturbance_y = disturbance_z = 0.0
-        else:
-            # Simulation plant — position from servo model
-            disturbance_x = plant.update_axis('x', crane.x, vx_cmd, target_x, locked['x'], dt, t)
-            disturbance_y = plant.update_axis('y', crane.y, vy_cmd, target_y, locked['y'], dt, t)
-            disturbance_z = plant.update_axis('z', crane.z, vz_cmd, target_z, locked['z'], dt, t)
-
-        # --- STEP 5: Arrival detection ---
-        axis_data = [
-            ('x', crane.x, target_x, vx_cmd),
-            ('y', crane.y, target_y, vy_cmd),
-            ('z', crane.z, target_z, vz_cmd),
-        ]
-        for name, axis, target, cmd in axis_data:
-            in_capture_window = abs(axis.position - target) < config.arrival_capture_pos_tol
-            command_settled = abs(cmd) < config.arrival_cmd_tol
-            if not locked[name] and (_axis_arrived(axis, target, config) or (in_capture_window and command_settled)):
-                axis.position = target
-                axis.velocity = 0.0
-                locked[name] = True
-                arrival_events.append((t, name))
-
-        # --- STEP 6: Record history ---
-        history.append({
-            't': t,
-            'x': crane.x.position, 'y': crane.y.position, 'z': crane.z.position,
-            'vx': crane.x.velocity, 'vy': crane.y.velocity, 'vz': crane.z.velocity,
-            'p_ref_x': target_x, 'p_ref_y': target_y, 'p_ref_z': target_z,
-            'v_ref_x': 0.0, 'v_ref_y': 0.0, 'v_ref_z': 0.0,
-            'vx_cmd': vx_cmd, 'vy_cmd': vy_cmd, 'vz_cmd': vz_cmd,
-            'x_measured': x_measured, 'y_measured': y_measured, 'z_measured': z_measured,
-            'vx_raw': vx_raw, 'vy_raw': vy_raw, 'vz_raw': vz_raw,
-            'vx_filtered': vx_filtered, 'vy_filtered': vy_filtered, 'vz_filtered': vz_filtered,
-            'disturbance_x': disturbance_x, 'disturbance_y': disturbance_y, 'disturbance_z': disturbance_z,
-        })
-        t += dt
-
-    if verbose:
-        final = history[-1]
-        print("=" * 50)
-        print(f"{mode_label}完成! 总时间: {final['t']:.2f}s")
-        print(f"最终位置: X={final['x']:.3f}, Y={final['y']:.3f}, Z={final['z']:.3f}")
-
-    return history, arrival_events
-
+# ============================================================================
+# CLI
+# ============================================================================
 
 def _build_arg_parser():
     parser = argparse.ArgumentParser(description='Bridge crane target-position control simulation')
@@ -262,17 +126,17 @@ def main(argv=None):
         kd_pos=0.45,
         dt=0.01,
     )
-    crane0 = CraneState(x0=0.0, y0=0.0, z0=5.0)
+    crane0 = CraneState(x0=0.0, y0=0.0, z0=0.0)
     target_pos = (args.target_x, args.target_y, args.target_z)
 
-    # Create PLC interface if PLC IP is specified
-    plc = None
+    # ---- PLC 模式 ----
     if args.plc_ip:
         plc = create_plc(lib_path=args.plc_lib)
         plc.connect(args.plc_ip)
         plc.start_heartbeat()
         start_ros_bridge()
-        # Wait for first localization pose (timeout 5s)
+
+        # 等待首次定位数据 (超时 5s)
         print('Waiting for /localization_pose...')
         waited = 0.0
         while get_latest_pose() is None and waited < 5.0:
@@ -286,18 +150,65 @@ def main(argv=None):
         else:
             print('Warning: /localization_pose timeout, using default initial position')
 
+        initial_pos = (crane0.x.position, crane0.y.position, crane0.z.position)
+
+        if args.live:
+            # PLC 实时控制模式: 开 UI, 等用户 Apply Target
+            ros_source = RosPositionSource()
+            plc_actuator = PlcActuator(plc, initial_z=crane0.z.position)
+
+            print(f'Live view starting — set target in browser and click "Apply Target"')
+            serve_live_view(
+                payload=None,  # PLC 模式不需要回放数据
+                host=args.host,
+                port=args.port,
+                payload_factory=None,
+                plc=plc,
+                ros_source=ros_source,
+                plc_actuator=plc_actuator,
+                config=config,
+                initial_pos=initial_pos,
+                update_hz=args.hz,
+                speed=args.speed,
+            )
+        else:
+            # PLC 模式非 live: 使用命令行 target 直接运行 (兼容旧行为)
+            ros_source = RosPositionSource()
+            plc_actuator = PlcActuator(plc, initial_z=crane0.z.position)
+            try:
+                history, arrival_events = run_pd_control(
+                    source=ros_source,
+                    actuator=plc_actuator,
+                    config=config,
+                    target_pos=target_pos,
+                    initial_state=crane0,
+                    verbose=True,
+                    is_simulation=False,
+                )
+            finally:
+                plc.disconnect()
+
+            viz = CraneVisualizer(config)
+            viz.plot(history, arrival_events)
+            viz.plot_operation_diagram(
+                history=history,
+                phase_boundaries=arrival_events,
+                target_pos=target_pos,
+                initial_pos=initial_pos,
+            )
+        return
+
+    # ---- 仿真模式 ----
     try:
         history, arrival_events = run_simulation(
             target_pos=target_pos,
             initial_state=crane0,
             config=config,
             verbose=True,
-            plc=plc,
         )
-    finally:
-        # Keep PLC alive during live session (buttons need it)
-        if plc is not None and not args.live:
-            plc.disconnect()
+    except Exception:
+        raise
+
     initial_pos = (crane0.x.position, crane0.y.position, crane0.z.position)
     viz = CraneVisualizer(config)
     viz.plot(history, arrival_events)
@@ -307,16 +218,15 @@ def main(argv=None):
         target_pos=target_pos,
         initial_pos=initial_pos,
     )
-    if args.live:
-        start_ros_bridge()
 
-        _plc = plc  # capture for closure
-        _state = {'target': target_pos, 'initial': initial_pos}  # mutable for re-simulation
+    if args.live:
+        # 仿真回放模式: 直接回放已完成的仿真
+        # (PLC 模式不需要 ROS, 但 live_view 的 SSE 需要 start_ros_bridge)
+        _state = {'target': target_pos, 'initial': initial_pos}
 
         def live_payload_for_query(query: dict[str, list[str]]):
             if not query:
                 return payload
-            # Use last target as new initial position (continuous path)
             start_pos = _state['target']
             requested_target = _target_from_query(query, _state['target'])
             live_history, live_events = run_simulation(
@@ -324,9 +234,7 @@ def main(argv=None):
                 initial_state=CraneState(x0=start_pos[0], y0=start_pos[1], z0=start_pos[2]),
                 config=config,
                 verbose=False,
-                plc=_plc,
             )
-            # Update state for next re-simulation
             _state['initial'] = start_pos
             _state['target'] = requested_target
             return build_live_payload(
@@ -353,10 +261,8 @@ def main(argv=None):
             host=args.host,
             port=args.port,
             payload_factory=live_payload_for_query,
-            plc=plc,
+            plc=None,
         )
-        if plc is not None:
-            plc.disconnect()
 
 
 if __name__ == '__main__':

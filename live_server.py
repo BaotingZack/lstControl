@@ -1,15 +1,37 @@
-"""Browser-based 10 Hz live view for the crane simulation."""
+"""Browser-based 10 Hz live view for the crane simulation.
+
+Supports two rendering modes:
+
+  Simulation (replay):
+    Simulation runs to completion first, then the browser replays the
+    recorded history at 10 Hz.  URL query parameters trigger new runs.
+
+  PLC (real-time):
+    The browser shows live /localization_pose data on open.  The user
+    sets a target and clicks "Apply Target" to start PD control.
+    A background thread runs the control loop while an SSE endpoint
+    pushes real-time state to the browser Canvas.
+"""
 
 from __future__ import annotations
 
 import json
+import queue
 import socket
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from ros_bridge import get_latest_pose
+from crane_model import (
+    ControlHooks,
+    CraneConfig,
+    CraneState,
+    run_pd_control,
+)
+from ros_bridge import get_latest_pose, RosPositionSource
+from plc_interface import PlcActuator
 from visualizer import CraneVisualizer
 
 
@@ -86,9 +108,91 @@ def build_live_payload(
     }
 
 
-def render_live_html() -> str:
-    """Return the browser live view HTML."""
-    return """<!doctype html>
+# ============================================================================
+# PLC 实时控制钩子 — 通过队列将 PD 状态推送到 SSE
+# ============================================================================
+
+class LiveControlHooks(ControlHooks):
+    """ControlHooks 实现 — 将每步 PD 状态写入 ControlState (供轮询) + 入队 (供 SSE)。"""
+
+    def __init__(self, control_state: ControlState | None = None):
+        self._queue: queue.Queue = queue.Queue()
+        self._event = threading.Event()    # 信号: 队列有新数据, 唤醒 SSE 消费者
+        self._stop_flag = threading.Event()
+        self._control_state = control_state  # 轮询 API 用的共享状态
+
+    def on_step(self, step_data: dict) -> None:
+        """每步: 写 ControlState (供轮询) + 入队 (供 SSE)。"""
+        # 写入轮询状态 (主要数据通道)
+        if self._control_state is not None:
+            self._control_state.set_step(step_data)
+        # 入队供 SSE (诊断通道)
+        try:
+            self._queue.put_nowait({'type': 'step', 'data': step_data})
+            self._event.set()
+        except queue.Full:
+            pass
+
+    def on_arrival(self, axis: str, t: float) -> None:
+        """到达事件: 写 ControlState + 入队。"""
+        if self._control_state is not None:
+            self._control_state.set_arrival(axis, t)
+        try:
+            self._queue.put_nowait({'type': 'arrival', 'axis': axis, 't': t})
+            self._event.set()
+        except queue.Full:
+            pass
+
+    def should_stop(self) -> bool:
+        """检查外部停止信号。"""
+        return self._stop_flag.is_set()
+
+    def stop(self) -> None:
+        """请求停止控制循环。"""
+        self._stop_flag.set()
+
+    def done(self) -> None:
+        """发送完成信号。"""
+        try:
+            self._queue.put_nowait({'type': 'done'})
+            self._event.set()
+        except queue.Full:
+            pass
+
+    def send_error(self, message: str) -> None:
+        """发送错误信号。"""
+        try:
+            self._queue.put_nowait({'type': 'error', 'message': message})
+            self._event.set()
+        except queue.Full:
+            pass
+
+    def get_event(self, timeout: float = 0.5) -> dict | None:
+        """SSE 端点调用 — 阻塞等待下一个事件（Event 驱动，无轮询延迟）。
+
+        与 queue.Queue.get(timeout) 不同，此方法用 threading.Event
+        实现即时唤醒：一旦 on_step() 入队数据，get_event() 立即返回，
+        而非等待最多 timeout 秒。
+        """
+        if self._event.wait(timeout=timeout):
+            # 有数据到达
+            try:
+                event = self._queue.get_nowait()
+                if self._queue.empty():
+                    self._event.clear()
+                return event
+            except queue.Empty:
+                return None
+        return None
+
+
+def render_live_html(plc_mode: bool = False) -> str:
+    """Return the browser live view HTML.
+
+    Args:
+        plc_mode: True → PLC 实时控制模式, False → 仿真回放模式
+    """
+    html = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -580,11 +684,17 @@ def render_live_html() -> str:
     </aside>
   </main>
   <script>
+    const PLC_MODE = __PLC_MODE__;
     const canvas = document.getElementById('scene');
     const ctx = canvas.getContext('2d');
     let payload;
     let frame = 0;
     let lastAdvance = 0;
+    // PLC real-time state (updated from /api/control-state polling)
+    let _liveControlState = null;
+    let _controlActive = false;
+    let _lastStepCount = -1;
+    let _lastTrailTime = -1;  // 1Hz trail decimation
 
     const els = {
       rate: document.getElementById('rate'),
@@ -771,6 +881,28 @@ def render_live_html() -> str:
     function drawCraneBay(box, r, current) {
       drawPanel(box, 'Bridge Crane Bay');
       drawGrid(box);
+      // Axis tick labels
+      ctx.fillStyle = '#91a3b3';
+      ctx.font = '10px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      var xRange = r.xMax - r.xMin;
+      var yRange = r.yMax - r.yMin;
+      var xStep = Math.pow(10, Math.floor(Math.log10(xRange))) / 2;
+      if (xRange / xStep > 8) xStep *= 2;
+      var yStep = Math.pow(10, Math.floor(Math.log10(yRange))) / 2;
+      if (yRange / yStep > 8) yStep *= 2;
+      // X-axis ticks (bottom)
+      for (var xv = Math.ceil(r.xMin / xStep) * xStep; xv <= r.xMax; xv += xStep) {
+        var sx = box.x + ((xv - r.xMin) / xRange) * box.w;
+        ctx.fillText(xv.toFixed(1), sx, box.y + box.h + 16);
+      }
+      // Y-axis ticks (left)
+      ctx.textAlign = 'right';
+      for (var yv = Math.ceil(r.yMin / yStep) * yStep; yv <= r.yMax; yv += yStep) {
+        var sy = box.y + box.h - ((yv - r.yMin) / yRange) * box.h;
+        ctx.fillText(yv.toFixed(1), box.x - 6, sy + 4);
+      }
+      ctx.textAlign = 'start';
       const railTop = box.y + box.h * 0.11;
       const railBottom = box.y + box.h * 0.89;
       ctx.strokeStyle = '#7c8790';
@@ -861,8 +993,17 @@ def render_live_html() -> str:
     }
 
     function draw() {
-      if (!payload) return;
       const rect = canvas.getBoundingClientRect();
+      if (!payload) {
+        // PLC mode waiting for data — show placeholder
+        ctx.clearRect(0, 0, rect.width, rect.height);
+        ctx.fillStyle = '#91a3b3';
+        ctx.font = '700 18px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Waiting for localization data...', rect.width / 2, rect.height / 2);
+        ctx.textAlign = 'start';
+        return;
+      }
       ctx.clearRect(0, 0, rect.width, rect.height);
       const r = ranges();
       const current = payload.frames[frame];
@@ -907,11 +1048,8 @@ def render_live_html() -> str:
       els.vy.style.color = vyColor;
       els.vz.style.color = vzColor;
 
-      // Control tab — update values from replay frame (no flash)
-      els.ctrlVx.textContent = f.vxCmd.toFixed(3) + ' m/s';
-      els.ctrlVy.textContent = f.vyCmd.toFixed(3) + ' m/s';
-      els.ctrlHz.textContent = f.z.toFixed(3) + ' m';
-      els.ctrlGrip.textContent = '--';
+      // Control tab values are updated exclusively by pollPlcStatus()
+      // to avoid racing between replay frames and live PLC data.
     }
 
     function renderTargetControls() {
@@ -921,6 +1059,43 @@ def render_live_html() -> str:
     }
 
     function applyTargetCommand() {
+      if (PLC_MODE) {
+        // PLC real-time mode: POST target → start control
+        const target = {
+          target_x: parseFloat(els.targetX.value),
+          target_y: parseFloat(els.targetY.value),
+          target_z: parseFloat(els.targetZ.value),
+        };
+        els.applyTarget.disabled = true;
+        els.applyTarget.textContent = 'Starting...';
+        els.ctrlMsg.textContent = '';
+        fetch('/api/start-control', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(target),
+        })
+          .then(r => r.json())
+          .then(data => {
+            if (data.ok) {
+              els.ctrlMsg.textContent = 'Control started — polling...';
+              els.ctrlMsg.style.color = '#5ebd72';
+              _lastStepCount = -1;  // reset so first step triggers Start marker
+            } else {
+              els.ctrlMsg.textContent = 'Error: ' + (data.error || 'unknown');
+              els.ctrlMsg.style.color = '#e05a47';
+              els.applyTarget.disabled = false;
+              els.applyTarget.textContent = 'Apply Target';
+            }
+          })
+          .catch(err => {
+            els.ctrlMsg.textContent = 'Failed: ' + err.message;
+            els.ctrlMsg.style.color = '#e05a47';
+            els.applyTarget.disabled = false;
+            els.applyTarget.textContent = 'Apply Target';
+          });
+        return;
+      }
+      // Simulation replay mode: URL-based re-simulation
       const params = new URLSearchParams(window.location.search);
       params.set('target_x', els.targetX.value);
       params.set('target_y', els.targetY.value);
@@ -947,30 +1122,63 @@ def render_live_html() -> str:
       });
     }
 
-    fetch('/simulation.json' + window.location.search)
-      .then(async r => {
-        if (!r.ok) throw new Error(await r.text());
-        return r.json();
-      })
-      .then(data => {
-        payload = data;
-        frame = 0;
-        lastAdvance = 0;
-        els.rate.textContent = `${payload.updateHz} Hz`;
-        els.startTime.textContent = '0.0s';
-        els.endTime.textContent = `${payload.frames[payload.frames.length - 1].t.toFixed(1)}s`;
-        els.phaseLog.innerHTML = payload.phaseBoundaries.map(p =>
-          `<div><span>${p.label}</span><span>${p.t.toFixed(1)}s</span></div>`
-        ).join('');
-        renderTargetControls();
-        renderStatus();
-        resize();
-        requestAnimationFrame(animate);
-      })
-      .catch(error => {
-        els.phase.textContent = 'Invalid target';
-        els.phaseLog.textContent = error.message;
-      });
+    if (PLC_MODE) {
+      // PLC mode — wait for control stream, show initial state
+      els.phase.textContent = 'PLC Mode — Set Target';
+      els.phaseLog.innerHTML = '<div>Waiting for target...</div>';
+      els.rate.textContent = 'Live';
+      els.time.textContent = '0.0s';
+      els.frame.textContent = '—';
+      els.speed.textContent = 'Live';
+      // Initialize target inputs empty
+      els.targetX.value = '';
+      els.targetY.value = '';
+      els.targetZ.value = '';
+      // Create default payload so Canvas shows crane immediately
+      const defaultPos = {x: 0, y: 0, z: 5};
+      payload = {
+        updateHz: 10, speed: 1, framePeriodMs: 100,
+        target: defaultPos,
+        initial: defaultPos,
+        bounds: { xMin: -2, xMax: 10, yMin: -2, yMax: 8, zMin: 0, zMax: 7 },
+        velocityLimits: {xy: 0.3, z: 0.2},
+        phaseBoundaries: [],
+        frames: [{t: 0, x: 0, y: 0, z: 5, vx: 0, vy: 0, vz: 0,
+                  vxCmd: 0, vyCmd: 0, vzCmd: 0, phaseLabel: 'Waiting for localization...'}],
+      };
+      frame = 0;
+      els.rate.textContent = 'Live';
+      els.startTime.textContent = '—';
+      els.endTime.textContent = '—';
+      resize();
+      draw();
+      requestAnimationFrame(draw);
+    } else {
+      fetch('/simulation.json' + window.location.search)
+        .then(async r => {
+          if (!r.ok) throw new Error(await r.text());
+          return r.json();
+        })
+        .then(data => {
+          payload = data;
+          frame = 0;
+          lastAdvance = 0;
+          els.rate.textContent = `${payload.updateHz} Hz`;
+          els.startTime.textContent = '0.0s';
+          els.endTime.textContent = `${payload.frames[payload.frames.length - 1].t.toFixed(1)}s`;
+          els.phaseLog.innerHTML = payload.phaseBoundaries.map(p =>
+            `<div><span>${p.label}</span><span>${p.t.toFixed(1)}s</span></div>`
+          ).join('');
+          renderTargetControls();
+          renderStatus();
+          resize();
+          requestAnimationFrame(animate);
+        })
+        .catch(error => {
+          els.phase.textContent = 'Invalid target';
+          els.phaseLog.textContent = error.message;
+        });
+    }
 
     window.addEventListener('resize', resize);
 
@@ -997,11 +1205,176 @@ def render_live_html() -> str:
       els.locoTimestamp.textContent = 'Stamp: ' + new Date(stamp * 1000).toLocaleTimeString();
       els.locoStatus.textContent = 'Connected — /localization_pose';
       els.locoStatus.style.color = '#5ebd72';
+
+      // PLC mode — use localization data to drive Canvas when no control is active
+      if (PLC_MODE && !_controlActive) {
+        const pos = {x: data.x, y: data.y, z: data.z};
+        const vel = {vx: data.vx, vy: data.vy, vz: data.vz};
+        if (!payload) {
+          payload = {
+            updateHz: 10, speed: 1, framePeriodMs: 100,
+            target: pos,
+            initial: pos,
+            bounds: {
+              xMin: data.x - 2, xMax: data.x + 2,
+              yMin: data.y - 2, yMax: data.y + 2,
+              zMin: data.z - 2, zMax: data.z + 2,
+            },
+            velocityLimits: {xy: 0.3, z: 0.2},
+            phaseBoundaries: [],
+            frames: [],
+          };
+        }
+        // Keep a sliding window of recent positions for the trail
+        const f = {t: stamp, x: data.x, y: data.y, z: data.z,
+                   vx: data.vx, vy: data.vy, vz: data.vz,
+                   vxCmd: 0, vyCmd: 0, vzCmd: 0,
+                   phaseLabel: 'Localization Live'};
+        payload.frames.push(f);
+        if (payload.frames.length > 30) payload.frames.shift();
+        payload.target = pos;  // no target yet, show current position
+        frame = payload.frames.length - 1;
+
+        // Update readout
+        els.time.textContent = new Date(stamp * 1000).toLocaleTimeString();
+        els.phase.textContent = 'PLC Live — Set Target';
+        els.x.textContent = data.x.toFixed(2);
+        els.y.textContent = data.y.toFixed(2);
+        els.z.textContent = data.z.toFixed(2);
+        els.vx.textContent = data.vx.toFixed(2);
+        els.vy.textContent = data.vy.toFixed(2);
+        els.vz.textContent = data.vz.toFixed(2);
+
+        // Keep bounds updated
+        payload.bounds.xMin = Math.min(payload.bounds.xMin, data.x - 2);
+        payload.bounds.xMax = Math.max(payload.bounds.xMax, data.x + 2);
+        payload.bounds.yMin = Math.min(payload.bounds.yMin, data.y - 2);
+        payload.bounds.yMax = Math.max(payload.bounds.yMax, data.y + 2);
+
+        draw();
+      }
     };
     locoSource.onerror = () => {
       els.locoStatus.textContent = 'Disconnected — waiting for data...';
       els.locoStatus.style.color = '#e05a47';
     };
+
+    // PLC mode — poll /api/control-state at 10 Hz for real-time PD state
+    function pollControlState() {
+      fetch('/api/control-state')
+        .then(r => r.json())
+        .then(s => {
+          if (!s.running && !s.done && !s.error) return; // control not started yet
+          if (s.error) {
+            _controlActive = false;
+            els.ctrlMsg.textContent = 'Error: ' + s.error;
+            els.ctrlMsg.style.color = '#e05a47';
+            els.applyTarget.disabled = false;
+            els.applyTarget.textContent = 'Apply Target';
+            return;
+          }
+          if (s.done) {
+            if (_controlActive) {
+              _controlActive = false;
+              els.phase.textContent = 'Target Reached';
+              els.ctrlMsg.textContent = 'Control complete — all axes arrived';
+              els.ctrlMsg.style.color = '#5ebd72';
+              els.applyTarget.disabled = false;
+              els.applyTarget.textContent = 'Apply Target';
+            }
+            return;
+          }
+          if (!s.latest) return;
+          const d = s.latest;
+          // Only process new steps (avoid duplicate rendering)
+          if (s.step_count <= _lastStepCount) return;
+          _lastStepCount = s.step_count;
+
+          // On first step, set Start marker + reset trajectory with auto-fit bounds
+          if (!_controlActive) {
+            payload.initial = s.start_pos
+              ? {x: s.start_pos.x, y: s.start_pos.y, z: s.start_pos.z}
+              : {x: d.x, y: d.y, z: d.z};
+            payload.target = {x: d.p_ref_x, y: d.p_ref_y, z: d.p_ref_z};
+            // Keep existing frames for continuous trajectory, mark PD start
+            payload.frames.push({t: d.t, x: d.x, y: d.y, z: d.z,
+                                 vx: 0, vy: 0, vz: 0, vxCmd: 0, vyCmd: 0, vzCmd: 0,
+                                 phaseLabel: 'PD START'});
+            // Fit bounds around initial→target with 20% padding
+            var ix = payload.initial.x, iy = payload.initial.y, iz = payload.initial.z;
+            var tx = d.p_ref_x, ty = d.p_ref_y, tz = d.p_ref_z;
+            var padX = Math.max(1.0, Math.abs(tx - ix) * 0.2);
+            var padY = Math.max(1.0, Math.abs(ty - iy) * 0.2);
+            var padZ = Math.max(1.0, Math.abs(tz - iz) * 0.2);
+            payload.bounds = {
+              xMin: Math.min(ix, tx) - padX, xMax: Math.max(ix, tx) + padX,
+              yMin: Math.min(iy, ty) - padY, yMax: Math.max(iy, ty) + padY,
+              zMin: Math.min(iz, tz) - padZ, zMax: Math.max(iz, tz) + padZ,
+            };
+            els.ctrlMsg.textContent = 'Start(' + ix.toFixed(1) + ',' + iy.toFixed(1) + ') Target(' + tx.toFixed(1) + ',' + ty.toFixed(1) + ')';
+            els.ctrlMsg.style.color = '#5ebd72';
+          }
+          _controlActive = true;
+          // Expand bounds if position moves outside (trajectory auto-follow)
+          var b = payload.bounds;
+          if (d.x < b.xMin + 0.5) b.xMin = d.x - 2;
+          if (d.x > b.xMax - 0.5) b.xMax = d.x + 2;
+          if (d.y < b.yMin + 0.5) b.yMin = d.y - 2;
+          if (d.y > b.yMax - 0.5) b.yMax = d.y + 2;
+          if (d.z < b.zMin + 0.5) b.zMin = d.z - 2;
+          if (d.z > b.zMax - 0.5) b.zMax = d.z + 2;
+          // Update readout — show PD state: error + position
+          var ex = ((d.p_ref_x||0) - (d.x||0)).toFixed(2);
+          var ey = ((d.p_ref_y||0) - (d.y||0)).toFixed(2);
+          var ez = ((d.p_ref_z||0) - (d.z||0)).toFixed(2);
+          els.time.textContent = (d.t || 0).toFixed(1) + 's';
+          els.phase.textContent = 'PD#' + s.step_count
+            + ' err=(' + ex + ',' + ey + ',' + ez + ')m'
+            + ' cmd=(' + (d.vx_cmd||0).toFixed(2) + ',' + (d.vy_cmd||0).toFixed(2) + ',' + (d.vz_cmd||0).toFixed(2) + ')m/s';
+          els.phase.style.color = '#f0a83b';
+          els.ctrlMsg.textContent = 'PD step #' + s.step_count;
+          els.ctrlMsg.style.color = '#5ebd72';
+          els.x.textContent = (d.x || 0).toFixed(2);
+          els.y.textContent = (d.y || 0).toFixed(2);
+          els.z.textContent = (d.z || 0).toFixed(2);
+          els.vx.textContent = (d.vx_cmd || 0).toFixed(2);
+          els.vy.textContent = (d.vy_cmd || 0).toFixed(2);
+          els.vz.textContent = (d.vz_cmd || 0).toFixed(2);
+          const xyLimit = 0.3, zLimit = 0.2;
+          els.coordVx.style.borderColor = speedColor(Math.abs(d.vx_cmd), xyLimit);
+          els.coordVy.style.borderColor = speedColor(Math.abs(d.vy_cmd), xyLimit);
+          els.coordVz.style.borderColor = speedColor(Math.abs(d.vz_cmd), zLimit);
+          els.vx.style.color = speedColor(Math.abs(d.vx_cmd), xyLimit);
+          els.vy.style.color = speedColor(Math.abs(d.vy_cmd), xyLimit);
+          els.vz.style.color = speedColor(Math.abs(d.vz_cmd), zLimit);
+          if (!els.targetX.value) {
+            els.targetX.value = d.p_ref_x.toFixed(2);
+            els.targetY.value = d.p_ref_y.toFixed(2);
+            els.targetZ.value = d.p_ref_z.toFixed(2);
+          }
+          const f = {
+            t: d.t, x: d.x, y: d.y, z: d.z,
+            vx: d.vx, vy: d.vy, vz: d.vz,
+            vxCmd: d.vx_cmd, vyCmd: d.vy_cmd, vzCmd: d.vz_cmd,
+            phaseLabel: 'PD Control',
+          };
+          // 2 Hz trail sampling: 3000 frames = 25 min @ 2 Hz
+          if (_lastTrailTime < 0 || d.t - _lastTrailTime >= 0.45) {
+            payload.frames.push(f);
+            if (payload.frames.length > 3000) payload.frames.shift();
+            _lastTrailTime = d.t;
+          }
+          frame = Math.max(0, payload.frames.length - 1);
+          draw();
+        })
+        .catch(function(err) {
+          els.ctrlMsg.textContent = 'Poll error: ' + (err.message || err);
+          els.ctrlMsg.style.color = '#e05a47';
+        });
+    }
+    if (PLC_MODE) {
+      setInterval(pollControlState, 100); // 10 Hz polling
+    }
 
     // Control tab — PLC status polling (2 Hz), flash on PLC command change
     let _lastPlcVx = null, _lastPlcVy = null, _lastPlcHz = null;
@@ -1029,27 +1402,35 @@ def render_live_html() -> str:
             els.hbStatusText.textContent = 'Heartbeat';
             els.hbStatusText.style.color = 'var(--red)';
           }
-          // Flash cells only when PLC actually sent a new command
-          function maybeFlash(el, newVal, lastVal) {
-            const txt = newVal.toFixed(3) + ' m/s';
-            if (lastVal !== null && Math.abs(newVal - lastVal) > 0.001) {
+          // Update Control tab cells — always show latest value, flash on change
+          function updateCell(el, newVal, lastVal, unit) {
+            const txt = newVal.toFixed(3) + ' ' + unit;
+            // Always update text (first call + every poll)
+            if (lastVal === null) {
+              el.textContent = txt;
+              return newVal;
+            }
+            // Flash on significant change
+            if (Math.abs(newVal - lastVal) > 0.001) {
               el.textContent = txt;
               el.classList.add('flash');
               setTimeout(() => el.classList.remove('flash'), 400);
               return newVal;
             }
-            return lastVal;
+            // Small change: update text without flash
+            el.textContent = txt;
+            return newVal;
           }
-          _lastPlcVx = maybeFlash(els.ctrlVx, s.last_vx, _lastPlcVx);
-          _lastPlcVy = maybeFlash(els.ctrlVy, s.last_vy, _lastPlcVy);
-          // Z height flash (m)
+          _lastPlcVx = updateCell(els.ctrlVx, s.last_vx, _lastPlcVx, 'm/s');
+          _lastPlcVy = updateCell(els.ctrlVy, s.last_vy, _lastPlcVy, 'm/s');
+          // Z height (m) — always show latest
           {
             const txt = s.last_hz.toFixed(3) + ' m';
             if (_lastPlcHz !== null && Math.abs(s.last_hz - _lastPlcHz) > 0.001) {
-              els.ctrlHz.textContent = txt;
               els.ctrlHz.classList.add('flash');
               setTimeout(() => els.ctrlHz.classList.remove('flash'), 400);
             }
+            els.ctrlHz.textContent = txt;
             _lastPlcHz = s.last_hz;
           }
         })
@@ -1098,6 +1479,7 @@ def render_live_html() -> str:
   </script>
 </body>
 </html>"""
+    return html.replace('__PLC_MODE__', 'true' if plc_mode else 'false')
 
 
 class _LiveRequestHandler(BaseHTTPRequestHandler):
@@ -1109,11 +1491,23 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path == '/api/start-control':
+            self._handle_start_control()
+        else:
+            self._write(404, 'text/plain; charset=utf-8', b'not found')
+
     def do_GET(self):
         parsed = urlparse(self.path)
+        plc_mode = self.server.plc_actuator is not None
         if parsed.path in ('/', '/index.html'):
-            self._write(200, 'text/html; charset=utf-8', render_live_html().encode('utf-8'))
+            self._write(200, 'text/html; charset=utf-8', render_live_html(plc_mode).encode('utf-8'))
         elif parsed.path == '/simulation.json':
+            if plc_mode:
+                self._write(400, 'application/json; charset=utf-8',
+                            json.dumps({'error': 'Not available in PLC mode'}).encode('utf-8'))
+                return
             try:
                 payload = self.server.build_payload(parse_qs(parsed.query))
             except ValueError as exc:
@@ -1124,12 +1518,16 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             self._write(200, 'application/json; charset=utf-8', body)
         elif parsed.path == '/localization/stream':
             self._stream_localization()
+        elif parsed.path == '/control/stream':
+            self._stream_control()
         elif parsed.path == '/api/stop':
             self._handle_stop()
         elif parsed.path == '/api/reset':
             self._handle_reset()
         elif parsed.path == '/api/plc-status':
             self._handle_plc_status()
+        elif parsed.path == '/api/control-state':
+            self._handle_control_state()
         else:
             self._write(404, 'text/plain; charset=utf-8', b'not found')
 
@@ -1156,6 +1554,138 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _stream_control(self):
+        """SSE endpoint — stream real-time PD control state to browser."""
+        server = self.server
+        if server.plc_actuator is None:
+            self._write(400, 'text/plain; charset=utf-8', b'PLC mode not active')
+            return
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'keep-alive')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        print('[control SSE] Client connected, waiting for control hooks...')
+        try:
+            while True:
+                hooks = server.control_hooks  # re-read each iteration — hooks set later by /api/start-control
+                event = hooks.get_event(timeout=0.5) if hooks else None
+                if event is not None:
+                    data = json.dumps(event, ensure_ascii=False)
+                    self.wfile.write(f'data: {data}\n\n'.encode('utf-8'))
+                    self.wfile.flush()
+                    if event.get('type') in ('done', 'error'):
+                        print(f'[control SSE] Sent {event.get("type")}, closing')
+                        break
+                else:
+                    if hooks is None:
+                        pass  # no hooks yet, heartbeat only
+                    # Keep-alive heartbeat
+                    self.wfile.write(': heartbeat\n\n'.encode('utf-8'))
+                    self.wfile.flush()
+                    time.sleep(0.25)  # 防止 busy-loop, 4Hz 心跳足够
+        except (BrokenPipeError, ConnectionResetError):
+            print('[control SSE] Client disconnected')
+        except Exception as exc:
+            print(f'[control SSE] Unexpected error: {exc}')
+            import traceback; traceback.print_exc()
+
+    def _handle_start_control(self):
+        """POST /api/start-control — parse target and start PLC PD control thread."""
+        server = self.server
+        if server.plc_actuator is None or server.ros_source is None or server.config is None:
+            self._write(400, 'application/json; charset=utf-8',
+                        json.dumps({'ok': False, 'error': 'PLC mode not active'}).encode('utf-8'))
+            return
+
+        # Read request body
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length).decode('utf-8')
+        try:
+            target = json.loads(body)
+            target_x = float(target['target_x'])
+            target_y = float(target['target_y'])
+            target_z = float(target['target_z'])
+        except (ValueError, KeyError, TypeError) as exc:
+            self._write(400, 'application/json; charset=utf-8',
+                        json.dumps({'ok': False, 'error': f'Invalid target: {exc}'}).encode('utf-8'))
+            return
+
+        # Check if control is already running
+        if server.control_thread is not None and server.control_thread.is_alive():
+            self._write(409, 'application/json; charset=utf-8',
+                        json.dumps({'ok': False, 'error': 'Control already running'}).encode('utf-8'))
+            return
+
+        # Get current position from localization
+        pose = get_latest_pose()
+        if pose is None:
+            self._write(503, 'application/json; charset=utf-8',
+                        json.dumps({'ok': False, 'error': 'No localization data — cannot start control'}).encode('utf-8'))
+            return
+
+        # Create control state for frontend polling
+        cs = ControlState()
+        cs.set_start(
+            pos={'x': pose['x'], 'y': pose['y'], 'z': pose['z']},
+            target={'x': target_x, 'y': target_y, 'z': target_z},
+        )
+        server.control_state = cs
+
+        # Create control hooks — writes to ControlState (polling) + queue (SSE diagnostic)
+        hooks = LiveControlHooks(control_state=cs)
+        server.control_hooks = hooks
+
+        initial_state = CraneState(x0=pose['x'], y0=pose['y'], z0=pose['z'])
+        # Update PlcActuator Z height to match current position
+        server.plc_actuator._z_height = pose['z']
+
+        target_pos = (target_x, target_y, target_z)
+
+        # Start control in background thread
+        def _run():
+            print(f'[PLC control] Starting PD: target=({target_x:.2f}, {target_y:.2f}, {target_z:.2f}), '
+                  f'start=({initial_state.x.position:.2f}, {initial_state.y.position:.2f}, {initial_state.z.position:.2f})')
+            try:
+                history, events = run_pd_control(
+                    source=server.ros_source,
+                    actuator=server.plc_actuator,
+                    config=server.config,
+                    target_pos=target_pos,
+                    initial_state=initial_state,
+                    hooks=hooks,
+                    verbose=True,
+                    is_simulation=False,
+                    max_time=600.0,  # 10min max — same as expected max operation time
+                )
+                print(f'[PLC control] PD complete — {len(history)} steps, arrivals: {[(t,a) for t,a in events]}')
+                hooks.done()
+                cs.set_done()
+            except TimeoutError as exc:
+                msg = (f'Timeout after 20 min — axes did not all arrive. '
+                       f'Check PLC connection or localization. Use STOP ALL to abort sooner.')
+                print(f'[PLC control] {msg}')
+                hooks.send_error(msg)
+                cs.set_error(msg)
+            except Exception as exc:
+                import traceback
+                print(f'[PLC control] Error: {exc}')
+                traceback.print_exc()
+                hooks.send_error(str(exc))
+                cs.set_error(str(exc))
+            finally:
+                server.control_thread = None
+                print(f'[PLC control] Thread exiting')
+
+        server.control_thread = threading.Thread(target=_run, name='plc-control', daemon=True)
+        server.control_thread.start()
+        print(f'[PLC control] Thread started')
+
+        self._write(200, 'application/json; charset=utf-8',
+                    json.dumps({'ok': True, 'message': 'Control started'}).encode('utf-8'))
+
     def _handle_stop(self):
         """STOP ALL: send zero velocity to all three axes (matches demo.cpp pattern)."""
         plc = self.server.plc
@@ -1163,6 +1693,10 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             plc.big_car_ctrl(0.0)
             plc.small_car_ctrl(0.0)
             plc.lift_ctrl(0.0)
+        # Also stop PLC control loop if running
+        server = self.server
+        if server.control_hooks is not None:
+            server.control_hooks.stop()
         self._write(200, 'application/json; charset=utf-8', b'{"ok":true}')
 
     def _handle_reset(self):
@@ -1192,16 +1726,98 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             })
         self._write(200, 'application/json; charset=utf-8', body.encode('utf-8'))
 
+    def _handle_control_state(self):
+        """Return latest PD control state for frontend polling (10 Hz)."""
+        cs = self.server.control_state
+        if cs is None:
+            self._write(200, 'application/json; charset=utf-8',
+                        json.dumps({'running': False, 'latest': None}).encode('utf-8'))
+            return
+        self._write(200, 'application/json; charset=utf-8',
+                    json.dumps(cs.snapshot(), ensure_ascii=False).encode('utf-8'))
+
     def log_message(self, format, *args):
         return
 
 
+class ControlState:
+    """Thread-safe shared state for the active PD control run.
+
+    Written by the control thread, read by /api/control-state polling.
+    This replaces the SSE + hooks queue architecture with simple polling.
+    """
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.latest: dict | None = None   # most recent step_data
+        self.running: bool = False
+        self.start_pos: dict | None = None  # {'x','y','z'} at Apply Target time
+        self.target_pos: dict | None = None # {'x','y','z'} target
+        self.step_count: int = 0
+        self.arrivals: list = []            # [{'axis': 'x', 't': 1.23}, ...]
+        self.done: bool = False
+        self.error: str | None = None
+
+    def set_start(self, pos: dict, target: dict):
+        with self.lock:
+            self.start_pos = dict(pos)
+            self.target_pos = dict(target)
+            self.running = True
+            self.done = False
+            self.error = None
+            self.step_count = 0
+            self.arrivals = []
+
+    def set_step(self, step_data: dict):
+        with self.lock:
+            self.latest = dict(step_data)
+            self.step_count += 1
+
+    def set_arrival(self, axis: str, t: float):
+        with self.lock:
+            self.arrivals.append({'axis': axis, 't': t})
+
+    def set_done(self):
+        with self.lock:
+            self.done = True
+            self.running = False
+
+    def set_error(self, msg: str):
+        with self.lock:
+            self.error = msg
+            self.running = False
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                'running': self.running,
+                'done': self.done,
+                'error': self.error,
+                'step_count': self.step_count,
+                'start_pos': self.start_pos,
+                'target_pos': self.target_pos,
+                'arrivals': list(self.arrivals),
+                'latest': dict(self.latest) if self.latest else None,
+            }
+
+
 class CraneLiveServer(ThreadingHTTPServer):
-    def __init__(self, server_address, payload, payload_factory=None, plc=None):
+    def __init__(self, server_address, payload, payload_factory=None, plc=None,
+                 ros_source=None, plc_actuator=None, config=None,
+                 initial_pos=None, update_hz=10.0, speed=1.0):
         super().__init__(server_address, _LiveRequestHandler)
         self.payload = payload
         self.payload_factory = payload_factory
         self.plc = plc  # PLC instance for interactive control (stop/reset)
+        # PLC real-time control mode
+        self.ros_source: RosPositionSource | None = ros_source
+        self.plc_actuator: PlcActuator | None = plc_actuator
+        self.config: CraneConfig | None = config
+        self.initial_pos: tuple | None = initial_pos
+        self.update_hz: float = update_hz
+        self.speed: float = speed
+        self.control_hooks: LiveControlHooks | None = None
+        self.control_thread: threading.Thread | None = None
+        self.control_state: ControlState | None = None
 
     def build_payload(self, query: dict[str, list[str]]) -> dict[str, Any]:
         if self.payload_factory is None:
@@ -1219,15 +1835,35 @@ def _find_available_port(host: str, preferred_port: int) -> int:
 
 
 def serve_live_view(
-    payload: dict[str, Any],
+    payload: dict[str, Any] | None,
     host: str = '127.0.0.1',
     port: int = 8000,
     payload_factory=None,
     plc=None,
+    ros_source=None,
+    plc_actuator=None,
+    config=None,
+    initial_pos=None,
+    update_hz: float = 10.0,
+    speed: float = 1.0,
 ):
-    """Start a blocking browser live-view server."""
+    """Start a blocking browser live-view server.
+
+    Simulation mode (ros_source=None, plc_actuator=None):
+      payload and payload_factory control what the browser replays.
+
+    PLC mode (ros_source and plc_actuator provided):
+      payload should be None.  The browser shows live /localization_pose
+      data and the user starts control via the Apply Target button.
+    """
     selected_port = _find_available_port(host, port)
-    server = CraneLiveServer((host, selected_port), payload, payload_factory=payload_factory, plc=plc)
+    server = CraneLiveServer(
+        (host, selected_port), payload,
+        payload_factory=payload_factory, plc=plc,
+        ros_source=ros_source, plc_actuator=plc_actuator,
+        config=config, initial_pos=initial_pos,
+        update_hz=update_hz, speed=speed,
+    )
     actual_host, actual_port = server.server_address
     url = f'http://{actual_host}:{actual_port}'
     print(f'Live view: {url}')

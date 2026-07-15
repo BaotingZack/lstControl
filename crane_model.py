@@ -8,6 +8,8 @@
   X-Y 构成水平面, 抓钩在 Z 轴上下移动
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 import math
 import random
@@ -188,7 +190,8 @@ class CraneConfig:
     # --- PLC 速度控制器参数 ---
     kp_pos: float = 0.5                # 位置环比例增益 [1/s]
     kd_pos: float = 0.35               # 速度阻尼增益, 用于 PD 的 D 项
-    velocity_filter_tau: float = 0.25  # [s] SLAM/差分速度低通滤波时间常数
+    velocity_filter_tau: float = 0.25  # [s] SLAM/差分速度低通滤波时间常数（仿真模式）
+    velocity_filter_tau_plc: float = 0.50  # [s] PLC 模式速度滤波时间常数（10Hz 需更大 τ 补偿大 dt）
 
     # --- 伺服/扰动模型 ---
     servo_time_constant_xy: float = 0.18   # [s] XY 速度环一阶响应时间常数
@@ -226,6 +229,7 @@ class CraneConfig:
             'servo_time_constant_xy': self.servo_time_constant_xy,
             'servo_time_constant_z': self.servo_time_constant_z,
             'velocity_filter_tau': self.velocity_filter_tau,
+            'velocity_filter_tau_plc': self.velocity_filter_tau_plc,
         }
         for name, value in positive_fields.items():
             if value <= 0:
@@ -250,3 +254,356 @@ class CraneConfig:
         for name, value in non_negative_fields.items():
             if value < 0:
                 raise ValueError(f'{name} must be non-negative')
+
+
+# ============================================================================
+# 策略模式接口 — 统一 PD 控制循环的抽象
+# ============================================================================
+
+class PositionSource:
+    """位置反馈源抽象接口。
+
+    不同模式提供不同实现:
+      - SimPositionSource  — 仿真对象模型 (100 Hz 非阻塞)
+      - RosPositionSource  — ROS /localization_pose (10 Hz 阻塞等待)
+
+    返回的 dict 必须包含:
+      x, y, z:        位置 [m]
+      vx, vy, vz:     速度 [m/s] (可能为 None)
+      dt:             本次与上次测量的时间间隔 [s]
+      t:              时间戳 [s]
+      stamp:          唯一标识 (用于检测新数据)
+    """
+
+    def get_position(self) -> dict | None:
+        """获取最新位置反馈。返回 None 表示超时/不可恢复错误。"""
+        raise NotImplementedError
+
+    def reset(self) -> None:
+        """重置内部状态 (用于新的控制运行)。"""
+        pass
+
+
+class Actuator:
+    """执行器抽象接口。
+
+    不同模式提供不同实现:
+      - PlantActuator  — 仿真伺服 + 扰动模型
+      - PlcActuator    — 真实 PLC 指令 (libsscarctrl)
+    """
+
+    def apply(self, vx: float, vy: float, vz: float, dt: float) -> None:
+        """发送速度指令到被控对象。"""
+        raise NotImplementedError
+
+    def update_state(self, state: CraneState, position: dict) -> None:
+        """从位置反馈更新 CraneState。
+
+        仿真模式: 位置来自 plant model (已在 apply 中更新)
+        PLC 模式: 位置来自 /localization_pose
+        """
+        raise NotImplementedError
+
+    def emergency_stop(self) -> None:
+        """安全停止 — 立即发送零速度指令。"""
+        pass
+
+    def cleanup(self) -> None:
+        """控制运行结束后的清理。"""
+        pass
+
+
+class ControlHooks:
+    """控制循环回调钩子 — 用于实时推送、日志、外部中断。
+
+    所有方法都是可选的 (默认空实现)。子类只需覆盖需要的方法。
+    """
+
+    def on_step(self, step_data: dict) -> None:
+        """每步 PD 计算完成后调用。
+
+        step_data 包含: t, x, y, z, vx, vy, vz, vx_cmd, vy_cmd, vz_cmd,
+                        vx_raw, vx_filtered, target_x, target_y, target_z
+        """
+        pass
+
+    def on_arrival(self, axis: str, t: float) -> None:
+        """某轴到达目标时调用。"""
+        pass
+
+    def should_stop(self) -> bool:
+        """返回 True 中止控制循环。每步检查。"""
+        return False
+
+
+# ============================================================================
+# 仿真模式实现
+# ============================================================================
+
+class SimPositionSource(PositionSource):
+    """仿真位置源 — 从 CranePlant 获取带噪声的测量位置。
+
+    100 Hz 非阻塞: get_position() 始终立即返回。
+    """
+
+    def __init__(self, plant: CranePlant, state: CraneState, config: CraneConfig):
+        self._plant = plant
+        self._state = state
+        self._config = config
+        self._t = 0.0
+        self._stamp = 0
+
+    def get_position(self) -> dict:
+        self._stamp += 1
+        self._t += self._config.dt
+        return {
+            'x': self._plant.measure_position('x', self._state.x.position),
+            'y': self._plant.measure_position('y', self._state.y.position),
+            'z': self._plant.measure_position('z', self._state.z.position),
+            'vx': None,   # 仿真模式 PD 使用差分速度
+            'vy': None,
+            'vz': None,
+            'dt': self._config.dt,
+            't': self._t,
+            'stamp': self._stamp,
+        }
+
+    def reset(self) -> None:
+        self._t = 0.0
+        self._stamp = 0
+
+
+class PlantActuator(Actuator):
+    """仿真执行器 — 一阶伺服模型 + 低频扰动。
+
+    调用 apply() 后, CraneState 已更新为最新的伺服响应状态。
+    """
+
+    def __init__(self, plant: CranePlant, state: CraneState, config: CraneConfig):
+        self._plant = plant
+        self._state = state
+        self._config = config
+
+    def apply(self, vx: float, vy: float, vz: float, dt: float) -> None:
+        """通过仿真 plant model 执行速度指令，更新 state。
+
+        返回的扰动值通过 step_data 传出 (在 run_pd_control 中记录)。
+        """
+        # 将在 run_pd_control 中调用 plant.update_axis()，这里不用做
+        pass
+
+    def update_state(self, state: CraneState, position: dict) -> None:
+        """仿真模式: 位置已在 plant.update_axis() 中更新，这里为空。"""
+        pass  # state 已通过 plant.update_axis() 更新
+
+    def emergency_stop(self) -> None:
+        for axis_name in ('x', 'y', 'z'):
+            axis = getattr(self._state, axis_name)
+            axis.velocity = 0.0
+
+
+# ============================================================================
+# 统一 PD 控制循环
+# ============================================================================
+
+def _axis_arrived(axis, target: float, config: CraneConfig) -> bool:
+    """判断单轴是否已到达目标 (位置 + 速度双重判定)。"""
+    pos_ok = abs(axis.position - target) < config.arrival_pos_tol
+    vel_ok = abs(axis.velocity) < config.arrival_vel_tol
+    return pos_ok and vel_ok
+
+
+def run_pd_control(
+    source: PositionSource,
+    actuator: Actuator,
+    config: CraneConfig,
+    target_pos: tuple[float, float, float],
+    initial_state: CraneState,
+    hooks: ControlHooks | None = None,
+    max_time: float | None = 180.0,
+    verbose: bool = True,
+    is_simulation: bool = True,
+) -> tuple[list[dict], list[tuple[float, str]]]:
+    """统一 PD 位置控制循环 — 仿真和 PLC 模式共用。
+
+    控制律:
+      v_cmd = Kp * (target - measured) - Kd * filtered_velocity
+
+    仿真模式: SimPositionSource (100 Hz 非阻塞) + PlantActuator
+    PLC 模式: RosPositionSource (10 Hz 阻塞) + PlcActuator
+
+    Args:
+        source:         位置反馈源
+        actuator:       执行器
+        config:         控制配置参数
+        target_pos:     目标位置 (tx, ty, tz) [m]
+        initial_state:  初始 CraneState (会被复制, 不修改原对象)
+        hooks:          可选回调钩子
+        max_time:       最大运行时间 [s]
+        verbose:        是否打印日志
+        is_simulation:  True=仿真模式 (虚拟时间), False=PLC 模式 (真实时间)
+
+    Returns:
+        (history, arrival_events):
+          history:        每步状态的 list[dict]
+          arrival_events: 各轴到达时间的 list[tuple[float, str]]
+    """
+    from pd_controller import PositionPDController
+    from velocity_filter import LowPassVelocityEstimator
+
+    # 复制初始状态
+    crane = CraneState(
+        x0=initial_state.x.position,
+        y0=initial_state.y.position,
+        z0=initial_state.z.position,
+    )
+    crane.x.velocity = initial_state.x.velocity
+    crane.y.velocity = initial_state.y.velocity
+    crane.z.velocity = initial_state.z.velocity
+
+    target_x, target_y, target_z = target_pos
+
+    # 根据模式选择速度滤波时间常数
+    filter_tau = config.velocity_filter_tau if is_simulation else config.velocity_filter_tau_plc
+
+    # PD 控制器 — 两种模式完全共用
+    controllers = {
+        'x': PositionPDController(config.kp_pos, config.kd_pos, config.max_velocity_xy),
+        'y': PositionPDController(config.kp_pos, config.kd_pos, config.max_velocity_xy),
+        'z': PositionPDController(config.kp_pos, config.kd_pos, config.max_velocity_z),
+    }
+
+    # 速度滤波器 — 共用, PLC 模式使用更大的 tau
+    filters = {
+        'x': LowPassVelocityEstimator(filter_tau, crane.x.position, crane.x.velocity),
+        'y': LowPassVelocityEstimator(filter_tau, crane.y.position, crane.y.velocity),
+        'z': LowPassVelocityEstimator(filter_tau, crane.z.position, crane.z.velocity),
+    }
+
+    history: list[dict] = []
+    arrival_events: list[tuple[float, str]] = []
+    locked = {'x': False, 'y': False, 'z': False}
+
+    # PD 输出
+    vx_cmd = vy_cmd = vz_cmd = 0.0
+    vx_raw = vy_raw = vz_raw = 0.0
+    vx_filtered = vy_filtered = vz_filtered = 0.0
+
+    # 扰动记录 (仅仿真模式非零)
+    disturbance_x = disturbance_y = disturbance_z = 0.0
+
+    # 位置测量值
+    x_measured = crane.x.position
+    y_measured = crane.y.position
+    z_measured = crane.z.position
+
+    mode_label = 'PLC' if not is_simulation else '仿真'
+    if verbose:
+        print(f"=== 起重机 PD 速度控制{mode_label} ===")
+        print(f"初始位置: X={crane.x.position:.2f}, Y={crane.y.position:.2f}, Z={crane.z.position:.2f}")
+        print(f"目标位置: X={target_x:.2f}, Y={target_y:.2f}, Z={target_z:.2f}")
+        print("=" * 50)
+
+    source.reset()
+
+    # Rebind source/actuator to the copied crane state
+    # (SimPositionSource/PlantActuator hold a reference to the original
+    # initial_state, but the loop updates crane — the copy.)
+    if hasattr(source, '_state'):
+        source._state = crane
+    if hasattr(actuator, '_state'):
+        actuator._state = crane
+
+    while not all(locked.values()):
+        # --- 检查钩子中断 ---
+        if hooks is not None and hooks.should_stop():
+            if verbose:
+                print(f"{mode_label} 控制被外部中断")
+            actuator.emergency_stop()
+            break
+
+        # --- STEP 1: 获取位置反馈 ---
+        pos = source.get_position()
+        if pos is None:
+            # 超时/断流 — 安全停止
+            if verbose:
+                print(f"{mode_label} 定位数据超时 — 安全停止")
+            actuator.emergency_stop()
+            break
+
+        x_measured = pos['x']
+        y_measured = pos['y']
+        z_measured = pos['z']
+        dt = pos['dt']
+        t = pos['t']
+
+        if max_time is not None and t > max_time:
+            raise TimeoutError(f"{mode_label} control did not finish within {max_time:.2f}s (t={t:.2f}s)")
+
+        # --- STEP 2-3: 速度估计 + PD 控制 (共用核心) ---
+        vx_raw, vx_filtered = filters['x'].update(x_measured, dt)
+        vy_raw, vy_filtered = filters['y'].update(y_measured, dt)
+        vz_raw, vz_filtered = filters['z'].update(z_measured, dt)
+
+        vx_cmd = 0.0 if locked['x'] else controllers['x'].update(target_x, x_measured, vx_filtered)
+        vy_cmd = 0.0 if locked['y'] else controllers['y'].update(target_y, y_measured, vy_filtered)
+        vz_cmd = 0.0 if locked['z'] else controllers['z'].update(target_z, z_measured, vz_filtered)
+
+        # --- STEP 4: 执行 — 委托给 Actuator ---
+        if is_simulation:
+            # 仿真模式: plant.update_axis() 更新 state
+            plant = getattr(source, '_plant', None)
+            if plant is not None:
+                disturbance_x = plant.update_axis('x', crane.x, vx_cmd, target_x, locked['x'], dt, t)
+                disturbance_y = plant.update_axis('y', crane.y, vy_cmd, target_y, locked['y'], dt, t)
+                disturbance_z = plant.update_axis('z', crane.z, vz_cmd, target_z, locked['z'], dt, t)
+        else:
+            # PLC 模式: 发送指令到真实 PLC
+            actuator.apply(vx_cmd, vy_cmd, vz_cmd, dt)
+            # 从定位数据更新 state
+            actuator.update_state(crane, pos)
+            disturbance_x = disturbance_y = disturbance_z = 0.0
+
+        # --- STEP 5: 到达检测 ---
+        axis_data = [
+            ('x', crane.x, target_x, vx_cmd),
+            ('y', crane.y, target_y, vy_cmd),
+            ('z', crane.z, target_z, vz_cmd),
+        ]
+        for name, axis, target, cmd in axis_data:
+            in_capture_window = abs(axis.position - target) < config.arrival_capture_pos_tol
+            command_settled = abs(cmd) < config.arrival_cmd_tol
+            if not locked[name] and (_axis_arrived(axis, target, config) or (in_capture_window and command_settled)):
+                axis.position = target
+                axis.velocity = 0.0
+                locked[name] = True
+                arrival_events.append((t, name))
+                if hooks is not None:
+                    hooks.on_arrival(name, t)
+
+        # --- STEP 6: 记录历史 ---
+        step_data = {
+            't': t,
+            'x': crane.x.position, 'y': crane.y.position, 'z': crane.z.position,
+            'vx': crane.x.velocity, 'vy': crane.y.velocity, 'vz': crane.z.velocity,
+            'p_ref_x': target_x, 'p_ref_y': target_y, 'p_ref_z': target_z,
+            'v_ref_x': 0.0, 'v_ref_y': 0.0, 'v_ref_z': 0.0,
+            'vx_cmd': vx_cmd, 'vy_cmd': vy_cmd, 'vz_cmd': vz_cmd,
+            'x_measured': x_measured, 'y_measured': y_measured, 'z_measured': z_measured,
+            'vx_raw': vx_raw, 'vy_raw': vy_raw, 'vz_raw': vz_raw,
+            'vx_filtered': vx_filtered, 'vy_filtered': vy_filtered, 'vz_filtered': vz_filtered,
+            'disturbance_x': disturbance_x, 'disturbance_y': disturbance_y, 'disturbance_z': disturbance_z,
+        }
+        history.append(step_data)
+
+        if hooks is not None:
+            hooks.on_step(step_data)
+
+    if verbose:
+        final = history[-1]
+        print("=" * 50)
+        print(f"{mode_label}完成! 总时间: {final['t']:.2f}s")
+        print(f"最终位置: X={final['x']:.3f}, Y={final['y']:.3f}, Z={final['z']:.3f}")
+
+    actuator.cleanup()
+    return history, arrival_events
