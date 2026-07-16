@@ -165,6 +165,35 @@ def test_position_timeout_is_an_error_instead_of_normal_completion():
     assert actuator.cleanup_calls == 1
 
 
+@pytest.mark.parametrize(
+    "invalid_position",
+    [
+        position(x=math.nan),
+        position(z=-0.01),
+        {**position(), "dt": math.nan},
+        {**position(), "dt": 0.0},
+        {**position(), "vx": math.inf},
+    ],
+)
+def test_invalid_ros_feedback_is_rejected_before_motion(invalid_position):
+    actuator = StubActuator()
+    source = SequenceSource([invalid_position])
+
+    with pytest.raises(RuntimeError, match="invalid position feedback"):
+        run_pd_control(
+            source=source,
+            actuator=actuator,
+            config=CraneConfig(),
+            target_pos=(1.0, 1.0, 1.0),
+            initial_state=CraneState(0.0, 0.0, 0.0),
+            verbose=False,
+            is_simulation=False,
+        )
+
+    assert actuator.apply_calls == []
+    assert actuator.emergency_stop_calls == 1
+
+
 def test_stop_requested_while_waiting_for_position_never_applies_motion():
     actuator = StubActuator()
 
