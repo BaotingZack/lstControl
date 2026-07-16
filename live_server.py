@@ -9,8 +9,8 @@ Supports two rendering modes:
   PLC (real-time):
     The browser shows live /localization_pose data on open.  The user
     sets a target and clicks "Apply Target" to start PD control.
-    A background thread runs the control loop while an SSE endpoint
-    pushes real-time state to the browser Canvas.
+    A background thread runs the control loop while the browser polls
+    the latest thread-safe state; SSE remains available for diagnostics.
 """
 
 from __future__ import annotations
@@ -26,13 +26,37 @@ from urllib.parse import parse_qs, urlparse
 
 from crane_model import (
     ControlHooks,
+    ControlStoppedError,
     CraneConfig,
     CraneState,
+    PositionFeedbackTimeout,
     run_pd_control,
 )
 from ros_bridge import get_latest_pose, RosPositionSource
 from plc_interface import PlcActuator
 from visualizer import CraneVisualizer
+
+
+_MAX_CONTROL_BODY_BYTES = 4096
+
+
+def _parse_control_target(body: str, config: CraneConfig) -> tuple[float, float, float]:
+    """Parse a web target and apply the same safety validation as the CLI."""
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'invalid JSON: {exc.msg}') from exc
+    if not isinstance(payload, dict):
+        raise ValueError('target payload must be a JSON object')
+    try:
+        target = (
+            float(payload['target_x']),
+            float(payload['target_y']),
+            float(payload['target_z']),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f'target_x, target_y, and target_z are required numbers: {exc}') from exc
+    return config.validate_target(target)
 
 
 def _point_tuple(point: tuple[float, float, float]) -> dict[str, float]:
@@ -1264,10 +1288,19 @@ def render_live_html(plc_mode: bool = False) -> str:
       fetch('/api/control-state')
         .then(r => r.json())
         .then(s => {
-          if (!s.running && !s.done && !s.error) return; // control not started yet
+          if (!s.running && !s.done && !s.error && !s.stopped) return; // control not started yet
           if (s.error) {
             _controlActive = false;
             els.ctrlMsg.textContent = 'Error: ' + s.error;
+            els.ctrlMsg.style.color = '#e05a47';
+            els.applyTarget.disabled = false;
+            els.applyTarget.textContent = 'Apply Target';
+            return;
+          }
+          if (s.stopped) {
+            _controlActive = false;
+            els.phase.textContent = 'Control Stopped';
+            els.ctrlMsg.textContent = s.stop_reason || 'Stopped by operator';
             els.ctrlMsg.style.color = '#e05a47';
             els.applyTarget.disabled = false;
             els.applyTarget.textContent = 'Apply Target';
@@ -1590,7 +1623,8 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             print('[control SSE] Client disconnected')
         except Exception as exc:
             print(f'[control SSE] Unexpected error: {exc}')
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
 
     def _handle_start_control(self):
         """POST /api/start-control — parse target and start PLC PD control thread."""
@@ -1600,23 +1634,33 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                         json.dumps({'ok': False, 'error': 'PLC mode not active'}).encode('utf-8'))
             return
 
-        # Read request body
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length).decode('utf-8')
         try:
-            target = json.loads(body)
-            target_x = float(target['target_x'])
-            target_y = float(target['target_y'])
-            target_z = float(target['target_z'])
-        except (ValueError, KeyError, TypeError) as exc:
+            content_length = int(self.headers.get('Content-Length', 0))
+        except ValueError:
+            self._write(400, 'application/json; charset=utf-8',
+                        json.dumps({'ok': False, 'error': 'Invalid Content-Length'}).encode('utf-8'))
+            return
+        if content_length <= 0 or content_length > _MAX_CONTROL_BODY_BYTES:
+            self._write(413, 'application/json; charset=utf-8',
+                        json.dumps({'ok': False, 'error': 'Invalid control request size'}).encode('utf-8'))
+            return
+
+        try:
+            body = self.rfile.read(content_length).decode('utf-8')
+            target_x, target_y, target_z = _parse_control_target(body, server.config)
+        except (UnicodeDecodeError, ValueError) as exc:
             self._write(400, 'application/json; charset=utf-8',
                         json.dumps({'ok': False, 'error': f'Invalid target: {exc}'}).encode('utf-8'))
             return
 
-        # Check if control is already running
-        if server.control_thread is not None and server.control_thread.is_alive():
-            self._write(409, 'application/json; charset=utf-8',
-                        json.dumps({'ok': False, 'error': 'Control already running'}).encode('utf-8'))
+        plc = server.plc
+        if plc is None or not plc.check_connection():
+            self._write(503, 'application/json; charset=utf-8',
+                        json.dumps({'ok': False, 'error': 'PLC connection is not available'}).encode('utf-8'))
+            return
+        if not plc.heartbeat_healthy:
+            self._write(503, 'application/json; charset=utf-8',
+                        json.dumps({'ok': False, 'error': 'PLC heartbeat is not healthy'}).encode('utf-8'))
             return
 
         # Get current position from localization
@@ -1624,6 +1668,20 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         if pose is None:
             self._write(503, 'application/json; charset=utf-8',
                         json.dumps({'ok': False, 'error': 'No localization data — cannot start control'}).encode('utf-8'))
+            return
+        try:
+            pose_x, pose_y, pose_z = server.config.validate_position(
+                (pose['x'], pose['y'], pose['z'])
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            self._write(503, 'application/json; charset=utf-8',
+                        json.dumps({'ok': False, 'error': f'Invalid localization data: {exc}'}).encode('utf-8'))
+            return
+        pose = {**pose, 'x': pose_x, 'y': pose_y, 'z': pose_z}
+
+        if not server.reserve_control_run():
+            self._write(409, 'application/json; charset=utf-8',
+                        json.dumps({'ok': False, 'error': 'Control already running'}).encode('utf-8'))
             return
 
         # Create control state for frontend polling
@@ -1640,7 +1698,7 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
 
         initial_state = CraneState(x0=pose['x'], y0=pose['y'], z0=pose['z'])
         # Update PlcActuator Z height to match current position
-        server.plc_actuator._z_height = pose['z']
+        server.plc_actuator.set_z_reference(pose['z'])
 
         target_pos = (target_x, target_y, target_z)
 
@@ -1660,12 +1718,24 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                     is_simulation=False,
                     max_time=600.0,  # 10min max — same as expected max operation time
                 )
-                print(f'[PLC control] PD complete — {len(history)} steps, arrivals: {[(t,a) for t,a in events]}')
-                hooks.done()
-                cs.set_done()
+                print(f'[PLC control] PD complete — {len(history)} steps, arrivals: {[(t, a) for t, a in events]}')
+                if hooks.should_stop():
+                    cs.set_stopped('Stopped by operator')
+                else:
+                    hooks.done()
+                    cs.set_done()
+            except ControlStoppedError as exc:
+                msg = str(exc)
+                print(f'[PLC control] {msg}')
+                cs.set_stopped(msg)
+            except PositionFeedbackTimeout as exc:
+                msg = f'{exc}. Check ROS /localization_pose.'
+                print(f'[PLC control] {msg}')
+                hooks.send_error(msg)
+                cs.set_error(msg)
             except TimeoutError as exc:
-                msg = (f'Timeout after 20 min — axes did not all arrive. '
-                       f'Check PLC connection or localization. Use STOP ALL to abort sooner.')
+                msg = (f'Timeout after 10 min — axes did not all arrive. '
+                       f'Check PLC connection or localization: {exc}')
                 print(f'[PLC control] {msg}')
                 hooks.send_error(msg)
                 cs.set_error(msg)
@@ -1676,27 +1746,37 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                 hooks.send_error(str(exc))
                 cs.set_error(str(exc))
             finally:
-                server.control_thread = None
-                print(f'[PLC control] Thread exiting')
+                server.release_control_run()
+                print('[PLC control] Thread exiting')
 
-        server.control_thread = threading.Thread(target=_run, name='plc-control', daemon=True)
-        server.control_thread.start()
-        print(f'[PLC control] Thread started')
+        control_thread = threading.Thread(target=_run, name='plc-control', daemon=True)
+        server.set_control_thread(control_thread)
+        try:
+            control_thread.start()
+        except Exception as exc:
+            server.release_control_run()
+            self._write(500, 'application/json; charset=utf-8',
+                        json.dumps({'ok': False, 'error': f'Failed to start control: {exc}'}).encode('utf-8'))
+            return
+        print('[PLC control] Thread started')
 
         self._write(200, 'application/json; charset=utf-8',
                     json.dumps({'ok': True, 'message': 'Control started'}).encode('utf-8'))
 
     def _handle_stop(self):
         """STOP ALL: send zero velocity to all three axes (matches demo.cpp pattern)."""
-        plc = self.server.plc
-        if plc is not None:
-            plc.big_car_ctrl(0.0)
-            plc.small_car_ctrl(0.0)
-            plc.lift_ctrl(0.0)
-        # Also stop PLC control loop if running
         server = self.server
+        # 先置停止标志，再通过执行器锁下发最终 STOP，保证 STOP 后没有运动指令穿插。
         if server.control_hooks is not None:
             server.control_hooks.stop()
+        if server.control_state is not None:
+            server.control_state.set_stopped('Stopped by operator')
+        if server.plc_actuator is not None:
+            server.plc_actuator.emergency_stop()
+        elif server.plc is not None:
+            server.plc.big_car_ctrl(0.0)
+            server.plc.small_car_ctrl(0.0)
+            server.plc.lift_ctrl(0.0)
         self._write(200, 'application/json; charset=utf-8', b'{"ok":true}')
 
     def _handle_reset(self):
@@ -1751,11 +1831,13 @@ class ControlState:
         self.latest: dict | None = None   # most recent step_data
         self.running: bool = False
         self.start_pos: dict | None = None  # {'x','y','z'} at Apply Target time
-        self.target_pos: dict | None = None # {'x','y','z'} target
+        self.target_pos: dict | None = None  # {'x','y','z'} target
         self.step_count: int = 0
         self.arrivals: list = []            # [{'axis': 'x', 't': 1.23}, ...]
         self.done: bool = False
         self.error: str | None = None
+        self.stopped: bool = False
+        self.stop_reason: str | None = None
 
     def set_start(self, pos: dict, target: dict):
         with self.lock:
@@ -1764,6 +1846,8 @@ class ControlState:
             self.running = True
             self.done = False
             self.error = None
+            self.stopped = False
+            self.stop_reason = None
             self.step_count = 0
             self.arrivals = []
 
@@ -1780,11 +1864,24 @@ class ControlState:
         with self.lock:
             self.done = True
             self.running = False
+            self.stopped = False
+            self.stop_reason = None
 
     def set_error(self, msg: str):
         with self.lock:
             self.error = msg
             self.running = False
+            self.done = False
+            self.stopped = False
+            self.stop_reason = None
+
+    def set_stopped(self, reason: str):
+        with self.lock:
+            self.running = False
+            self.done = False
+            self.error = None
+            self.stopped = True
+            self.stop_reason = reason
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -1792,6 +1889,8 @@ class ControlState:
                 'running': self.running,
                 'done': self.done,
                 'error': self.error,
+                'stopped': self.stopped,
+                'stop_reason': self.stop_reason,
                 'step_count': self.step_count,
                 'start_pos': self.start_pos,
                 'target_pos': self.target_pos,
@@ -1818,11 +1917,32 @@ class CraneLiveServer(ThreadingHTTPServer):
         self.control_hooks: LiveControlHooks | None = None
         self.control_thread: threading.Thread | None = None
         self.control_state: ControlState | None = None
+        self._control_run_lock = threading.Lock()
+        self._control_run_reserved = False
 
     def build_payload(self, query: dict[str, list[str]]) -> dict[str, Any]:
         if self.payload_factory is None:
             return self.payload
         return self.payload_factory(query)
+
+    def reserve_control_run(self) -> bool:
+        """Atomically reserve the single PLC control slot."""
+        with self._control_run_lock:
+            if self._control_run_reserved:
+                return False
+            self._control_run_reserved = True
+            return True
+
+    def set_control_thread(self, thread: threading.Thread) -> None:
+        with self._control_run_lock:
+            if not self._control_run_reserved:
+                raise RuntimeError('control run has not been reserved')
+            self.control_thread = thread
+
+    def release_control_run(self) -> None:
+        with self._control_run_lock:
+            self.control_thread = None
+            self._control_run_reserved = False
 
 
 def _find_available_port(host: str, preferred_port: int) -> int:
@@ -1873,4 +1993,14 @@ def serve_live_view(
     except KeyboardInterrupt:
         print('\nLive view stopped.')
     finally:
+        if server.control_hooks is not None:
+            server.control_hooks.stop()
+        if server.plc_actuator is not None:
+            try:
+                server.plc_actuator.emergency_stop()
+            except Exception as exc:
+                print(f'[PLC] Failed to send shutdown stop command: {exc}')
+        control_thread = server.control_thread
+        if control_thread is not None and control_thread.is_alive():
+            control_thread.join(timeout=3.0)
         server.server_close()

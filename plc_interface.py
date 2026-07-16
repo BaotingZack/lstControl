@@ -20,7 +20,6 @@ from __future__ import annotations
 import ctypes
 import threading
 import time
-from typing import Any
 
 from crane_model import CraneState
 
@@ -236,7 +235,6 @@ class RealPLC(PLCInterface):
         self.last_vy: float = 0.0          # last-sent Y velocity
         self.last_hz: float = 0.0          # last-sent Z height
         self.last_vz: float = 0.0          # last-sent Z velocity
-        self.last_vz: float = 0.0          # last-sent Z velocity
         self._lib.connect_to_plc.argtypes = [ctypes.c_char_p]
         self._lib.connect_to_plc.restype = ctypes.c_int
 
@@ -371,16 +369,22 @@ class RealPLC(PLCInterface):
 # Factory
 # ---------------------------------------------------------------------------
 
-def create_plc(lib_path: str = 'plc_lib/lib/libsscarctrl.so', verbose: bool = False) -> PLCInterface:
-    """Try to create a RealPLC; fall back to MockPLC if the library can't load."""
+def create_plc(
+    lib_path: str = 'plc_lib/lib/libsscarctrl.so',
+    verbose: bool = False,
+    allow_mock: bool = False,
+) -> PLCInterface:
+    """Create a PLC interface, requiring explicit opt-in before using a mock."""
     try:
         plc = RealPLC(lib_path)
         print('[PLC] Using RealPLC (ctypes → libsscarctrl.so)')
         return plc
     except OSError as exc:
-        print(f'[PLC] Cannot load {lib_path}: {exc}')
-        print('[PLC] Falling back to MockPLC (print-based)')
-        return MockPLC(verbose=verbose)
+        if allow_mock:
+            print(f'[PLC] Cannot load {lib_path}: {exc}')
+            print('[PLC] Explicit mock mode enabled — using MockPLC')
+            return MockPLC(verbose=verbose)
+        raise RuntimeError(f'Cannot load PLC library {lib_path}: {exc}') from exc
 
 
 # ============================================================================
@@ -400,14 +404,14 @@ class PlcActuator:
     """
 
     _DEADBAND = 0.005  # [m/s or m] 最小变化阈值
-    _Z_CLAMP_MARGIN = 1.0  # [m] Z 轴高度上限 (当前位置 + 此值)
 
     def __init__(self, plc: PLCInterface, initial_z: float = 0.0):
         self._plc = plc
+        self._command_lock = threading.RLock()
         self._z_height = initial_z          # Z 轴绝对高度积分值
         self._last_vx: float | None = None
         self._last_vy: float | None = None
-        self._last_vz_cmd: float | None = None
+        self._last_z_height: float | None = None
         self._last_log: float = 0.0          # 上次 PD 日志时间
 
     _log_interval = 1.0  # [s] PD 输出日志最小间隔
@@ -418,57 +422,99 @@ class PlcActuator:
         X/Y 轴: 直接发送速度指令 (含 deadband 过滤)
         Z 轴:   vz * dt 积分 → 绝对高度 → liftctrl()
         """
-        # 定期打印 PD 输出 (每秒最多一次, 避免刷屏)
-        now = time.time()
-        if not hasattr(self, '_last_log') or now - self._last_log > self._log_interval:
-            print(f'[PD] v_cmd=(x={vx:+.4f}, y={vy:+.4f}, z={vz:+.4f}) m/s  z_h={self._z_height:.3f}m')
-            self._last_log = now
+        with self._command_lock:
+            self._ensure_available()
 
-        # X 轴
-        self._plc.last_vx = vx  # 始终更新, 供前端轮询
-        if self._last_vx is None or abs(vx - self._last_vx) > self._DEADBAND:
-            self._plc.big_car_ctrl(vx)
-            self._last_vx = vx
+            # 定期打印 PD 输出 (每秒最多一次, 避免刷屏)
+            now = time.time()
+            if now - self._last_log > self._log_interval:
+                print(f'[PD] v_cmd=(x={vx:+.4f}, y={vy:+.4f}, z={vz:+.4f}) m/s  z_h={self._z_height:.3f}m')
+                self._last_log = now
 
-        # Y 轴
-        self._plc.last_vy = vy
-        if self._last_vy is None or abs(vy - self._last_vy) > self._DEADBAND:
-            self._plc.small_car_ctrl(vy)
-            self._last_vy = vy
+            # X/Y 的零速指令不能被 deadband 吞掉。
+            self._plc.last_vx = vx
+            if self._should_send_velocity(vx, self._last_vx):
+                self._plc.big_car_ctrl(vx)
+                self._last_vx = vx
 
-        # Z 轴 — 积分速度 → 绝对高度
-        self._z_height += vz * dt
-        self._z_height = max(0.0, self._z_height)
-        self._plc.last_vz = vz
-        self._plc.last_hz = self._z_height
-        if self._last_vz_cmd is None or abs(vz - self._last_vz_cmd) > self._DEADBAND:
-            self._plc.lift_ctrl(self._z_height)
-            self._last_vz_cmd = vz
+            self._plc.last_vy = vy
+            if self._should_send_velocity(vy, self._last_vy):
+                self._plc.small_car_ctrl(vy)
+                self._last_vy = vy
+
+            # Z 轴 API 接收绝对高度。节流必须比较高度设定值，而不是 vz。
+            self._z_height = max(0.0, self._z_height + vz * dt)
+            self._plc.last_vz = vz
+            self._plc.last_hz = self._z_height
+            if (
+                self._last_z_height is None
+                or abs(self._z_height - self._last_z_height) >= self._DEADBAND
+            ):
+                self._plc.lift_ctrl(self._z_height)
+                self._last_z_height = self._z_height
+
+    def _ensure_available(self) -> None:
+        if not self._plc.check_connection():
+            raise RuntimeError('PLC connection is not available')
+        if not self._plc.heartbeat_healthy:
+            raise RuntimeError('PLC heartbeat is not healthy')
+
+    @staticmethod
+    def _should_send_velocity(value: float, previous: float | None) -> bool:
+        if previous is None:
+            return True
+        if value == 0.0 and previous != 0.0:
+            return True
+        return abs(value - previous) >= PlcActuator._DEADBAND
+
+    def set_z_reference(self, height: float) -> None:
+        """Synchronize the Z integrator with a fresh localization measurement."""
+        with self._command_lock:
+            self._z_height = max(0.0, float(height))
+            self._last_z_height = None
 
     def update_state(self, state: CraneState, position: dict) -> None:
         """从 /localization_pose 数据更新 CraneState。
 
         位置直接来自定位, 速度使用 Odometry 原生速度 (若可用) 或 PD 指令速度。
         """
-        state.x.position = position['x']
-        state.y.position = position['y']
-        state.z.position = position['z']
+        with self._command_lock:
+            state.x.position = position['x']
+            state.y.position = position['y']
+            state.z.position = position['z']
+            self._z_height = max(0.0, position['z'])
 
-        # 优先使用 Odometry 原生速度, 若不可用则保留 PD cmd (在 run_pd_control 中设置)
-        if position.get('vx') is not None:
-            state.x.velocity = position['vx']
-            state.y.velocity = position['vy']
-            state.z.velocity = position['vz']
+            # 优先使用 Odometry 原生速度, 若不可用则保留当前状态。
+            if position.get('vx') is not None:
+                state.x.velocity = position['vx']
+                state.y.velocity = position['vy']
+                state.z.velocity = position['vz']
+
+    def stop_motion(self) -> None:
+        """正常到位：X/Y 归零，Z 保持当前绝对高度。"""
+        with self._command_lock:
+            self._plc.big_car_ctrl(0.0)
+            self._plc.small_car_ctrl(0.0)
+            self._plc.lift_ctrl(self._z_height)
+            self._plc.last_vx = 0.0
+            self._plc.last_vy = 0.0
+            self._plc.last_vz = 0.0
+            self._plc.last_hz = self._z_height
+            self._last_vx = 0.0
+            self._last_vy = 0.0
+            self._last_z_height = self._z_height
 
     def emergency_stop(self) -> None:
         """安全停止 — 匹配 demo.cpp STOP ALL 模式。"""
-        self._plc.big_car_ctrl(0.0)
-        self._plc.small_car_ctrl(0.0)
-        self._plc.lift_ctrl(0.0)
-        self._plc.last_vx = 0.0
-        self._plc.last_vy = 0.0
-        self._plc.last_vz = 0.0
-        self._last_vx = self._last_vy = self._last_vz_cmd = None
+        with self._command_lock:
+            self._plc.big_car_ctrl(0.0)
+            self._plc.small_car_ctrl(0.0)
+            self._plc.lift_ctrl(0.0)
+            self._plc.last_vx = 0.0
+            self._plc.last_vy = 0.0
+            self._plc.last_vz = 0.0
+            self._plc.last_hz = 0.0
+            self._last_vx = self._last_vy = self._last_z_height = None
 
     def cleanup(self) -> None:
         """控制结束后的清理 (PLC 连接保持, 仅重置内部状态)。"""

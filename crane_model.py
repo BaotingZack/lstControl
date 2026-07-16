@@ -198,7 +198,7 @@ class CraneConfig:
     servo_time_constant_z: float = 0.12    # [s] Z 速度环一阶响应时间常数
     enable_disturbance: bool = True        # 是否启用外扰和测量噪声
     disturbance_seed: int = 7              # 扰动随机种子, 保证仿真可复现
-    disturbance_velocity_xy: float = 0.006 # [m/s] XY 低频等效速度扰动幅值
+    disturbance_velocity_xy: float = 0.006  # [m/s] XY 低频等效速度扰动幅值
     disturbance_velocity_z: float = 0.003  # [m/s] Z 低频等效速度扰动幅值
     measurement_noise_xy: float = 0.0005   # [m] XY 位置反馈测量噪声标准差
     measurement_noise_z: float = 0.0003    # [m] Z 位置反馈测量噪声标准差
@@ -212,10 +212,17 @@ class CraneConfig:
     dt: float = 0.01                   # [s] 仿真步长
     arrival_pos_tol: float = 0.01      # [m] 到达判断位置容差
     arrival_vel_tol: float = 0.005     # [m/s] 到达判断速度容差
-    velocity_deadband: float = 0.01    # [m/s] 零速阈值, |v|低于此值+到位 → 强制归零
-                                        #       模拟伺服驱动 zero-speed 窗口行为
+    # 零速阈值；低于此值且到位时，模拟伺服驱动的 zero-speed 窗口行为。
+    velocity_deadband: float = 0.01
     arrival_capture_pos_tol: float = 0.02  # [m] 到位捕获位置窗口
     arrival_cmd_tol: float = 0.015         # [m/s] 到位捕获速度指令窗口
+
+    # --- 可选机械工作区 ---
+    # 现场行程因设备而异，X/Y 不提供虚假的默认范围；PLC 部署时应显式配置。
+    # Z=0 为地面，因此即使未配置 workspace_z_bounds，也拒绝负高度。
+    workspace_x_bounds: tuple[float, float] | None = None
+    workspace_y_bounds: tuple[float, float] | None = None
+    workspace_z_bounds: tuple[float, float] | None = None
 
     def __post_init__(self):
         positive_fields = {
@@ -232,7 +239,7 @@ class CraneConfig:
             'velocity_filter_tau_plc': self.velocity_filter_tau_plc,
         }
         for name, value in positive_fields.items():
-            if value <= 0:
+            if not math.isfinite(value) or value <= 0:
                 raise ValueError(f'{name} must be positive')
 
         non_negative_fields = {
@@ -252,8 +259,64 @@ class CraneConfig:
             'measurement_noise_z': self.measurement_noise_z,
         }
         for name, value in non_negative_fields.items():
-            if value < 0:
+            if not math.isfinite(value) or value < 0:
                 raise ValueError(f'{name} must be non-negative')
+
+        for axis_name, bounds in (
+            ('X', self.workspace_x_bounds),
+            ('Y', self.workspace_y_bounds),
+            ('Z', self.workspace_z_bounds),
+        ):
+            if bounds is None:
+                continue
+            if len(bounds) != 2:
+                raise ValueError(f'{axis_name} workspace bounds must contain min and max')
+            lower, upper = bounds
+            if not math.isfinite(lower) or not math.isfinite(upper):
+                raise ValueError(f'{axis_name} workspace bounds must be finite')
+            if lower > upper:
+                raise ValueError(f'{axis_name} workspace minimum must not exceed maximum')
+
+    def validate_target(
+        self,
+        target_pos: tuple[float, float, float],
+    ) -> tuple[float, float, float]:
+        """Validate and normalize a dispatch target before motion is enabled."""
+        return self._validate_coordinates(target_pos, label='target')
+
+    def validate_position(
+        self,
+        position: tuple[float, float, float],
+    ) -> tuple[float, float, float]:
+        """Validate a localization position against physical constraints."""
+        return self._validate_coordinates(position, label='position')
+
+    def _validate_coordinates(
+        self,
+        coordinates: tuple[float, float, float],
+        *,
+        label: str,
+    ) -> tuple[float, float, float]:
+        if len(coordinates) != 3:
+            raise ValueError(f'{label} must contain exactly X, Y, and Z')
+
+        values = tuple(float(value) for value in coordinates)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(f'{label} coordinates must be finite numbers')
+        if values[2] < 0.0:
+            raise ValueError(f'Z {label} must be non-negative')
+
+        for axis_name, value, bounds in (
+            ('X', values[0], self.workspace_x_bounds),
+            ('Y', values[1], self.workspace_y_bounds),
+            ('Z', values[2], self.workspace_z_bounds),
+        ):
+            if bounds is not None and not bounds[0] <= value <= bounds[1]:
+                raise ValueError(
+                    f'{axis_name} {label} {value} is outside workspace '
+                    f'[{bounds[0]}, {bounds[1]}]'
+                )
+        return values
 
 
 # ============================================================================
@@ -307,6 +370,10 @@ class Actuator:
     def emergency_stop(self) -> None:
         """安全停止 — 立即发送零速度指令。"""
         pass
+
+    def stop_motion(self) -> None:
+        """正常完成后停止运动，同时保持安全的位置设定。"""
+        self.emergency_stop()
 
     def cleanup(self) -> None:
         """控制运行结束后的清理。"""
@@ -401,10 +468,55 @@ class PlantActuator(Actuator):
             axis = getattr(self._state, axis_name)
             axis.velocity = 0.0
 
+    def stop_motion(self) -> None:
+        self.emergency_stop()
+
 
 # ============================================================================
 # 统一 PD 控制循环
 # ============================================================================
+
+
+class ControlRunError(RuntimeError):
+    """Base class for an abnormal control-loop termination."""
+
+
+class ControlStoppedError(ControlRunError):
+    """Raised when an operator or external hook stops a control run."""
+
+
+class PositionFeedbackTimeout(ControlRunError):
+    """Raised when the position source stops delivering fresh measurements."""
+
+
+class PositionFeedbackError(ControlRunError):
+    """Raised when a position measurement is unsafe or malformed."""
+
+
+def _validate_position_feedback(position: dict, config: CraneConfig) -> dict:
+    """Return normalized feedback or fail before it reaches the controller."""
+    try:
+        normalized = dict(position)
+        normalized['x'], normalized['y'], normalized['z'] = config.validate_position(
+            (position['x'], position['y'], position['z'])
+        )
+        normalized['dt'] = float(position['dt'])
+        normalized['t'] = float(position['t'])
+        if not math.isfinite(normalized['dt']) or normalized['dt'] <= 0.0:
+            raise ValueError('dt must be a finite positive number')
+        if not math.isfinite(normalized['t']) or normalized['t'] < 0.0:
+            raise ValueError('t must be a finite non-negative number')
+        for velocity_name in ('vx', 'vy', 'vz'):
+            velocity = position.get(velocity_name)
+            if velocity is not None:
+                velocity = float(velocity)
+                if not math.isfinite(velocity):
+                    raise ValueError(f'{velocity_name} must be finite')
+            normalized[velocity_name] = velocity
+        return normalized
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PositionFeedbackError(f'invalid position feedback: {exc}') from exc
+
 
 def _axis_arrived(axis, target: float, config: CraneConfig) -> bool:
     """判断单轴是否已到达目标 (位置 + 速度双重判定)。"""
@@ -461,7 +573,7 @@ def run_pd_control(
     crane.y.velocity = initial_state.y.velocity
     crane.z.velocity = initial_state.z.velocity
 
-    target_x, target_y, target_z = target_pos
+    target_x, target_y, target_z = config.validate_target(target_pos)
 
     # 根据模式选择速度滤波时间常数
     filter_tau = config.velocity_filter_tau if is_simulation else config.velocity_filter_tau_plc
@@ -514,96 +626,109 @@ def run_pd_control(
     if hasattr(actuator, '_state'):
         actuator._state = crane
 
-    while not all(locked.values()):
-        # --- 检查钩子中断 ---
-        if hooks is not None and hooks.should_stop():
-            if verbose:
-                print(f"{mode_label} 控制被外部中断")
-            actuator.emergency_stop()
-            break
+    completed = False
+    try:
+        while not all(locked.values()):
+            # --- 检查钩子中断 ---
+            if hooks is not None and hooks.should_stop():
+                raise ControlStoppedError(f'{mode_label} control stopped by external request')
 
-        # --- STEP 1: 获取位置反馈 ---
-        pos = source.get_position()
-        if pos is None:
-            # 超时/断流 — 安全停止
-            if verbose:
-                print(f"{mode_label} 定位数据超时 — 安全停止")
-            actuator.emergency_stop()
-            break
+            # --- STEP 1: 获取位置反馈 ---
+            pos = source.get_position()
+            if pos is None:
+                raise PositionFeedbackTimeout(
+                    f'{mode_label} position feedback timed out'
+                )
 
-        x_measured = pos['x']
-        y_measured = pos['y']
-        z_measured = pos['z']
-        dt = pos['dt']
-        t = pos['t']
+            # STOP 可能在阻塞等待定位数据期间到达；下发新指令前必须再次检查。
+            if hooks is not None and hooks.should_stop():
+                raise ControlStoppedError(f'{mode_label} control stopped by external request')
 
-        if max_time is not None and t > max_time:
-            raise TimeoutError(f"{mode_label} control did not finish within {max_time:.2f}s (t={t:.2f}s)")
+            pos = _validate_position_feedback(pos, config)
 
-        # --- STEP 2-3: 速度估计 + PD 控制 (共用核心) ---
-        vx_raw, vx_filtered = filters['x'].update(x_measured, dt)
-        vy_raw, vy_filtered = filters['y'].update(y_measured, dt)
-        vz_raw, vz_filtered = filters['z'].update(z_measured, dt)
+            x_measured = pos['x']
+            y_measured = pos['y']
+            z_measured = pos['z']
+            dt = pos['dt']
+            t = pos['t']
 
-        vx_cmd = 0.0 if locked['x'] else controllers['x'].update(target_x, x_measured, vx_filtered)
-        vy_cmd = 0.0 if locked['y'] else controllers['y'].update(target_y, y_measured, vy_filtered)
-        vz_cmd = 0.0 if locked['z'] else controllers['z'].update(target_z, z_measured, vz_filtered)
+            if max_time is not None and t > max_time:
+                raise TimeoutError(
+                    f"{mode_label} control did not finish within "
+                    f"{max_time:.2f}s (t={t:.2f}s)"
+                )
 
-        # --- STEP 4: 执行 — 委托给 Actuator ---
-        if is_simulation:
-            # 仿真模式: plant.update_axis() 更新 state
-            plant = getattr(source, '_plant', None)
-            if plant is not None:
-                disturbance_x = plant.update_axis('x', crane.x, vx_cmd, target_x, locked['x'], dt, t)
-                disturbance_y = plant.update_axis('y', crane.y, vy_cmd, target_y, locked['y'], dt, t)
-                disturbance_z = plant.update_axis('z', crane.z, vz_cmd, target_z, locked['z'], dt, t)
-        else:
-            # PLC 模式: 发送指令到真实 PLC
-            actuator.apply(vx_cmd, vy_cmd, vz_cmd, dt)
-            # 从定位数据更新 state
-            actuator.update_state(crane, pos)
-            disturbance_x = disturbance_y = disturbance_z = 0.0
+            # --- STEP 2-3: 速度估计 + PD 控制 (共用核心) ---
+            vx_raw, vx_filtered = filters['x'].update(x_measured, dt)
+            vy_raw, vy_filtered = filters['y'].update(y_measured, dt)
+            vz_raw, vz_filtered = filters['z'].update(z_measured, dt)
 
-        # --- STEP 5: 到达检测 ---
-        axis_data = [
-            ('x', crane.x, target_x, vx_cmd),
-            ('y', crane.y, target_y, vy_cmd),
-            ('z', crane.z, target_z, vz_cmd),
-        ]
-        for name, axis, target, cmd in axis_data:
-            in_capture_window = abs(axis.position - target) < config.arrival_capture_pos_tol
-            command_settled = abs(cmd) < config.arrival_cmd_tol
-            if not locked[name] and (_axis_arrived(axis, target, config) or (in_capture_window and command_settled)):
-                axis.position = target
-                axis.velocity = 0.0
-                locked[name] = True
-                arrival_events.append((t, name))
-                if hooks is not None:
-                    hooks.on_arrival(name, t)
+            vx_cmd = 0.0 if locked['x'] else controllers['x'].update(target_x, x_measured, vx_filtered)
+            vy_cmd = 0.0 if locked['y'] else controllers['y'].update(target_y, y_measured, vy_filtered)
+            vz_cmd = 0.0 if locked['z'] else controllers['z'].update(target_z, z_measured, vz_filtered)
 
-        # --- STEP 6: 记录历史 ---
-        step_data = {
-            't': t,
-            'x': crane.x.position, 'y': crane.y.position, 'z': crane.z.position,
-            'vx': crane.x.velocity, 'vy': crane.y.velocity, 'vz': crane.z.velocity,
-            'p_ref_x': target_x, 'p_ref_y': target_y, 'p_ref_z': target_z,
-            'v_ref_x': 0.0, 'v_ref_y': 0.0, 'v_ref_z': 0.0,
-            'vx_cmd': vx_cmd, 'vy_cmd': vy_cmd, 'vz_cmd': vz_cmd,
-            'x_measured': x_measured, 'y_measured': y_measured, 'z_measured': z_measured,
-            'vx_raw': vx_raw, 'vy_raw': vy_raw, 'vz_raw': vz_raw,
-            'vx_filtered': vx_filtered, 'vy_filtered': vy_filtered, 'vz_filtered': vz_filtered,
-            'disturbance_x': disturbance_x, 'disturbance_y': disturbance_y, 'disturbance_z': disturbance_z,
-        }
-        history.append(step_data)
+            # --- STEP 4: 执行 — 委托给 Actuator ---
+            if is_simulation:
+                # 仿真模式: plant.update_axis() 更新 state
+                plant = getattr(source, '_plant', None)
+                if plant is not None:
+                    disturbance_x = plant.update_axis('x', crane.x, vx_cmd, target_x, locked['x'], dt, t)
+                    disturbance_y = plant.update_axis('y', crane.y, vy_cmd, target_y, locked['y'], dt, t)
+                    disturbance_z = plant.update_axis('z', crane.z, vz_cmd, target_z, locked['z'], dt, t)
+            else:
+                # PLC 模式: 发送指令到真实 PLC
+                actuator.apply(vx_cmd, vy_cmd, vz_cmd, dt)
+                # 从定位数据更新 state
+                actuator.update_state(crane, pos)
+                disturbance_x = disturbance_y = disturbance_z = 0.0
 
-        if hooks is not None:
-            hooks.on_step(step_data)
+            # --- STEP 5: 到达检测 ---
+            axis_data = [
+                ('x', crane.x, target_x, vx_cmd),
+                ('y', crane.y, target_y, vy_cmd),
+                ('z', crane.z, target_z, vz_cmd),
+            ]
+            for name, axis, target, cmd in axis_data:
+                in_capture_window = abs(axis.position - target) < config.arrival_capture_pos_tol
+                command_settled = abs(cmd) < config.arrival_cmd_tol
+                if not locked[name] and (_axis_arrived(axis, target, config) or (in_capture_window and command_settled)):
+                    axis.position = target
+                    axis.velocity = 0.0
+                    locked[name] = True
+                    arrival_events.append((t, name))
+                    if hooks is not None:
+                        hooks.on_arrival(name, t)
 
-    if verbose:
-        final = history[-1]
-        print("=" * 50)
-        print(f"{mode_label}完成! 总时间: {final['t']:.2f}s")
-        print(f"最终位置: X={final['x']:.3f}, Y={final['y']:.3f}, Z={final['z']:.3f}")
+            # --- STEP 6: 记录历史 ---
+            step_data = {
+                't': t,
+                'x': crane.x.position, 'y': crane.y.position, 'z': crane.z.position,
+                'vx': crane.x.velocity, 'vy': crane.y.velocity, 'vz': crane.z.velocity,
+                'p_ref_x': target_x, 'p_ref_y': target_y, 'p_ref_z': target_z,
+                'v_ref_x': 0.0, 'v_ref_y': 0.0, 'v_ref_z': 0.0,
+                'vx_cmd': vx_cmd, 'vy_cmd': vy_cmd, 'vz_cmd': vz_cmd,
+                'x_measured': x_measured, 'y_measured': y_measured, 'z_measured': z_measured,
+                'vx_raw': vx_raw, 'vy_raw': vy_raw, 'vz_raw': vz_raw,
+                'vx_filtered': vx_filtered, 'vy_filtered': vy_filtered, 'vz_filtered': vz_filtered,
+                'disturbance_x': disturbance_x, 'disturbance_y': disturbance_y, 'disturbance_z': disturbance_z,
+            }
+            history.append(step_data)
 
-    actuator.cleanup()
-    return history, arrival_events
+            if hooks is not None:
+                hooks.on_step(step_data)
+
+        completed = True
+        if verbose:
+            final = history[-1]
+            print("=" * 50)
+            print(f"{mode_label}完成! 总时间: {final['t']:.2f}s")
+            print(f"最终位置: X={final['x']:.3f}, Y={final['y']:.3f}, Z={final['z']:.3f}")
+        return history, arrival_events
+    finally:
+        try:
+            if completed:
+                actuator.stop_motion()
+            else:
+                actuator.emergency_stop()
+        finally:
+            actuator.cleanup()

@@ -18,19 +18,19 @@ PLC 每个周期读取位置反馈，估计并滤波速度，使用 PD 输出速
     - 位置反馈来自 ROS /localization_pose (10 Hz)
     - 10 Hz 事件驱动, 跟随定位数据节奏
     - 开 UI 后设置 Target → Apply Target → 开始 PD 控制
-    - SSE 实时推送状态到浏览器
+    - HTTP 轮询控制状态，SSE 保留为诊断通道
 """
 
 from __future__ import annotations
+
+import argparse
+import time
 
 # Must be set before any matplotlib import (headless mode, no tkinter)
 import matplotlib
 matplotlib.use('Agg')
 
-import argparse
-import time
-
-from crane_model import (
+from crane_model import (  # noqa: E402
     CraneConfig,
     CranePlant,
     CraneState,
@@ -38,10 +38,10 @@ from crane_model import (
     SimPositionSource,
     run_pd_control,
 )
-from live_server import build_live_payload, serve_live_view
-from plc_interface import PlcActuator, create_plc
-from ros_bridge import RosPositionSource, get_latest_pose, start_ros_bridge
-from visualizer import CraneVisualizer
+from live_server import build_live_payload, serve_live_view  # noqa: E402
+from plc_interface import PlcActuator, create_plc  # noqa: E402
+from ros_bridge import RosPositionSource, get_latest_pose, start_ros_bridge  # noqa: E402
+from visualizer import CraneVisualizer  # noqa: E402
 
 
 # ============================================================================
@@ -92,7 +92,59 @@ def _build_arg_parser():
     parser.add_argument('--plc-ip', default='', help='PLC IP (empty = lab simulation; set to e.g. 192.168.0.1 for real PLC)')
     parser.add_argument('--plc-lib', default='plc_lib/lib/libsscarctrl.so',
                         help='path to libsscarctrl.so')
+    parser.add_argument('--allow-mock-plc', action='store_true',
+                        help='explicitly allow MockPLC when the real PLC library cannot load')
+    for axis in ('x', 'y', 'z'):
+        parser.add_argument(f'--workspace-{axis}-min', type=float, default=None,
+                            help=f'minimum allowed {axis.upper()} target in PLC workspace')
+        parser.add_argument(f'--workspace-{axis}-max', type=float, default=None,
+                            help=f'maximum allowed {axis.upper()} target in PLC workspace')
     return parser
+
+
+def _workspace_bounds_from_args(args, axis: str) -> tuple[float, float] | None:
+    lower = getattr(args, f'workspace_{axis}_min')
+    upper = getattr(args, f'workspace_{axis}_max')
+    if lower is None and upper is None:
+        return None
+    if lower is None or upper is None:
+        raise ValueError(
+            f'workspace {axis.upper()} requires both --workspace-{axis}-min '
+            f'and --workspace-{axis}-max'
+        )
+    return (lower, upper)
+
+
+def _config_from_args(args) -> CraneConfig:
+    return CraneConfig(
+        max_velocity_xy=0.3,
+        max_velocity_z=0.2,
+        kp_pos=0.6,
+        kd_pos=0.45,
+        dt=0.01,
+        workspace_x_bounds=_workspace_bounds_from_args(args, 'x'),
+        workspace_y_bounds=_workspace_bounds_from_args(args, 'y'),
+        workspace_z_bounds=_workspace_bounds_from_args(args, 'z'),
+    )
+
+
+def _connect_plc(args):
+    """Create and connect the selected PLC, failing closed on startup errors."""
+    plc = create_plc(
+        lib_path=args.plc_lib,
+        allow_mock=args.allow_mock_plc,
+    )
+    try:
+        result = plc.connect(args.plc_ip)
+        if result != 0:
+            raise ConnectionError(
+                f'Failed to connect PLC at {args.plc_ip}: ret={result}'
+            )
+        plc.start_heartbeat()
+        return plc
+    except Exception:
+        plc.disconnect()
+        raise
 
 
 def _query_float(query: dict[str, list[str]], names: tuple[str, ...], default: float) -> float:
@@ -119,63 +171,54 @@ def _target_from_query(
 
 def main(argv=None):
     args = _build_arg_parser().parse_args(argv)
-    config = CraneConfig(
-        max_velocity_xy=0.3,
-        max_velocity_z=0.2,
-        kp_pos=0.6,
-        kd_pos=0.45,
-        dt=0.01,
-    )
+    config = _config_from_args(args)
     crane0 = CraneState(x0=0.0, y0=0.0, z0=0.0)
-    target_pos = (args.target_x, args.target_y, args.target_z)
+    target_pos = config.validate_target((args.target_x, args.target_y, args.target_z))
 
     # ---- PLC 模式 ----
     if args.plc_ip:
-        plc = create_plc(lib_path=args.plc_lib)
-        plc.connect(args.plc_ip)
-        plc.start_heartbeat()
-        start_ros_bridge()
+        plc = _connect_plc(args)
+        try:
+            start_ros_bridge()
 
-        # 等待首次定位数据 (超时 5s)
-        print('Waiting for /localization_pose...')
-        waited = 0.0
-        while get_latest_pose() is None and waited < 5.0:
-            time.sleep(0.1)
-            waited += 0.1
-        pose = get_latest_pose()
-        if pose is not None:
-            crane0 = CraneState(x0=pose['x'], y0=pose['y'], z0=pose['z'])
-            px, py, pz = pose['x'], pose['y'], pose['z']
-            print(f'Localization received: X={px:.2f}, Y={py:.2f}, Z={pz:.2f}')
-        else:
-            print('Warning: /localization_pose timeout, using default initial position')
+            # 等待首次定位数据 (超时 5s)
+            print('Waiting for /localization_pose...')
+            waited = 0.0
+            while get_latest_pose() is None and waited < 5.0:
+                time.sleep(0.1)
+                waited += 0.1
+            pose = get_latest_pose()
+            if pose is not None:
+                px, py, pz = config.validate_position(
+                    (pose['x'], pose['y'], pose['z'])
+                )
+                crane0 = CraneState(x0=px, y0=py, z0=pz)
+                print(f'Localization received: X={px:.2f}, Y={py:.2f}, Z={pz:.2f}')
+            else:
+                print('Warning: /localization_pose timeout, using default initial position')
 
-        initial_pos = (crane0.x.position, crane0.y.position, crane0.z.position)
-
-        if args.live:
-            # PLC 实时控制模式: 开 UI, 等用户 Apply Target
+            initial_pos = (crane0.x.position, crane0.y.position, crane0.z.position)
             ros_source = RosPositionSource()
             plc_actuator = PlcActuator(plc, initial_z=crane0.z.position)
 
-            print(f'Live view starting — set target in browser and click "Apply Target"')
-            serve_live_view(
-                payload=None,  # PLC 模式不需要回放数据
-                host=args.host,
-                port=args.port,
-                payload_factory=None,
-                plc=plc,
-                ros_source=ros_source,
-                plc_actuator=plc_actuator,
-                config=config,
-                initial_pos=initial_pos,
-                update_hz=args.hz,
-                speed=args.speed,
-            )
-        else:
-            # PLC 模式非 live: 使用命令行 target 直接运行 (兼容旧行为)
-            ros_source = RosPositionSource()
-            plc_actuator = PlcActuator(plc, initial_z=crane0.z.position)
-            try:
+            if args.live:
+                # PLC 实时控制模式: 开 UI, 等用户 Apply Target
+                print('Live view starting — set target in browser and click "Apply Target"')
+                serve_live_view(
+                    payload=None,  # PLC 模式不需要回放数据
+                    host=args.host,
+                    port=args.port,
+                    payload_factory=None,
+                    plc=plc,
+                    ros_source=ros_source,
+                    plc_actuator=plc_actuator,
+                    config=config,
+                    initial_pos=initial_pos,
+                    update_hz=args.hz,
+                    speed=args.speed,
+                )
+            else:
+                # PLC 模式非 live: 使用命令行 target 直接运行
                 history, arrival_events = run_pd_control(
                     source=ros_source,
                     actuator=plc_actuator,
@@ -185,29 +228,25 @@ def main(argv=None):
                     verbose=True,
                     is_simulation=False,
                 )
-            finally:
-                plc.disconnect()
-
-            viz = CraneVisualizer(config)
-            viz.plot(history, arrival_events)
-            viz.plot_operation_diagram(
-                history=history,
-                phase_boundaries=arrival_events,
-                target_pos=target_pos,
-                initial_pos=initial_pos,
-            )
+                viz = CraneVisualizer(config)
+                viz.plot(history, arrival_events)
+                viz.plot_operation_diagram(
+                    history=history,
+                    phase_boundaries=arrival_events,
+                    target_pos=target_pos,
+                    initial_pos=initial_pos,
+                )
+        finally:
+            plc.disconnect()
         return
 
     # ---- 仿真模式 ----
-    try:
-        history, arrival_events = run_simulation(
-            target_pos=target_pos,
-            initial_state=crane0,
-            config=config,
-            verbose=True,
-        )
-    except Exception:
-        raise
+    history, arrival_events = run_simulation(
+        target_pos=target_pos,
+        initial_state=crane0,
+        config=config,
+        verbose=True,
+    )
 
     initial_pos = (crane0.x.position, crane0.y.position, crane0.z.position)
     viz = CraneVisualizer(config)
@@ -221,7 +260,6 @@ def main(argv=None):
 
     if args.live:
         # 仿真回放模式: 直接回放已完成的仿真
-        # (PLC 模式不需要 ROS, 但 live_view 的 SSE 需要 start_ros_bridge)
         _state = {'target': target_pos, 'initial': initial_pos}
 
         def live_payload_for_query(query: dict[str, list[str]]):
