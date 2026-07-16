@@ -1,9 +1,12 @@
 import math
+import json
+import threading
 
 import pytest
 
+import live_server
 from crane_model import ControlHooks, CraneConfig, CraneState, run_pd_control
-from live_server import ControlState
+from live_server import ControlState, CraneLiveServer
 from plc_interface import MockPLC, PlcActuator, create_plc
 
 
@@ -247,3 +250,51 @@ def test_missing_plc_library_requires_explicit_mock_opt_in(tmp_path):
         create_plc(lib_path=str(missing_library), allow_mock=True),
         MockPLC,
     )
+
+
+def test_web_target_parser_uses_control_config_validation():
+    config = CraneConfig(workspace_x_bounds=(0.0, 5.0))
+
+    assert live_server._parse_control_target(
+        json.dumps({"target_x": 2, "target_y": 1, "target_z": 3}),
+        config,
+    ) == (2.0, 1.0, 3.0)
+
+    with pytest.raises(ValueError, match="finite"):
+        live_server._parse_control_target(
+            '{"target_x": NaN, "target_y": 1, "target_z": 3}',
+            config,
+        )
+    with pytest.raises(ValueError, match="X target"):
+        live_server._parse_control_target(
+            json.dumps({"target_x": 6, "target_y": 1, "target_z": 3}),
+            config,
+        )
+
+
+def test_control_run_reservation_allows_only_one_concurrent_starter():
+    server = CraneLiveServer(("127.0.0.1", 0), payload=None)
+    barrier = threading.Barrier(8)
+    reservations = []
+    result_lock = threading.Lock()
+
+    def reserve():
+        barrier.wait()
+        result = server.reserve_control_run()
+        with result_lock:
+            reservations.append(result)
+
+    threads = [threading.Thread(target=reserve) for _ in range(8)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert reservations.count(True) == 1
+        assert reservations.count(False) == 7
+        server.release_control_run()
+        assert server.reserve_control_run() is True
+    finally:
+        server.release_control_run()
+        server.server_close()
