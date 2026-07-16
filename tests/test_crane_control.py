@@ -158,6 +158,7 @@ def test_browser_live_html_contains_canvas_bootstrap():
     assert "drawCraneBay" in html
     assert "drawTrolleyCloseup" in html
     assert "Trolley Movement" in html
+    assert "!s.error && !s.stopped" in html
 
 
 def test_simulation_has_timeout_guard(default_config):
