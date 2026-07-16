@@ -5,6 +5,7 @@ import threading
 import pytest
 
 import live_server
+import main
 from crane_model import ControlHooks, CraneConfig, CraneState, run_pd_control
 from live_server import ControlState, CraneLiveServer
 from plc_interface import MockPLC, PlcActuator, create_plc
@@ -298,3 +299,58 @@ def test_control_run_reservation_allows_only_one_concurrent_starter():
     finally:
         server.release_control_run()
         server.server_close()
+
+
+def test_cli_builds_workspace_bounds_and_explicit_mock_mode():
+    args = main._build_arg_parser().parse_args(
+        [
+            "--allow-mock-plc",
+            "--workspace-x-min", "0",
+            "--workspace-x-max", "30",
+            "--workspace-y-min", "-10",
+            "--workspace-y-max", "10",
+            "--workspace-z-min", "0",
+            "--workspace-z-max", "15",
+        ]
+    )
+
+    config = main._config_from_args(args)
+
+    assert args.allow_mock_plc is True
+    assert config.workspace_x_bounds == (0.0, 30.0)
+    assert config.workspace_y_bounds == (-10.0, 10.0)
+    assert config.workspace_z_bounds == (0.0, 15.0)
+
+
+def test_cli_rejects_half_configured_workspace_bounds():
+    args = main._build_arg_parser().parse_args(["--workspace-x-min", "0"])
+
+    with pytest.raises(ValueError, match="workspace X"):
+        main._config_from_args(args)
+
+
+def test_plc_connection_failure_stops_startup(monkeypatch):
+    class FailedPLC(RecordingPLC):
+        def __init__(self):
+            super().__init__(connected=False, heartbeat_healthy=False)
+            self.disconnected = False
+            self.heartbeat_started = False
+
+        def connect(self, ip):
+            return 7
+
+        def start_heartbeat(self):
+            self.heartbeat_started = True
+
+        def disconnect(self):
+            self.disconnected = True
+
+    plc = FailedPLC()
+    monkeypatch.setattr(main, "create_plc", lambda **kwargs: plc)
+    args = main._build_arg_parser().parse_args(["--plc-ip", "192.168.0.1"])
+
+    with pytest.raises(ConnectionError, match="ret=7"):
+        main._connect_plc(args)
+
+    assert plc.heartbeat_started is False
+    assert plc.disconnected is True
