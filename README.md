@@ -6,6 +6,153 @@
 - **Y**：小行车（台车），沿桥架横移方向
 - **Z**：吊钩（抓斗），高度方向
 
+## 快速运行
+
+### 1. 准备 Python 环境
+
+项目要求 Python 3.8 或更高版本。在宿主机首次运行时执行：
+
+```bash
+cd /home/big/workspace/lstControl
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements.txt
+```
+
+后续重新打开终端时，只需进入项目并激活环境：
+
+```bash
+cd /home/big/workspace/lstControl
+source .venv/bin/activate
+```
+
+### 2. 快速打开三维标定网页
+
+标定网页本身不需要 ROS 或 PLC。为了跳过较长的默认运动仿真，可把仿真目标设为原点：
+
+```bash
+python3 main.py \
+  --live \
+  --target-x 0 \
+  --target-y 0 \
+  --target-z 0 \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+等待终端出现类似输出：
+
+```text
+Live view: http://127.0.0.1:8000
+Press Ctrl+C to stop.
+```
+
+然后打开：
+
+- 三维标定页面：`http://127.0.0.1:8000/calibration`
+- 起重机控制/仿真页面：`http://127.0.0.1:8000/`
+
+如果 `8000` 端口已被占用，程序会自动选择其他可用端口。此时必须使用终端实际打印的 `Live view` 地址。
+
+标定页面的基本操作：
+
+1. 设置模拟地图的 roll、pitch、yaw、三维原点和测量噪声。
+2. 设置大车 Forward Run 与小车 Lateral Run 的实际有符号移动距离。
+3. 点击 **SIMULATE RUN** 查看地图倾斜时的 XYZ 变化；也可以直接填写现场记录的三个三维 SLAM 点。
+4. 点击 **CALIBRATE / 标定**，检查比例、正交误差、地面倾角和残差 RMS。
+5. 点击 **COPY CLI**，将生成的 `--map-to-crane-*` 参数加入 PLC 启动命令。
+
+### 3. 允许局域网其他电脑访问
+
+服务器监听所有网卡：
+
+```bash
+python3 main.py \
+  --live \
+  --target-x 0 --target-y 0 --target-z 0 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+在其他电脑浏览器打开：
+
+```text
+http://运行程序的电脑IP:8000/calibration
+```
+
+需要确保宿主机防火墙允许 TCP 8000 端口。`0.0.0.0` 只用于监听，不能直接作为浏览器访问地址。
+
+### 4. 在现有 20rocker 容器中运行
+
+进入容器并加载 ROS Noetic 环境：
+
+```bash
+docker exec -it rocker-20-ws /usr/bin/zsh
+source /opt/ros/noetic/setup.zsh 2>/dev/null || source /opt/ros/noetic/setup.bash
+cd /home/big/workspace/lstControl
+python3 -m pip install --user -r requirements.txt
+python3 main.py \
+  --live \
+  --target-x 0 --target-y 0 --target-z 0 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+如果容器使用 host 网络，可从宿主机打开 `http://127.0.0.1:8000/calibration`；如果使用 bridge 网络，需要在创建容器时发布 8000 端口，或使用容器可达 IP。
+
+### 5. 运行普通控制仿真
+
+```bash
+python3 main.py \
+  --target-x 10 \
+  --target-y 5 \
+  --target-z 2 \
+  --live
+```
+
+程序先完成控制仿真、生成曲线图片，再启动 Web 服务。默认目标距离较大时，需要等待一段时间，直到终端打印 `Live view` 才能访问网页。
+
+### 6. 运行真实 PLC + ROS 模式
+
+先确认 ROS 定位话题有数据：
+
+```bash
+source /opt/ros/noetic/setup.zsh 2>/dev/null || source /opt/ros/noetic/setup.bash
+rostopic echo -n 1 /localization_pose
+```
+
+再使用标定页生成的三维参数启动，例如：
+
+```bash
+python3 main.py \
+  --plc-ip 192.168.1.100 \
+  --live \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --map-to-crane-origin-x 10 \
+  --map-to-crane-origin-y 20 \
+  --map-to-crane-origin-z 1.5 \
+  --map-to-crane-roll-deg 2 \
+  --map-to-crane-pitch-deg -4 \
+  --map-to-crane-yaw-deg 90 \
+  --workspace-x-min 0 --workspace-x-max 30 \
+  --workspace-y-min -10 --workspace-y-max 10 \
+  --workspace-z-min -5 --workspace-z-max 15
+```
+
+真实 PLC 模式不会自动开始运动。打开控制页面、确认 PLC 与 Heartbeat 状态正常，输入 SLAM map 坐标目标后点击 **Apply Target**。停止服务使用 `Ctrl+C`；程序退出时会执行安全停止和资源清理。
+
+### 常见问题
+
+- **网页打不开**：先确认终端已经打印 `Live view`，再使用实际打印的端口。
+- **局域网无法访问**：确认使用了 `--host 0.0.0.0`，并检查防火墙和容器端口映射。
+- **标定 API 报错**：三个观测点都必须包含有限的 Map X/Y/Z，两段移动距离不能为 0，两条轨迹不能接近平行。
+- **PLC 模式没有定位**：使用 `rostopic echo -n 1 /localization_pose` 检查 ROS 话题和时间戳是否持续更新。
+- **PLC 库无法加载**：真实库只适用于对应 ARM 环境；开发测试必须显式添加 `--allow-mock-plc` 才会使用 MockPLC。
+
+---
+
 ## 控制律
 
 ```text
