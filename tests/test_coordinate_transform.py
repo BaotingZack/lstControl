@@ -187,10 +187,11 @@ def test_cli_builds_map_to_crane_transform():
 
     transform = main._coordinate_transform_from_args(args)
 
-    assert transform.map_to_crane_point(10.0, 22.0) == pytest.approx((2.0, 0.0))
+    map_position = transform.crane_to_map_position(2.0, 0.0, 0.0)
+    assert transform.map_to_crane_position(*map_position) == pytest.approx((2.0, 0.0, 0.0))
     assert transform.origin_map_z == 30.0
-    assert transform.crane_roll_deg == 2.0
-    assert transform.crane_pitch_deg == -3.0
+    assert transform.crane_roll_deg == pytest.approx(2.0)
+    assert transform.crane_pitch_deg == pytest.approx(-3.0)
 
 
 def test_web_map_target_is_transformed_before_crane_workspace_validation():

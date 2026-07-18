@@ -99,6 +99,12 @@ def _build_arg_parser():
                         help='crane origin X coordinate in the SLAM map')
     parser.add_argument('--map-to-crane-origin-y', type=float, default=0.0,
                         help='crane origin Y coordinate in the SLAM map')
+    parser.add_argument('--map-to-crane-origin-z', type=float, default=0.0,
+                        help='crane origin Z coordinate in the SLAM map')
+    parser.add_argument('--map-to-crane-roll-deg', type=float, default=0.0,
+                        help='roll of the physical crane frame in the SLAM map')
+    parser.add_argument('--map-to-crane-pitch-deg', type=float, default=0.0,
+                        help='pitch of the physical crane frame in the SLAM map')
     parser.add_argument('--map-to-crane-yaw-deg', type=float, default=0.0,
                         help='yaw of the crane +X rail in the SLAM map, in degrees')
     parser.add_argument('--use-native-z-velocity', action='store_true',
@@ -141,6 +147,9 @@ def _coordinate_transform_from_args(args) -> CoordinateTransform2D:
     return CoordinateTransform2D.from_degrees(
         origin_map_x=args.map_to_crane_origin_x,
         origin_map_y=args.map_to_crane_origin_y,
+        origin_map_z=args.map_to_crane_origin_z,
+        crane_roll_deg=args.map_to_crane_roll_deg,
+        crane_pitch_deg=args.map_to_crane_pitch_deg,
         crane_x_axis_yaw_deg=args.map_to_crane_yaw_deg,
     )
 
@@ -195,10 +204,9 @@ def main(argv=None):
 
     # ---- PLC 模式 ----
     if args.plc_ip:
-        target_x, target_y = coordinate_transform.map_to_crane_point(
-            map_target_pos[0], map_target_pos[1]
+        target_pos = config.validate_target(
+            coordinate_transform.map_to_crane_position(*map_target_pos)
         )
-        target_pos = config.validate_target((target_x, target_y, map_target_pos[2]))
         plc = _connect_plc(args)
         try:
             start_ros_bridge()
@@ -211,11 +219,10 @@ def main(argv=None):
                 waited += 0.1
             pose = get_latest_pose()
             if pose is not None:
-                crane_x, crane_y = coordinate_transform.map_to_crane_point(
-                    pose['x'], pose['y']
-                )
                 px, py, pz = config.validate_position(
-                    (crane_x, crane_y, pose['z'])
+                    coordinate_transform.map_to_crane_position(
+                        pose['x'], pose['y'], pose['z']
+                    )
                 )
                 crane0 = CraneState(x0=px, y0=py, z0=pz)
                 print(
@@ -225,14 +232,15 @@ def main(argv=None):
             else:
                 print('Warning: /localization_pose timeout, using default initial position')
 
-            fallback_map_x, fallback_map_y = coordinate_transform.crane_to_map_point(
+            fallback_map = coordinate_transform.crane_to_map_position(
                 crane0.x.position,
                 crane0.y.position,
+                crane0.z.position,
             )
             initial_pos = (
-                pose['x'] if pose is not None else fallback_map_x,
-                pose['y'] if pose is not None else fallback_map_y,
-                crane0.z.position,
+                pose['x'] if pose is not None else fallback_map[0],
+                pose['y'] if pose is not None else fallback_map[1],
+                pose['z'] if pose is not None else fallback_map[2],
             )
             ros_source = RosPositionSource(
                 coordinate_transform=coordinate_transform,

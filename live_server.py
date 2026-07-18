@@ -54,11 +54,11 @@ def _calibrate_from_request(body: str) -> CalibrationResult:
         if not isinstance(payload, dict):
             raise TypeError('payload must be a JSON object')
 
-        def _point(name: str) -> tuple[float, float]:
+        def _point(name: str) -> tuple[float, float, float]:
             point = payload[name]
             if not isinstance(point, dict):
-                raise TypeError(f'{name} must be an object with x and y')
-            return float(point['x']), float(point['y'])
+                raise TypeError(f'{name} must be an object with x, y, and z')
+            return float(point['x']), float(point['y']), float(point['z'])
 
         observation = CalibrationObservation(
             start_map=_point('start'),
@@ -140,7 +140,7 @@ def render_calibration_html() -> str:
     .live-dot::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 10px currentColor; }
     main { display: grid; grid-template-columns: minmax(560px, 1.5fr) minmax(360px, .75fr); gap: 14px; padding: 14px; min-height: 0; }
     .visual, .controls { border: 1px solid var(--line); background: rgba(16, 26, 32, .96); }
-    .visual { display: grid; grid-template-rows: auto 1fr auto; min-height: 680px; }
+    .visual { display: grid; grid-template-rows: auto 1fr auto; min-height: 760px; }
     .section-head {
       display: flex; align-items: center; justify-content: space-between; gap: 12px;
       padding: 12px 15px; border-bottom: 1px solid var(--line); background: var(--panel);
@@ -148,8 +148,8 @@ def render_calibration_html() -> str:
     .section-title { display: flex; align-items: center; gap: 10px; font-size: 12px; letter-spacing: .09em; text-transform: uppercase; }
     .section-title::before { content: "//"; color: var(--amber); }
     .mode { color: var(--muted); font-size: 10px; }
-    .canvas-wrap { position: relative; min-height: 540px; }
-    canvas { display: block; width: 100%; height: 100%; min-height: 540px; }
+    .canvas-wrap { position: relative; min-height: 620px; }
+    canvas { display: block; width: 100%; height: 100%; min-height: 620px; }
     .legend {
       display: flex; flex-wrap: wrap; gap: 18px; padding: 10px 15px;
       color: var(--muted); font-size: 10px; border-top: 1px solid var(--line);
@@ -174,7 +174,7 @@ def render_calibration_html() -> str:
     }
     input:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 0 1px rgba(73,214,208,.25); }
     .run-label { grid-column: 1 / -1; color: var(--blue); margin-top: 4px; font-size: 10px; letter-spacing: .09em; text-transform: uppercase; }
-    .point-row { grid-column: 1 / -1; display: grid; grid-template-columns: 74px 1fr 1fr; gap: 8px; align-items: end; }
+    .point-row { grid-column: 1 / -1; display: grid; grid-template-columns: 74px repeat(3, 1fr); gap: 8px; align-items: end; }
     .point-row > span { align-self: center; color: var(--ink); font-size: 10px; }
     .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     button {
@@ -216,7 +216,7 @@ def render_calibration_html() -> str:
       main { padding: 8px; }
       .visual { min-height: 560px; }
       .canvas-wrap, canvas { min-height: 460px; }
-      .point-row { grid-template-columns: 58px 1fr 1fr; }
+      .point-row { grid-template-columns: 58px repeat(3, 1fr); }
     }
   </style>
 </head>
@@ -246,8 +246,11 @@ def render_calibration_html() -> str:
           <div class="form-grid">
             <label>地图偏转角 / DEG<input id="simYaw" type="number" step="0.1" value="17"></label>
             <label>测量噪声 / M<input id="simNoise" type="number" min="0" step="0.001" value="0.008"></label>
+            <label>地图横滚 Roll / DEG<input id="simRoll" type="number" step="0.1" value="2.5"></label>
+            <label>地图俯仰 Pitch / DEG<input id="simPitch" type="number" step="0.1" value="-4"></label>
             <label>地图原点 X / M<input id="originX" type="number" step="0.1" value="12.5"></label>
             <label>地图原点 Y / M<input id="originY" type="number" step="0.1" value="-4"></label>
+            <label>地图原点 Z / M<input id="originZ" type="number" step="0.1" value="1.2"></label>
             <label>Forward Run / 大车 X / M<input id="forwardDistance" type="number" step="0.1" value="6"></label>
             <label>Lateral Run / 小车 Y / M<input id="lateralDistance" type="number" step="0.1" value="3"></label>
           </div>
@@ -255,11 +258,11 @@ def render_calibration_html() -> str:
         <section class="block">
           <div class="block-title"><strong>SLAM 观测点</strong><span class="step-no">01—03</span></div>
           <div class="form-grid">
-            <div class="point-row"><span>START</span><label>Map X<input id="startX" type="number" step="0.001"></label><label>Map Y<input id="startY" type="number" step="0.001"></label></div>
+            <div class="point-row"><span>START</span><label>Map X<input id="startX" type="number" step="0.001"></label><label>Map Y<input id="startY" type="number" step="0.001"></label><label>Map Z<input id="startZ" type="number" step="0.001"></label></div>
             <div class="run-label">Forward Run / 沿大车轨道移动已知距离</div>
-            <div class="point-row"><span>AFTER X</span><label>Map X<input id="forwardX" type="number" step="0.001"></label><label>Map Y<input id="forwardY" type="number" step="0.001"></label></div>
+            <div class="point-row"><span>AFTER X</span><label>Map X<input id="forwardX" type="number" step="0.001"></label><label>Map Y<input id="forwardY" type="number" step="0.001"></label><label>Map Z<input id="forwardZ" type="number" step="0.001"></label></div>
             <div class="run-label">Lateral Run / 沿小车轨道移动已知距离</div>
-            <div class="point-row"><span>AFTER Y</span><label>Map X<input id="lateralX" type="number" step="0.001"></label><label>Map Y<input id="lateralY" type="number" step="0.001"></label></div>
+            <div class="point-row"><span>AFTER Y</span><label>Map X<input id="lateralX" type="number" step="0.001"></label><label>Map Y<input id="lateralY" type="number" step="0.001"></label><label>Map Z<input id="lateralZ" type="number" step="0.001"></label></div>
           </div>
         </section>
         <section class="block">
@@ -276,13 +279,17 @@ def render_calibration_html() -> str:
           <div class="metrics">
             <div class="metric"><span>Origin map X</span><strong id="resultOriginX">—</strong></div>
             <div class="metric"><span>Origin map Y</span><strong id="resultOriginY">—</strong></div>
+            <div class="metric"><span>Origin map Z</span><strong id="resultOriginZ">—</strong></div>
             <div class="metric"><span>Rail yaw</span><strong id="resultYaw">—</strong></div>
+            <div class="metric"><span>Map roll</span><strong id="resultRoll">—</strong></div>
+            <div class="metric"><span>Map pitch</span><strong id="resultPitch">—</strong></div>
+            <div class="metric"><span>GROUND TILT</span><strong id="resultTilt">—</strong></div>
             <div class="metric"><span>Orthogonality</span><strong id="resultOrth">—</strong></div>
             <div class="metric"><span>X / Y scale</span><strong id="resultScale">—</strong></div>
             <div class="metric"><span>Residual RMS</span><strong id="resultRms">—</strong></div>
           </div>
-          <div class="cli" id="cliOutput">--map-to-crane-origin-x … --map-to-crane-origin-y … --map-to-crane-yaw-deg …</div>
-          <p class="note">标定参数描述“起重机原点在 SLAM 地图中的位置”和“物理 +X 轨道在地图中的偏转角”。控制内部会把地图目标旋转到轨道坐标，网页仍显示地图坐标。</p>
+          <div class="cli" id="cliOutput">--map-to-crane-origin-x … --map-to-crane-origin-y … --map-to-crane-origin-z … --map-to-crane-roll-deg … --map-to-crane-pitch-deg … --map-to-crane-yaw-deg …</div>
+          <p class="note">两段三维 SLAM 轨迹确定物理 +X/+Y 轨道，叉乘得到真实地面法向 +Z。控制内部会同时修正地图的 roll、pitch 和 yaw；不需要额外移动吊钩。</p>
         </section>
       </aside>
     </main>
@@ -291,14 +298,17 @@ def render_calibration_html() -> str:
     const canvas = document.getElementById('calibrationCanvas');
     const ctx = canvas.getContext('2d');
     const ids = [
-      'simYaw', 'simNoise', 'originX', 'originY', 'forwardDistance', 'lateralDistance',
-      'startX', 'startY', 'forwardX', 'forwardY', 'lateralX', 'lateralY'
+      'simYaw', 'simRoll', 'simPitch', 'simNoise', 'originX', 'originY', 'originZ',
+      'forwardDistance', 'lateralDistance', 'startX', 'startY', 'startZ',
+      'forwardX', 'forwardY', 'forwardZ', 'lateralX', 'lateralY', 'lateralZ'
     ];
     const fields = Object.fromEntries(ids.map(id => [id, document.getElementById(id)]));
     const ui = {
       phase: document.getElementById('motionPhase'), quality: document.getElementById('quality'),
       originX: document.getElementById('resultOriginX'), originY: document.getElementById('resultOriginY'),
-      yaw: document.getElementById('resultYaw'), orth: document.getElementById('resultOrth'),
+      originZ: document.getElementById('resultOriginZ'), roll: document.getElementById('resultRoll'),
+      pitch: document.getElementById('resultPitch'), yaw: document.getElementById('resultYaw'),
+      tilt: document.getElementById('resultTilt'), orth: document.getElementById('resultOrth'),
       scale: document.getElementById('resultScale'), rms: document.getElementById('resultRms'),
       cli: document.getElementById('cliOutput'), simulate: document.getElementById('simulateBtn'),
       calibrate: document.getElementById('calibrateBtn'), copy: document.getElementById('copyBtn')
@@ -310,7 +320,19 @@ def render_calibration_html() -> str:
     const number = id => Number(fields[id].value);
     const rotate = (x, y, yaw) => ({x: Math.cos(yaw) * x - Math.sin(yaw) * y, y: Math.sin(yaw) * x + Math.cos(yaw) * y});
     const add = (a, b) => ({x: a.x + b.x, y: a.y + b.y});
+    const add3 = (a, b) => ({x: a.x + b.x, y: a.y + b.y, z: a.z + b.z});
     const fmt = value => Number(value).toFixed(3);
+
+    function rotate3(point, roll, pitch, yaw) {
+      const cr = Math.cos(roll), sr = Math.sin(roll);
+      const cp = Math.cos(pitch), sp = Math.sin(pitch);
+      const cy = Math.cos(yaw), sy = Math.sin(yaw);
+      return {
+        x: cy * cp * point.x + (cy * sp * sr - sy * cr) * point.y + (cy * sp * cr + sy * sr) * point.z,
+        y: sy * cp * point.x + (sy * sp * sr + cy * cr) * point.y + (sy * sp * cr - cy * sr) * point.z,
+        z: -sp * point.x + cp * sr * point.y + cp * cr * point.z
+      };
+    }
 
     function randomNoise(amplitude) {
       return amplitude ? (Math.random() * 2 - 1) * amplitude : 0;
@@ -319,24 +341,27 @@ def render_calibration_html() -> str:
     function writePoint(prefix, point) {
       fields[prefix + 'X'].value = fmt(point.x);
       fields[prefix + 'Y'].value = fmt(point.y);
+      fields[prefix + 'Z'].value = fmt(point.z);
     }
 
     function readMeasured() {
       return {
-        start: {x: number('startX'), y: number('startY')},
-        forward: {x: number('forwardX'), y: number('forwardY')},
-        lateral: {x: number('lateralX'), y: number('lateralY')}
+        start: {x: number('startX'), y: number('startY'), z: number('startZ')},
+        forward: {x: number('forwardX'), y: number('forwardY'), z: number('forwardZ')},
+        lateral: {x: number('lateralX'), y: number('lateralY'), z: number('lateralZ')}
       };
     }
 
     function simulate() {
       const yaw = number('simYaw') * Math.PI / 180;
+      const roll = number('simRoll') * Math.PI / 180;
+      const pitch = number('simPitch') * Math.PI / 180;
       const noise = Math.max(0, number('simNoise'));
-      const origin = {x: number('originX'), y: number('originY')};
-      const perturb = point => ({x: point.x + randomNoise(noise), y: point.y + randomNoise(noise)});
+      const origin = {x: number('originX'), y: number('originY'), z: number('originZ')};
+      const perturb = point => ({x: point.x + randomNoise(noise), y: point.y + randomNoise(noise), z: point.z + randomNoise(noise)});
       const start = perturb(origin);
-      const idealForward = add(origin, rotate(number('forwardDistance'), 0, yaw));
-      const idealLateral = add(idealForward, rotate(0, number('lateralDistance'), yaw));
+      const idealForward = add3(origin, rotate3({x: number('forwardDistance'), y: 0, z: 0}, roll, pitch, yaw));
+      const idealLateral = add3(idealForward, rotate3({x: 0, y: number('lateralDistance'), z: 0}, roll, pitch, yaw));
       measured = {start, forward: perturb(idealForward), lateral: perturb(idealLateral)};
       writePoint('start', measured.start);
       writePoint('forward', measured.forward);
@@ -350,8 +375,8 @@ def render_calibration_html() -> str:
     function clearResult() {
       ui.quality.className = 'quality';
       ui.quality.textContent = 'NOT CALIBRATED';
-      [ui.originX, ui.originY, ui.yaw, ui.orth, ui.scale, ui.rms].forEach(el => el.textContent = '—');
-      ui.cli.textContent = '--map-to-crane-origin-x … --map-to-crane-origin-y … --map-to-crane-yaw-deg …';
+      [ui.originX, ui.originY, ui.originZ, ui.roll, ui.pitch, ui.yaw, ui.tilt, ui.orth, ui.scale, ui.rms].forEach(el => el.textContent = '—');
+      ui.cli.textContent = '--map-to-crane-origin-x … --map-to-crane-origin-y … --map-to-crane-origin-z … --map-to-crane-roll-deg … --map-to-crane-pitch-deg … --map-to-crane-yaw-deg …';
     }
 
     async function calibrate() {
@@ -392,7 +417,11 @@ def render_calibration_html() -> str:
       ui.quality.textContent = pass ? 'PASS / 可用' : 'CHECK / 建议复测';
       ui.originX.textContent = fmt(result.transform.originMapX) + ' m';
       ui.originY.textContent = fmt(result.transform.originMapY) + ' m';
+      ui.originZ.textContent = fmt(result.transform.originMapZ) + ' m';
+      ui.roll.textContent = fmt(result.transform.craneRollDeg) + '°';
+      ui.pitch.textContent = fmt(result.transform.cranePitchDeg) + '°';
       ui.yaw.textContent = fmt(result.transform.craneXAxisYawDeg) + '°';
+      ui.tilt.textContent = fmt(result.groundTiltDeg) + '°';
       ui.orth.textContent = fmt(result.orthogonalityErrorDeg) + '°';
       ui.scale.textContent = result.forwardScale.toFixed(4) + ' / ' + result.lateralScale.toFixed(4);
       ui.rms.textContent = fmt(result.residualRms) + ' m';
@@ -450,6 +479,16 @@ def render_calibration_html() -> str:
       ctx.fillStyle = '#5caee8'; ctx.fillText('+Y RAIL', yo.x + 5, yo.y - 4);
     }
 
+    function axis3(origin, roll, pitch, yaw, length, map, alpha = 1) {
+      const xEnd = add3(origin, rotate3({x: length, y: 0, z: 0}, roll, pitch, yaw));
+      const yEnd = add3(origin, rotate3({x: 0, y: length, z: 0}, roll, pitch, yaw));
+      line(map(origin), map(xEnd), `rgba(244,185,66,${alpha})`, 3);
+      line(map(origin), map(yEnd), `rgba(92,174,232,${alpha})`, 3);
+      const xo = map(xEnd), yo = map(yEnd);
+      ctx.fillStyle = '#f4b942'; ctx.fillText('+X RAIL', xo.x + 5, xo.y - 4);
+      ctx.fillStyle = '#5caee8'; ctx.fillText('+Y RAIL', yo.x + 5, yo.y - 4);
+    }
+
     function dot(point, map, color, label) {
       const p = map(point); ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
       ctx.fillStyle = color; ctx.fill(); ctx.strokeStyle = '#f4f8fa'; ctx.lineWidth = 1.5; ctx.stroke();
@@ -460,22 +499,33 @@ def render_calibration_html() -> str:
       if (!measured) return null;
       if (progress < .58) {
         const t = progress / .58;
-        return {x: measured.start.x + (measured.forward.x - measured.start.x) * t, y: measured.start.y + (measured.forward.y - measured.start.y) * t};
+        return {
+          x: measured.start.x + (measured.forward.x - measured.start.x) * t,
+          y: measured.start.y + (measured.forward.y - measured.start.y) * t,
+          z: measured.start.z + (measured.forward.z - measured.start.z) * t
+        };
       }
       const t = (progress - .58) / .42;
-      return {x: measured.forward.x + (measured.lateral.x - measured.forward.x) * t, y: measured.forward.y + (measured.lateral.y - measured.forward.y) * t};
+      return {
+        x: measured.forward.x + (measured.lateral.x - measured.forward.x) * t,
+        y: measured.forward.y + (measured.lateral.y - measured.forward.y) * t,
+        z: measured.forward.z + (measured.lateral.z - measured.forward.z) * t
+      };
     }
 
     function drawMapPanel(box) {
       const yaw = number('simYaw') * Math.PI / 180;
-      const origin = {x: number('originX'), y: number('originY')};
-      const fallback = [origin, add(origin, rotate(number('forwardDistance'), 0, yaw)), add(origin, rotate(number('forwardDistance'), number('lateralDistance'), yaw))];
+      const roll = number('simRoll') * Math.PI / 180;
+      const pitch = number('simPitch') * Math.PI / 180;
+      const origin = {x: number('originX'), y: number('originY'), z: number('originZ')};
+      const idealForward = add3(origin, rotate3({x: number('forwardDistance'), y: 0, z: 0}, roll, pitch, yaw));
+      const fallback = [origin, idealForward, add3(idealForward, rotate3({x: 0, y: number('lateralDistance'), z: 0}, roll, pitch, yaw))];
       const points = measured ? [measured.start, measured.forward, measured.lateral] : fallback;
-      const rail = add(origin, rotate(Math.max(Math.abs(number('forwardDistance')), Math.abs(number('lateralDistance'))) * 1.25, 0, yaw));
+      const rail = add3(origin, rotate3({x: Math.max(Math.abs(number('forwardDistance')), Math.abs(number('lateralDistance'))) * 1.25, y: 0, z: 0}, roll, pitch, yaw));
       const bounds = boundsFor([...points, origin, rail]);
       const map = mapper({x: box.x + 10, y: box.y + 32, w: box.w - 20, h: box.h - 42}, bounds);
       grid(box, map, bounds, 'RAW SLAM MAP / 地图坐标未对齐');
-      axis(origin, yaw, Math.max(3, Math.abs(number('forwardDistance')) * 1.1), map, .85);
+      axis3(origin, roll, pitch, yaw, Math.max(3, Math.abs(number('forwardDistance')) * 1.1), map, .85);
       if (measured) {
         line(map(measured.start), map(measured.forward), '#79d987', 3);
         if (animation.progress > .58) line(map(measured.forward), map(measured.lateral), '#79d987', 3);
@@ -486,21 +536,37 @@ def render_calibration_html() -> str:
         if (car) dot(car, map, '#ef705d', 'CAR');
       }
       if (calibration) {
-        const estimatedOrigin = {x: calibration.transform.originMapX, y: calibration.transform.originMapY};
-        axis(estimatedOrigin, calibration.transform.craneXAxisYawDeg * Math.PI / 180, Math.max(3, Math.abs(number('forwardDistance'))), map, .6);
+        const estimatedOrigin = {x: calibration.transform.originMapX, y: calibration.transform.originMapY, z: calibration.transform.originMapZ};
+        axis3(
+          estimatedOrigin,
+          calibration.transform.craneRollDeg * Math.PI / 180,
+          calibration.transform.cranePitchDeg * Math.PI / 180,
+          calibration.transform.craneXAxisYawDeg * Math.PI / 180,
+          Math.max(3, Math.abs(number('forwardDistance'))), map, .6
+        );
       }
     }
 
     function mapToCrane(point) {
       if (!calibration) return point;
+      const roll = calibration.transform.craneRollDeg * Math.PI / 180;
+      const pitch = calibration.transform.cranePitchDeg * Math.PI / 180;
       const yaw = calibration.transform.craneXAxisYawDeg * Math.PI / 180;
+      const cr = Math.cos(roll), sr = Math.sin(roll);
+      const cp = Math.cos(pitch), sp = Math.sin(pitch);
+      const cy = Math.cos(yaw), sy = Math.sin(yaw);
       const dx = point.x - calibration.transform.originMapX;
       const dy = point.y - calibration.transform.originMapY;
-      return {x: Math.cos(yaw) * dx + Math.sin(yaw) * dy, y: -Math.sin(yaw) * dx + Math.cos(yaw) * dy};
+      const dz = point.z - calibration.transform.originMapZ;
+      return {
+        x: cy * cp * dx + sy * cp * dy - sp * dz,
+        y: (cy * sp * sr - sy * cr) * dx + (sy * sp * sr + cy * cr) * dy + cp * sr * dz,
+        z: (cy * sp * cr + sy * sr) * dx + (sy * sp * cr - cy * sr) * dy + cp * cr * dz
+      };
     }
 
     function drawCorrectedPanel(box) {
-      const corrected = measured && calibration ? [mapToCrane(measured.start), mapToCrane(measured.forward), mapToCrane(measured.lateral)] : [{x:0,y:0}, {x:number('forwardDistance'),y:0}, {x:number('forwardDistance'),y:number('lateralDistance')}];
+      const corrected = measured && calibration ? [mapToCrane(measured.start), mapToCrane(measured.forward), mapToCrane(measured.lateral)] : [{x:0,y:0,z:0}, {x:number('forwardDistance'),y:0,z:0}, {x:number('forwardDistance'),y:number('lateralDistance'),z:0}];
       const bounds = boundsFor(corrected);
       const map = mapper({x: box.x + 10, y: box.y + 32, w: box.w - 20, h: box.h - 42}, bounds);
       grid(box, map, bounds, calibration ? 'CALIBRATED CRANE FRAME / 轨道坐标已对正' : 'CALIBRATED CRANE FRAME / WAITING');
@@ -515,6 +581,57 @@ def render_calibration_html() -> str:
       } else {
         ctx.fillStyle = '#607681'; ctx.font = '11px monospace'; ctx.fillText('运行仿真并点击 CALIBRATE', box.x + 20, box.y + box.h / 2);
       }
+    }
+
+    function drawElevationPanel(box) {
+      ctx.fillStyle = '#0b151a'; ctx.fillRect(box.x, box.y, box.w, box.h);
+      ctx.strokeStyle = '#2c414b'; ctx.strokeRect(box.x + .5, box.y + .5, box.w - 1, box.h - 1);
+      ctx.fillStyle = '#8ea2ad'; ctx.font = '700 10px monospace';
+      ctx.fillText('GROUND PLANE Z / 水平移动时的地图高程漂移', box.x + 12, box.y + 20);
+      if (!measured) return;
+
+      const raw = [measured.start, measured.forward, measured.lateral];
+      const corrected = calibration ? raw.map(mapToCrane) : null;
+      const values = raw.map(point => point.z).concat(corrected ? corrected.map(point => point.z) : [0]);
+      let minZ = Math.min(...values), maxZ = Math.max(...values);
+      const range = Math.max(.08, maxZ - minZ);
+      minZ -= range * .25; maxZ += range * .25;
+      const left = box.x + 46, right = box.x + box.w - 22;
+      const top = box.y + 35, bottom = box.y + box.h - 28;
+      const sx = phase => left + phase * (right - left) / 2;
+      const sy = z => bottom - (z - minZ) * (bottom - top) / (maxZ - minZ);
+
+      ctx.strokeStyle = '#1d3038'; ctx.lineWidth = 1;
+      for (let index = 0; index <= 4; index++) {
+        const y = top + (bottom - top) * index / 4;
+        ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
+      }
+      ['START', 'AFTER X', 'AFTER Y'].forEach((label, index) => {
+        const x = sx(index);
+        ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, bottom); ctx.stroke();
+        ctx.fillStyle = '#607681'; ctx.fillText(label, x - 18, bottom + 17);
+      });
+      const rawScreen = raw.map((point, index) => ({x: sx(index), y: sy(point.z)}));
+      line(rawScreen[0], rawScreen[1], '#79d987', 3);
+      line(rawScreen[1], rawScreen[2], '#79d987', 3);
+      ctx.fillStyle = '#79d987'; ctx.fillText('RAW MAP Z', left + 8, rawScreen[0].y - 8);
+
+      if (corrected) {
+        const correctedScreen = corrected.map((point, index) => ({x: sx(index), y: sy(point.z)}));
+        line(correctedScreen[0], correctedScreen[1], '#49d6d0', 3);
+        line(correctedScreen[1], correctedScreen[2], '#49d6d0', 3);
+        ctx.fillStyle = '#49d6d0'; ctx.fillText('CALIBRATED GROUND Z ≈ 0', left + 8, correctedScreen[0].y + 14);
+      }
+
+      const phase = animation.progress < .58
+        ? animation.progress / .58
+        : 1 + (animation.progress - .58) / .42;
+      const car = interpolatePath(animation.progress);
+      const marker = {x: sx(phase), y: sy(car.z)};
+      ctx.beginPath(); ctx.arc(marker.x, marker.y, 5, 0, Math.PI * 2);
+      ctx.fillStyle = '#ef705d'; ctx.fill();
+      ctx.fillStyle = '#8ea2ad';
+      ctx.fillText(`Δ map Z ${(raw[2].z - raw[0].z).toFixed(3)} m`, right - 145, top + 12);
     }
 
     function resize() {
@@ -534,13 +651,16 @@ def render_calibration_html() -> str:
       }
       const width = canvas.clientWidth, height = canvas.clientHeight;
       ctx.clearRect(0, 0, width, height);
-      const gap = 12;
       if (width < 720) {
-        drawMapPanel({x: 10, y: 10, w: width - 20, h: (height - 30) / 2});
-        drawCorrectedPanel({x: 10, y: 20 + (height - 30) / 2, w: width - 20, h: (height - 30) / 2});
+        const panelHeight = (height - 40) / 3;
+        drawMapPanel({x: 10, y: 10, w: width - 20, h: panelHeight});
+        drawCorrectedPanel({x: 10, y: 20 + panelHeight, w: width - 20, h: panelHeight});
+        drawElevationPanel({x: 10, y: 30 + panelHeight * 2, w: width - 20, h: panelHeight});
       } else {
-        drawMapPanel({x: 10, y: 10, w: (width - 30) / 2, h: height - 20});
-        drawCorrectedPanel({x: 20 + (width - 30) / 2, y: 10, w: (width - 30) / 2, h: height - 20});
+        const planHeight = Math.max(280, height * .64);
+        drawMapPanel({x: 10, y: 10, w: (width - 30) / 2, h: planHeight - 15});
+        drawCorrectedPanel({x: 20 + (width - 30) / 2, y: 10, w: (width - 30) / 2, h: planHeight - 15});
+        drawElevationPanel({x: 10, y: planHeight + 5, w: width - 20, h: height - planHeight - 15});
       }
       requestAnimationFrame(draw);
     }
@@ -582,8 +702,8 @@ def _parse_control_target(
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f'target_x, target_y, and target_z are required numbers: {exc}') from exc
     transform = coordinate_transform or CoordinateTransform2D.identity()
-    crane_x, crane_y = transform.map_to_crane_point(map_target[0], map_target[1])
-    return config.validate_target((crane_x, crane_y, map_target[2]))
+    crane_target = transform.map_to_crane_position(*map_target)
+    return config.validate_target(crane_target)
 
 
 def _point_tuple(point: tuple[float, float, float]) -> dict[str, float]:
@@ -2260,11 +2380,10 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                         json.dumps({'ok': False, 'error': 'No localization data — cannot start control'}).encode('utf-8'))
             return
         try:
-            crane_x, crane_y = server.coordinate_transform.map_to_crane_point(
-                pose['x'], pose['y']
-            )
             pose_x, pose_y, pose_z = server.config.validate_position(
-                (crane_x, crane_y, pose['z'])
+                server.coordinate_transform.map_to_crane_position(
+                    pose['x'], pose['y'], pose['z']
+                )
             )
         except (KeyError, TypeError, ValueError) as exc:
             self._write(503, 'application/json; charset=utf-8',
@@ -2272,8 +2391,12 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             return
         map_pose = dict(pose)
         crane_pose = {**pose, 'x': pose_x, 'y': pose_y, 'z': pose_z}
-        map_target_x, map_target_y = server.coordinate_transform.crane_to_map_point(
-            target_x, target_y
+        map_target_x, map_target_y, map_target_z = (
+            server.coordinate_transform.crane_to_map_position(
+                target_x,
+                target_y,
+                target_z,
+            )
         )
 
         if not server.reserve_control_run():
@@ -2285,7 +2408,11 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         cs = ControlState()
         cs.set_start(
             pos={'x': map_pose['x'], 'y': map_pose['y'], 'z': map_pose['z']},
-            target={'x': map_target_x, 'y': map_target_y, 'z': target_z},
+            target={
+                'x': map_target_x,
+                'y': map_target_y,
+                'z': map_target_z,
+            },
         )
         server.control_state = cs
 

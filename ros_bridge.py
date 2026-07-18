@@ -151,23 +151,44 @@ class RosPositionSource:
             self._last_stamp = stamp
             self._last_wall = now
 
-            crane_x, crane_y = self._coordinate_transform.map_to_crane_point(
-                pose['x'], pose['y']
+            crane_x, crane_y, crane_z = (
+                self._coordinate_transform.map_to_crane_position(
+                    pose['x'], pose['y'], pose['z']
+                )
             )
-            vx = pose.get('vx') if self._use_native_xy_velocity else None
-            vy = pose.get('vy') if self._use_native_xy_velocity else None
-            if vx is not None and vy is not None:
-                vx, vy = self._coordinate_transform.map_to_crane_vector(vx, vy)
-            else:
-                vx = vy = None
+            vx = vy = vz = None
+            if self._use_native_xy_velocity:
+                map_vx = pose.get('vx')
+                map_vy = pose.get('vy')
+                map_vz = pose.get('vz')
+                if (
+                    map_vx is not None
+                    and map_vy is not None
+                    and self._use_native_z_velocity
+                    and map_vz is not None
+                ):
+                    vx, vy, vz = self._coordinate_transform.map_to_crane_vector3(
+                        map_vx,
+                        map_vy,
+                        map_vz,
+                    )
+                elif (
+                    map_vx is not None
+                    and map_vy is not None
+                    and self._coordinate_transform.is_planar
+                ):
+                    vx, vy = self._coordinate_transform.map_to_crane_vector(
+                        map_vx,
+                        map_vy,
+                    )
 
             return {
                 'x': crane_x,
                 'y': crane_y,
-                'z': pose['z'],
+                'z': crane_z,
                 'vx': vx,
                 'vy': vy,
-                'vz': pose.get('vz') if self._use_native_z_velocity else None,
+                'vz': vz,
                 'dt': dt,
                 't': self._t,
                 'stamp': stamp,
