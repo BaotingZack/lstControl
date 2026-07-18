@@ -169,7 +169,6 @@ def test_position_timeout_is_an_error_instead_of_normal_completion():
     "invalid_position",
     [
         position(x=math.nan),
-        position(z=-0.01),
         {**position(), "dt": math.nan},
         {**position(), "dt": 0.0},
         {**position(), "vx": math.inf},
@@ -234,12 +233,64 @@ def test_stop_requested_while_waiting_for_position_never_applies_motion():
     [
         (math.nan, 0.0, 0.0),
         (math.inf, 0.0, 0.0),
-        (0.0, 0.0, -0.01),
     ],
 )
-def test_config_rejects_non_finite_or_negative_height_targets(target):
+def test_config_rejects_non_finite_targets(target):
     with pytest.raises(ValueError):
         CraneConfig().validate_target(target)
+
+
+def test_negative_z_is_allowed_until_a_workspace_bound_is_configured():
+    assert CraneConfig().validate_target((1.0, 2.0, -3.0)) == (1.0, 2.0, -3.0)
+    assert CraneConfig().validate_position((1.0, 2.0, -3.0)) == (1.0, 2.0, -3.0)
+
+    config = CraneConfig(workspace_z_bounds=(0.0, 10.0))
+    with pytest.raises(ValueError, match="Z target"):
+        config.validate_target((1.0, 2.0, -3.0))
+
+
+def test_missing_native_z_velocity_uses_height_estimate_for_arrival():
+    class PreserveMissingVelocityActuator(StubActuator):
+        def update_state(self, state, feedback):
+            state.x.position = feedback["x"]
+            state.y.position = feedback["y"]
+            state.z.position = feedback["z"]
+            for axis_name in ("x", "y", "z"):
+                velocity = feedback[f"v{axis_name}"]
+                if velocity is not None:
+                    getattr(state, axis_name).velocity = velocity
+
+    class StopAfterFirstStep(ControlHooks):
+        def __init__(self):
+            self.stop_requested = False
+            self.arrivals = []
+
+        def on_step(self, step_data):
+            self.stop_requested = True
+
+        def on_arrival(self, axis, t):
+            self.arrivals.append(axis)
+
+        def should_stop(self):
+            return self.stop_requested
+
+    feedback = position(z=0.01)
+    feedback["vz"] = None
+    hooks = StopAfterFirstStep()
+
+    with pytest.raises(RuntimeError, match="stopped"):
+        run_pd_control(
+            source=SequenceSource([feedback]),
+            actuator=PreserveMissingVelocityActuator(),
+            config=CraneConfig(),
+            target_pos=(0.0, 0.0, 0.01),
+            initial_state=CraneState(0.0, 0.0, 0.0),
+            hooks=hooks,
+            verbose=False,
+            is_simulation=False,
+        )
+
+    assert "z" not in hooks.arrivals
 
 
 def test_config_enforces_configured_workspace_bounds():
