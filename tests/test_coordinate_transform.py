@@ -16,6 +16,25 @@ def test_identity_transform_preserves_points_and_vectors():
     assert transform.crane_to_map_point(3.0, -2.0) == pytest.approx((3.0, -2.0))
     assert transform.map_to_crane_vector(0.4, -0.2) == pytest.approx((0.4, -0.2))
     assert transform.crane_to_map_vector(0.4, -0.2) == pytest.approx((0.4, -0.2))
+    assert transform.map_to_crane_position(3.0, -2.0, 5.0) == pytest.approx((3.0, -2.0, 5.0))
+    assert transform.crane_to_map_position(3.0, -2.0, 5.0) == pytest.approx((3.0, -2.0, 5.0))
+
+
+def test_full_3d_transform_corrects_map_roll_and_yaw():
+    transform = CoordinateTransform2D.from_degrees(
+        origin_map_x=10.0,
+        origin_map_y=20.0,
+        origin_map_z=30.0,
+        crane_x_axis_yaw_deg=90.0,
+        crane_roll_deg=90.0,
+        crane_pitch_deg=0.0,
+    )
+
+    # Rz(90)Rx(90): crane X->map Y, crane Y->map Z, crane Z->map X.
+    assert transform.crane_to_map_position(2.0, 3.0, 4.0) == pytest.approx((14.0, 22.0, 33.0))
+    assert transform.map_to_crane_position(14.0, 22.0, 33.0) == pytest.approx((2.0, 3.0, 4.0))
+    assert transform.crane_to_map_vector3(2.0, 3.0, 4.0) == pytest.approx((4.0, 2.0, 3.0))
+    assert transform.map_to_crane_vector3(4.0, 2.0, 3.0) == pytest.approx((2.0, 3.0, 4.0))
 
 
 def test_map_points_are_rotated_and_translated_into_crane_axes():
@@ -50,7 +69,12 @@ def test_non_finite_transform_parameters_are_rejected():
 
 
 def test_control_step_is_converted_back_to_map_for_browser_display():
-    transform = CoordinateTransform2D.from_degrees(10.0, 20.0, 90.0)
+    transform = CoordinateTransform2D.from_degrees(
+        10.0,
+        20.0,
+        90.0,
+        origin_map_z=5.0,
+    )
     crane_step = {
         "x": 2.0,
         "y": 3.0,
@@ -64,6 +88,8 @@ def test_control_step_is_converted_back_to_map_for_browser_display():
         "vy": 0.0,
         "vx_cmd": 0.5,
         "vy_cmd": -0.25,
+        "vz": 0.2,
+        "vz_cmd": -0.1,
     }
 
     map_step = transform.control_step_to_map(crane_step)
@@ -73,21 +99,30 @@ def test_control_step_is_converted_back_to_map_for_browser_display():
     assert (map_step["x_measured"], map_step["y_measured"]) == pytest.approx((6.5, 22.5))
     assert (map_step["vx"], map_step["vy"]) == pytest.approx((0.0, 1.0))
     assert (map_step["vx_cmd"], map_step["vy_cmd"]) == pytest.approx((0.25, 0.5))
-    assert map_step["z"] == -1.5
+    assert map_step["z"] == pytest.approx(3.5)
+    assert map_step["p_ref_z"] == pytest.approx(3.0)
+    assert map_step["vz"] == pytest.approx(0.2)
+    assert map_step["vz_cmd"] == pytest.approx(-0.1)
 
 
 def test_ros_position_source_outputs_crane_coordinates_and_ignores_unavailable_z_velocity(monkeypatch):
-    transform = CoordinateTransform2D.from_degrees(10.0, 20.0, 90.0)
+    transform = CoordinateTransform2D.from_degrees(
+        origin_map_x=10.0,
+        origin_map_y=20.0,
+        origin_map_z=30.0,
+        crane_x_axis_yaw_deg=90.0,
+        crane_roll_deg=90.0,
+    )
     monkeypatch.setattr(
         ros_bridge,
         "get_latest_pose",
         lambda: {
-            "x": 7.0,
+            "x": 14.0,
             "y": 22.0,
-            "z": -1.5,
-            "vx": 0.0,
-            "vy": 1.0,
-            "vz": 99.0,
+            "z": 33.0,
+            "vx": 4.0,
+            "vy": 2.0,
+            "vz": 3.0,
             "stamp_sec": 1,
             "stamp_nsec": 0,
         },
@@ -99,9 +134,43 @@ def test_ros_position_source_outputs_crane_coordinates_and_ignores_unavailable_z
 
     position = source.get_position()
 
-    assert (position["x"], position["y"], position["z"]) == pytest.approx((2.0, 3.0, -1.5))
-    assert (position["vx"], position["vy"]) == pytest.approx((1.0, 0.0))
+    assert (position["x"], position["y"], position["z"]) == pytest.approx((2.0, 3.0, 4.0))
+    # A tilted 3D frame needs map Vz to rotate velocity safely. Since native
+    # Z velocity is disabled, all axes fall back to position-derived velocity.
+    assert position["vx"] is None
+    assert position["vy"] is None
     assert position["vz"] is None
+
+
+def test_ros_position_source_rotates_native_xyz_velocity_when_explicitly_trusted(monkeypatch):
+    transform = CoordinateTransform2D.from_degrees(
+        origin_map_x=10.0,
+        origin_map_y=20.0,
+        origin_map_z=30.0,
+        crane_x_axis_yaw_deg=90.0,
+        crane_roll_deg=90.0,
+    )
+    monkeypatch.setattr(
+        ros_bridge,
+        "get_latest_pose",
+        lambda: {
+            "x": 14.0,
+            "y": 22.0,
+            "z": 33.0,
+            "vx": 4.0,
+            "vy": 2.0,
+            "vz": 3.0,
+            "stamp_sec": 1,
+            "stamp_nsec": 0,
+        },
+    )
+
+    position = ros_bridge.RosPositionSource(
+        coordinate_transform=transform,
+        use_native_z_velocity=True,
+    ).get_position()
+
+    assert (position["vx"], position["vy"], position["vz"]) == pytest.approx((2.0, 3.0, 4.0))
 
 
 def test_cli_builds_map_to_crane_transform():
@@ -109,6 +178,9 @@ def test_cli_builds_map_to_crane_transform():
         [
             "--map-to-crane-origin-x", "10",
             "--map-to-crane-origin-y", "20",
+            "--map-to-crane-origin-z", "30",
+            "--map-to-crane-roll-deg", "2",
+            "--map-to-crane-pitch-deg", "-3",
             "--map-to-crane-yaw-deg", "90",
         ]
     )
@@ -116,18 +188,28 @@ def test_cli_builds_map_to_crane_transform():
     transform = main._coordinate_transform_from_args(args)
 
     assert transform.map_to_crane_point(10.0, 22.0) == pytest.approx((2.0, 0.0))
+    assert transform.origin_map_z == 30.0
+    assert transform.crane_roll_deg == 2.0
+    assert transform.crane_pitch_deg == -3.0
 
 
 def test_web_map_target_is_transformed_before_crane_workspace_validation():
-    transform = CoordinateTransform2D.from_degrees(10.0, 20.0, 90.0)
+    transform = CoordinateTransform2D.from_degrees(
+        origin_map_x=10.0,
+        origin_map_y=20.0,
+        origin_map_z=30.0,
+        crane_x_axis_yaw_deg=90.0,
+        crane_roll_deg=90.0,
+    )
     config = CraneConfig(
         workspace_x_bounds=(0.0, 3.0),
         workspace_y_bounds=(0.0, 4.0),
+        workspace_z_bounds=(0.0, 5.0),
     )
-    body = '{"target_x": 7, "target_y": 22, "target_z": -1.5}'
+    body = '{"target_x": 14, "target_y": 22, "target_z": 33}'
 
     assert live_server._parse_control_target(
         body,
         config,
         transform,
-    ) == pytest.approx((2.0, 3.0, -1.5))
+    ) == pytest.approx((2.0, 3.0, 4.0))
