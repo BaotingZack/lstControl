@@ -476,7 +476,8 @@ class PlcActuator:
     def update_state(self, state: CraneState, position: dict) -> None:
         """从 /localization_pose 数据更新 CraneState。
 
-        位置直接来自定位, 速度使用 Odometry 原生速度 (若可用) 或 PD 指令速度。
+        位置直接来自定位；可用的原生速度逐轴写入，缺失轴由控制循环
+        使用位置差分后的滤波速度补齐。
         """
         with self._command_lock:
             state.x.position = position['x']
