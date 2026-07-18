@@ -4,14 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import Tuple
 
 
-Matrix3 = tuple[
-    tuple[float, float, float],
-    tuple[float, float, float],
-    tuple[float, float, float],
+Matrix3 = Tuple[
+    Tuple[float, float, float],
+    Tuple[float, float, float],
+    Tuple[float, float, float],
 ]
-Vector3 = tuple[float, float, float]
+Vector3 = Tuple[float, float, float]
 
 
 def _matrix_vector(matrix: Matrix3, vector: Vector3) -> Vector3:

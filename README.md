@@ -12,7 +12,7 @@
 v_cmd = Kp * (target_position - measured_position) - Kd * filtered_velocity
 ```
 
-D 项使用位置差分后低通滤波得到的速度，避免原始差分速度抖动。两种模式使用完全相同的位置控制器和速度滤波器。PLC 模式的状态显示与到位检测可使用 Odometry 原生 XY 速度；Z 轴由于现场只有高度反馈，默认使用连续高度差分并低通滤波得到速度。
+D 项使用位置差分后低通滤波得到的速度，避免原始差分速度抖动。两种模式使用完全相同的位置控制器和速度滤波器。地图未倾斜时，PLC 状态显示与到位检测可使用 Odometry 原生 XY 速度；存在 roll/pitch 且 Map Vz 不可信时，XYZ 统一从变换后的位置差分并低通滤波得到速度。
 
 ---
 
@@ -86,6 +86,9 @@ ROS /localization_pose ──► RosPositionSource ──► PD 控制循环
 | `--allow-mock-plc` | 关闭 | 显式允许 PLC 库加载失败时使用 MockPLC |
 | `--map-to-crane-origin-x` | `0.0` | 起重机原点在 SLAM 地图中的 X 坐标 (m) |
 | `--map-to-crane-origin-y` | `0.0` | 起重机原点在 SLAM 地图中的 Y 坐标 (m) |
+| `--map-to-crane-origin-z` | `0.0` | 起重机原点在 SLAM 地图中的 Z 坐标 (m) |
+| `--map-to-crane-roll-deg` | `0.0` | 真实起重机坐标系在 SLAM 地图中的横滚角 (deg) |
+| `--map-to-crane-pitch-deg` | `0.0` | 真实起重机坐标系在 SLAM 地图中的俯仰角 (deg) |
 | `--map-to-crane-yaw-deg` | `0.0` | 起重机 +X 轨道在 SLAM 地图中的偏转角 (deg) |
 | `--use-native-z-velocity` | 关闭 | 显式信任 Odometry 的 `twist.linear.z`；默认从高度估速 |
 | `--workspace-x-min/max` | 空 | 可选 X 轴机械工作区；必须成对设置 |
@@ -107,39 +110,44 @@ python3 main.py --plc-ip 192.168.1.100 --live \
 
 ## SLAM 地图与起重机轨道标定
 
-SLAM 地图的 XY 轴不必与大车/小车轨道平行。程序使用一个二维刚体变换：
+SLAM 地图不仅可能与大车/小车轨道有水平偏角，也可能没有与真实地面完全平齐。程序使用完整三维刚体变换：
 
 ```text
-map_point   = map_origin + R(yaw) * crane_point
-crane_point = R(yaw)^T * (map_point - map_origin)
+map_point   = map_origin + Rz(yaw) Ry(pitch) Rx(roll) * crane_point
+crane_point = R^T * (map_point - map_origin)
 ```
 
 - 浏览器定位、目标输入和轨迹显示保持 **SLAM map 坐标**。
-- PD 控制、机械工作区检查和 PLC X/Y 指令使用 **起重机轨道坐标**。
-- 位置会旋转并平移，XY 速度只旋转，Z 不参与二维坐标变换。
-- 三个标定参数全为 0 时是单位变换，兼容未标定的旧用法。
+- PD 控制、机械工作区检查和 PLC 三轴指令使用 **真实起重机坐标**。
+- XYZ 位置会旋转并平移，XYZ 速度只旋转；地图坡度造成的 Z 漂移不会再串入真实 Z。
+- 原点、roll、pitch、yaw 全为 0 时是单位变换，兼容未标定的旧用法。
 
 ### 现场三点标定
 
-1. 将大车/小车停到约定的起重机坐标原点，记录 SLAM 点 `START`。
-2. 仅沿起重机 **+X 大车轨道**移动已知的有符号距离，记录 `AFTER X`。
-3. 从 `AFTER X` 仅沿起重机 **+Y 小车轨道**移动已知的有符号距离，记录 `AFTER Y`。
-4. 打开 `http://127.0.0.1:8000/calibration`，输入三个观测点和两段实际移动距离，点击 **CALIBRATE / 标定**。
-5. 检查 X/Y 比例、正交误差和残差 RMS；质量合格后复制页面生成的 CLI 参数。
+1. 将大车/小车停到约定的起重机坐标原点，记录三维 SLAM 点 `START (X,Y,Z)`。
+2. 仅沿起重机 **+X 大车轨道**移动已知的有符号距离，记录三维点 `AFTER X`。
+3. 从 `AFTER X` 仅沿起重机 **+Y 小车轨道**移动已知的有符号距离，记录三维点 `AFTER Y`。
+4. 打开 `http://127.0.0.1:8000/calibration`，输入三个三维观测点和两段实际移动距离，点击 **CALIBRATE / 标定**。
+5. 检查 X/Y 比例、正交误差、地面倾角和残差 RMS；质量合格后复制页面生成的 CLI 参数。
 
-例如地图中的起重机原点为 `(10, 20)`，大车 +X 在地图里指向 90°：
+两条不共线的三维水平轨迹已经确定了物理 +X/+Y 方向，其叉乘会得到真实地面法向 +Z，因此不需要为了该标定额外升降吊钩。若 SLAM 地图倾斜，大车或小车水平移动时原始 Map Z 会变化；变换到起重机坐标后，这三点的真实 Z 应接近同一个值。
+
+例如地图中的起重机原点为 `(10, 20, 1.5)`，地图相对真实地面 roll 为 2°、pitch 为 -4°，大车 +X 在地图里指向 90°：
 
 ```bash
 python3 main.py --plc-ip 192.168.1.100 --live \
   --map-to-crane-origin-x 10 \
   --map-to-crane-origin-y 20 \
+  --map-to-crane-origin-z 1.5 \
+  --map-to-crane-roll-deg 2 \
+  --map-to-crane-pitch-deg -4 \
   --map-to-crane-yaw-deg 90 \
   --workspace-x-min 0 --workspace-x-max 30 \
   --workspace-y-min -10 --workspace-y-max 10 \
   --workspace-z-min -5 --workspace-z-max 15
 ```
 
-标定页可先设置模拟的地图偏转、原点、移动距离和噪声，播放“大车前进 → 小车横移”过程；左图显示倾斜的 SLAM 轨迹，右图显示变换后与轨道对齐的坐标。观测点可手动编辑，因此也能直接代入现场记录做离线计算。
+标定页可先设置模拟的 roll、pitch、yaw、三维原点、移动距离和噪声，播放“大车前进 → 小车横移”过程。左上图显示原始 SLAM 平面轨迹，右上图显示变换后与轨道对齐的坐标，底部曲线显示水平移动产生的 Map Z 漂移以及标定后的真实地面 `Z≈0`。观测点可手动编辑，因此也能直接代入现场记录做离线计算。
 
 ---
 
@@ -212,8 +220,8 @@ velocity_filter.py     位置差分 + 低通滤波估计速度
 visualizer.py          静态控制曲线和作业示意图 (matplotlib)
 live_server.py         浏览器 live view (HTTP + SSE + 内嵌 HTML/JS)
                        支持仿真回放、PLC 实时控制和坐标标定页
-coordinate_transform.py SLAM map ↔ 起重机轨道二维刚体变换
-calibration.py         根据两段已知轨道移动估计原点、偏转角和质量指标
+coordinate_transform.py SLAM map ↔ 起重机坐标三维刚体变换
+calibration.py         根据两段三维轨道移动估计原点、roll/pitch/yaw 和质量指标
 plc_interface.py       PLC 接口 (MockPLC / RealPLC / PlcActuator)
 ros_bridge.py          ROS 桥接 (订阅 /localization_pose + RosPositionSource)
 plc_lib/               C++ PLC 控制库
@@ -265,7 +273,7 @@ vz_raw = (z_now - z_previous) / dt
 vz_filtered = low_pass(vz_raw, tau=0.50s)
 ```
 
-该方案在 10Hz 高度数据连续、时间戳可靠、量化噪声不过大的条件下可行。低通滤波会引入少量延迟，因此到达判断同时检查位置、速度估计和速度指令，避免“高度刚进入窗口但吊钩仍在运动”时过早判定到位。只有确认设备发布的 `twist.linear.z` 真实可靠时才建议传入 `--use-native-z-velocity`。
+该方案在 10Hz 高度数据连续、时间戳可靠、量化噪声不过大的条件下可行。低通滤波会引入少量延迟，因此到达判断同时检查位置、速度估计和速度指令，避免“高度刚进入窗口但吊钩仍在运动”时过早判定到位。地图存在 roll/pitch 且原生 Map Vz 不可信时，XYZ 三轴统一从变换后的连续位置估速，避免缺少 Vz 导致速度旋转错误；只有确认设备发布的三维 twist 真实可靠时才建议传入 `--use-native-z-velocity`。
 
 ### 停机与故障处理
 
