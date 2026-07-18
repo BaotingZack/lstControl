@@ -30,6 +30,7 @@ import time
 import matplotlib
 matplotlib.use('Agg')
 
+from coordinate_transform import CoordinateTransform2D  # noqa: E402
 from crane_model import (  # noqa: E402
     CraneConfig,
     CranePlant,
@@ -94,6 +95,14 @@ def _build_arg_parser():
                         help='path to libsscarctrl.so')
     parser.add_argument('--allow-mock-plc', action='store_true',
                         help='explicitly allow MockPLC when the real PLC library cannot load')
+    parser.add_argument('--map-to-crane-origin-x', type=float, default=0.0,
+                        help='crane origin X coordinate in the SLAM map')
+    parser.add_argument('--map-to-crane-origin-y', type=float, default=0.0,
+                        help='crane origin Y coordinate in the SLAM map')
+    parser.add_argument('--map-to-crane-yaw-deg', type=float, default=0.0,
+                        help='yaw of the crane +X rail in the SLAM map, in degrees')
+    parser.add_argument('--use-native-z-velocity', action='store_true',
+                        help='trust Odometry twist.linear.z instead of height-derived velocity')
     for axis in ('x', 'y', 'z'):
         parser.add_argument(f'--workspace-{axis}-min', type=float, default=None,
                             help=f'minimum allowed {axis.upper()} target in PLC workspace')
@@ -125,6 +134,14 @@ def _config_from_args(args) -> CraneConfig:
         workspace_x_bounds=_workspace_bounds_from_args(args, 'x'),
         workspace_y_bounds=_workspace_bounds_from_args(args, 'y'),
         workspace_z_bounds=_workspace_bounds_from_args(args, 'z'),
+    )
+
+
+def _coordinate_transform_from_args(args) -> CoordinateTransform2D:
+    return CoordinateTransform2D.from_degrees(
+        origin_map_x=args.map_to_crane_origin_x,
+        origin_map_y=args.map_to_crane_origin_y,
+        crane_x_axis_yaw_deg=args.map_to_crane_yaw_deg,
     )
 
 
@@ -172,11 +189,16 @@ def _target_from_query(
 def main(argv=None):
     args = _build_arg_parser().parse_args(argv)
     config = _config_from_args(args)
+    coordinate_transform = _coordinate_transform_from_args(args)
     crane0 = CraneState(x0=0.0, y0=0.0, z0=0.0)
-    target_pos = config.validate_target((args.target_x, args.target_y, args.target_z))
+    map_target_pos = (args.target_x, args.target_y, args.target_z)
 
     # ---- PLC 模式 ----
     if args.plc_ip:
+        target_x, target_y = coordinate_transform.map_to_crane_point(
+            map_target_pos[0], map_target_pos[1]
+        )
+        target_pos = config.validate_target((target_x, target_y, map_target_pos[2]))
         plc = _connect_plc(args)
         try:
             start_ros_bridge()
@@ -189,16 +211,33 @@ def main(argv=None):
                 waited += 0.1
             pose = get_latest_pose()
             if pose is not None:
+                crane_x, crane_y = coordinate_transform.map_to_crane_point(
+                    pose['x'], pose['y']
+                )
                 px, py, pz = config.validate_position(
-                    (pose['x'], pose['y'], pose['z'])
+                    (crane_x, crane_y, pose['z'])
                 )
                 crane0 = CraneState(x0=px, y0=py, z0=pz)
-                print(f'Localization received: X={px:.2f}, Y={py:.2f}, Z={pz:.2f}')
+                print(
+                    f'Localization received: map=({pose["x"]:.2f}, {pose["y"]:.2f}, {pz:.2f}), '
+                    f'crane=({px:.2f}, {py:.2f}, {pz:.2f})'
+                )
             else:
                 print('Warning: /localization_pose timeout, using default initial position')
 
-            initial_pos = (crane0.x.position, crane0.y.position, crane0.z.position)
-            ros_source = RosPositionSource()
+            fallback_map_x, fallback_map_y = coordinate_transform.crane_to_map_point(
+                crane0.x.position,
+                crane0.y.position,
+            )
+            initial_pos = (
+                pose['x'] if pose is not None else fallback_map_x,
+                pose['y'] if pose is not None else fallback_map_y,
+                crane0.z.position,
+            )
+            ros_source = RosPositionSource(
+                coordinate_transform=coordinate_transform,
+                use_native_z_velocity=args.use_native_z_velocity,
+            )
             plc_actuator = PlcActuator(plc, initial_z=crane0.z.position)
 
             if args.live:
@@ -216,6 +255,7 @@ def main(argv=None):
                     initial_pos=initial_pos,
                     update_hz=args.hz,
                     speed=args.speed,
+                    coordinate_transform=coordinate_transform,
                 )
             else:
                 # PLC 模式非 live: 使用命令行 target 直接运行
@@ -241,6 +281,7 @@ def main(argv=None):
         return
 
     # ---- 仿真模式 ----
+    target_pos = config.validate_target(map_target_pos)
     history, arrival_events = run_simulation(
         target_pos=target_pos,
         initial_state=crane0,

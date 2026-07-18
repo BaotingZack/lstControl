@@ -14,6 +14,8 @@ import threading
 import time
 from typing import Any
 
+from coordinate_transform import CoordinateTransform2D
+
 
 # ---- raw pose accessor (thread-safe, non-blocking) ----
 
@@ -100,7 +102,18 @@ class RosPositionSource:
 
     _POSITION_TIMEOUT = 2.0  # [s] 定位断流超时
 
-    def __init__(self):
+    def __init__(
+        self,
+        coordinate_transform: CoordinateTransform2D | None = None,
+        *,
+        use_native_xy_velocity: bool = True,
+        use_native_z_velocity: bool = False,
+    ):
+        self._coordinate_transform = (
+            coordinate_transform or CoordinateTransform2D.identity()
+        )
+        self._use_native_xy_velocity = use_native_xy_velocity
+        self._use_native_z_velocity = use_native_z_velocity
         self._last_stamp: float | None = None   # ROS stamp (sec + nsec*1e-9)
         self._t0: float | None = None           # 首次数据到达的单调时间
         self._last_wall: float | None = None    # 上次 get_position 的单调时间
@@ -138,13 +151,23 @@ class RosPositionSource:
             self._last_stamp = stamp
             self._last_wall = now
 
+            crane_x, crane_y = self._coordinate_transform.map_to_crane_point(
+                pose['x'], pose['y']
+            )
+            vx = pose.get('vx') if self._use_native_xy_velocity else None
+            vy = pose.get('vy') if self._use_native_xy_velocity else None
+            if vx is not None and vy is not None:
+                vx, vy = self._coordinate_transform.map_to_crane_vector(vx, vy)
+            else:
+                vx = vy = None
+
             return {
-                'x': pose['x'],
-                'y': pose['y'],
+                'x': crane_x,
+                'y': crane_y,
                 'z': pose['z'],
-                'vx': pose.get('vx'),  # native Odometry velocity (未使用, 保留)
-                'vy': pose.get('vy'),
-                'vz': pose.get('vz'),
+                'vx': vx,
+                'vy': vy,
+                'vz': pose.get('vz') if self._use_native_z_velocity else None,
                 'dt': dt,
                 't': self._t,
                 'stamp': stamp,

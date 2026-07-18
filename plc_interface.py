@@ -443,7 +443,7 @@ class PlcActuator:
                 self._last_vy = vy
 
             # Z 轴 API 接收绝对高度。节流必须比较高度设定值，而不是 vz。
-            self._z_height = max(0.0, self._z_height + vz * dt)
+            self._z_height += vz * dt
             self._plc.last_vz = vz
             self._plc.last_hz = self._z_height
             if (
@@ -470,7 +470,7 @@ class PlcActuator:
     def set_z_reference(self, height: float) -> None:
         """Synchronize the Z integrator with a fresh localization measurement."""
         with self._command_lock:
-            self._z_height = max(0.0, float(height))
+            self._z_height = float(height)
             self._last_z_height = None
 
     def update_state(self, state: CraneState, position: dict) -> None:
@@ -482,13 +482,13 @@ class PlcActuator:
             state.x.position = position['x']
             state.y.position = position['y']
             state.z.position = position['z']
-            self._z_height = max(0.0, position['z'])
+            self._z_height = position['z']
 
-            # 优先使用 Odometry 原生速度, 若不可用则保留当前状态。
-            if position.get('vx') is not None:
-                state.x.velocity = position['vx']
-                state.y.velocity = position['vy']
-                state.z.velocity = position['vz']
+            # 每个轴独立选择原生速度；缺失轴由控制循环填入差分估计值。
+            for axis_name in ('x', 'y', 'z'):
+                velocity = position.get(f'v{axis_name}')
+                if velocity is not None:
+                    getattr(state, axis_name).velocity = velocity
 
     def stop_motion(self) -> None:
         """正常到位：X/Y 归零，Z 保持当前绝对高度。"""

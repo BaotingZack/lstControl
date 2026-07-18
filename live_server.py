@@ -24,6 +24,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from calibration import (
+    CalibrationObservation,
+    CalibrationResult,
+    calibrate_map_to_crane,
+)
+from coordinate_transform import CoordinateTransform2D
 from crane_model import (
     ControlHooks,
     ControlStoppedError,
@@ -38,10 +44,529 @@ from visualizer import CraneVisualizer
 
 
 _MAX_CONTROL_BODY_BYTES = 4096
+_MAX_CALIBRATION_BODY_BYTES = 8192
 
 
-def _parse_control_target(body: str, config: CraneConfig) -> tuple[float, float, float]:
-    """Parse a web target and apply the same safety validation as the CLI."""
+def _calibrate_from_request(body: str) -> CalibrationResult:
+    """Parse browser observations and calculate a map-to-crane transform."""
+    try:
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise TypeError('payload must be a JSON object')
+
+        def _point(name: str) -> tuple[float, float]:
+            point = payload[name]
+            if not isinstance(point, dict):
+                raise TypeError(f'{name} must be an object with x and y')
+            return float(point['x']), float(point['y'])
+
+        observation = CalibrationObservation(
+            start_map=_point('start'),
+            after_forward_map=_point('afterForward'),
+            after_lateral_map=_point('afterLateral'),
+            forward_distance=float(payload['forwardDistance']),
+            lateral_distance=float(payload['lateralDistance']),
+        )
+        max_error = float(payload.get('maxOrthogonalityErrorDeg', 15.0))
+        return calibrate_map_to_crane(
+            observation,
+            max_orthogonality_error_deg=max_error,
+        )
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f'Invalid calibration: {exc}') from exc
+
+
+def render_calibration_html() -> str:
+    """Return the interactive SLAM-map to crane-rail calibration lab."""
+    return """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Coordinate Calibration Lab</title>
+  <style>
+    :root {
+      --ink: #eaf2f5;
+      --muted: #8ea2ad;
+      --void: #091014;
+      --deck: #101a20;
+      --panel: #142128;
+      --raised: #1a2a32;
+      --line: #2c414b;
+      --faint: #1c3038;
+      --amber: #f4b942;
+      --cyan: #49d6d0;
+      --green: #79d987;
+      --red: #ef705d;
+      --blue: #5caee8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background:
+        linear-gradient(rgba(73, 214, 208, 0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(73, 214, 208, 0.025) 1px, transparent 1px),
+        radial-gradient(circle at 74% 8%, #18303a 0, transparent 34%),
+        var(--void);
+      background-size: 24px 24px, 24px 24px, auto, auto;
+      font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+    }
+    button, input { font: inherit; }
+    .shell { min-height: 100vh; display: grid; grid-template-rows: auto 1fr; }
+    header {
+      min-height: 68px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 12px 22px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(9, 16, 20, 0.9);
+    }
+    .brand { display: flex; align-items: center; gap: 14px; }
+    .mark {
+      width: 36px; height: 36px; position: relative;
+      border: 1px solid var(--cyan); transform: rotate(45deg);
+      box-shadow: inset 0 0 0 7px var(--void), inset 0 0 0 8px var(--amber);
+    }
+    .eyebrow { color: var(--cyan); font-size: 10px; letter-spacing: .18em; text-transform: uppercase; }
+    h1 { margin: 3px 0 0; font-family: "Arial Narrow", sans-serif; font-size: 22px; letter-spacing: .04em; }
+    header nav { display: flex; align-items: center; gap: 14px; }
+    header a { color: var(--muted); text-decoration: none; font-size: 12px; }
+    header a:hover { color: var(--ink); }
+    .live-dot { display: inline-flex; align-items: center; gap: 7px; color: var(--green); font-size: 11px; }
+    .live-dot::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 10px currentColor; }
+    main { display: grid; grid-template-columns: minmax(560px, 1.5fr) minmax(360px, .75fr); gap: 14px; padding: 14px; min-height: 0; }
+    .visual, .controls { border: 1px solid var(--line); background: rgba(16, 26, 32, .96); }
+    .visual { display: grid; grid-template-rows: auto 1fr auto; min-height: 680px; }
+    .section-head {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      padding: 12px 15px; border-bottom: 1px solid var(--line); background: var(--panel);
+    }
+    .section-title { display: flex; align-items: center; gap: 10px; font-size: 12px; letter-spacing: .09em; text-transform: uppercase; }
+    .section-title::before { content: "//"; color: var(--amber); }
+    .mode { color: var(--muted); font-size: 10px; }
+    .canvas-wrap { position: relative; min-height: 540px; }
+    canvas { display: block; width: 100%; height: 100%; min-height: 540px; }
+    .legend {
+      display: flex; flex-wrap: wrap; gap: 18px; padding: 10px 15px;
+      color: var(--muted); font-size: 10px; border-top: 1px solid var(--line);
+    }
+    .legend span { display: inline-flex; align-items: center; gap: 7px; }
+    .legend i { width: 18px; height: 2px; background: var(--amber); }
+    .legend .measured { background: var(--green); }
+    .legend .corrected { background: var(--cyan); }
+    .controls { overflow: auto; }
+    .block { padding: 14px; border-bottom: 1px solid var(--line); }
+    .block:last-child { border-bottom: 0; }
+    .block-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+    .block-title strong { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
+    .step-no { color: var(--amber); font-size: 10px; }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+    label { display: grid; gap: 5px; color: var(--muted); font-size: 10px; }
+    label.wide { grid-column: 1 / -1; }
+    input {
+      min-width: 0; width: 100%; padding: 9px 10px; color: var(--ink);
+      border: 1px solid var(--line); border-radius: 2px; background: #0a1318;
+      font-variant-numeric: tabular-nums;
+    }
+    input:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 0 1px rgba(73,214,208,.25); }
+    .run-label { grid-column: 1 / -1; color: var(--blue); margin-top: 4px; font-size: 10px; letter-spacing: .09em; text-transform: uppercase; }
+    .point-row { grid-column: 1 / -1; display: grid; grid-template-columns: 74px 1fr 1fr; gap: 8px; align-items: end; }
+    .point-row > span { align-self: center; color: var(--ink); font-size: 10px; }
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    button {
+      min-height: 39px; border: 1px solid var(--line); border-radius: 2px;
+      color: var(--ink); background: var(--raised); cursor: pointer; transition: .15s ease;
+      font-size: 11px; font-weight: 700; letter-spacing: .04em;
+    }
+    button:hover { border-color: var(--cyan); transform: translateY(-1px); }
+    button.primary { color: #071114; border-color: var(--amber); background: var(--amber); }
+    button.primary:hover { filter: brightness(1.08); }
+    button.calibrate { color: #071114; border-color: var(--cyan); background: var(--cyan); }
+    button:disabled { opacity: .55; cursor: wait; transform: none; }
+    .status-line {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      margin-bottom: 11px; padding: 9px 10px; border: 1px solid var(--line); background: #0b151a;
+    }
+    .status-line span:first-child { color: var(--muted); font-size: 10px; }
+    .quality { color: var(--muted); font-size: 11px; font-weight: 700; }
+    .quality.pass { color: var(--green); }
+    .quality.warn, .quality.error { color: var(--red); }
+    .metrics { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--line); }
+    .metric { min-width: 0; padding: 10px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .metric:nth-child(2n) { border-right: 0; }
+    .metric:nth-last-child(-n + 2) { border-bottom: 0; }
+    .metric span { display: block; color: var(--muted); font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
+    .metric strong { display: block; margin-top: 6px; color: var(--ink); font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .cli {
+      min-height: 76px; margin-top: 10px; padding: 10px; color: var(--cyan); background: #071014;
+      border: 1px dashed #35515c; font-size: 10px; line-height: 1.55; word-break: break-all; user-select: all;
+    }
+    .note { margin: 10px 0 0; color: var(--muted); font-family: sans-serif; font-size: 11px; line-height: 1.55; }
+    @media (max-width: 980px) {
+      main { grid-template-columns: 1fr; }
+      .visual { min-height: 620px; }
+    }
+    @media (max-width: 600px) {
+      header { align-items: flex-start; }
+      header nav { flex-direction: column; align-items: flex-end; gap: 6px; }
+      main { padding: 8px; }
+      .visual { min-height: 560px; }
+      .canvas-wrap, canvas { min-height: 460px; }
+      .point-row { grid-template-columns: 58px 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div class="brand">
+        <div class="mark" aria-hidden="true"></div>
+        <div><div class="eyebrow">SLAM / Rail frame alignment</div><h1>Coordinate Calibration Lab</h1></div>
+      </div>
+      <nav><span class="live-dot">SIM READY</span><a href="/">返回起重机控制台 →</a></nav>
+    </header>
+    <main>
+      <section class="visual">
+        <div class="section-head">
+          <div class="section-title">Map deviation &amp; correction</div>
+          <div class="mode" id="motionPhase">IDLE / 等待仿真</div>
+        </div>
+        <div class="canvas-wrap"><canvas id="calibrationCanvas" aria-label="标定过程仿真画布"></canvas></div>
+        <div class="legend">
+          <span><i></i>物理行车轨道</span><span><i class="measured"></i>SLAM 测量轨迹</span><span><i class="corrected"></i>标定后坐标</span>
+        </div>
+      </section>
+      <aside class="controls">
+        <section class="block">
+          <div class="block-title"><strong>仿真工况</strong><span class="step-no">SETUP</span></div>
+          <div class="form-grid">
+            <label>地图偏转角 / DEG<input id="simYaw" type="number" step="0.1" value="17"></label>
+            <label>测量噪声 / M<input id="simNoise" type="number" min="0" step="0.001" value="0.008"></label>
+            <label>地图原点 X / M<input id="originX" type="number" step="0.1" value="12.5"></label>
+            <label>地图原点 Y / M<input id="originY" type="number" step="0.1" value="-4"></label>
+            <label>Forward Run / 大车 X / M<input id="forwardDistance" type="number" step="0.1" value="6"></label>
+            <label>Lateral Run / 小车 Y / M<input id="lateralDistance" type="number" step="0.1" value="3"></label>
+          </div>
+        </section>
+        <section class="block">
+          <div class="block-title"><strong>SLAM 观测点</strong><span class="step-no">01—03</span></div>
+          <div class="form-grid">
+            <div class="point-row"><span>START</span><label>Map X<input id="startX" type="number" step="0.001"></label><label>Map Y<input id="startY" type="number" step="0.001"></label></div>
+            <div class="run-label">Forward Run / 沿大车轨道移动已知距离</div>
+            <div class="point-row"><span>AFTER X</span><label>Map X<input id="forwardX" type="number" step="0.001"></label><label>Map Y<input id="forwardY" type="number" step="0.001"></label></div>
+            <div class="run-label">Lateral Run / 沿小车轨道移动已知距离</div>
+            <div class="point-row"><span>AFTER Y</span><label>Map X<input id="lateralX" type="number" step="0.001"></label><label>Map Y<input id="lateralY" type="number" step="0.001"></label></div>
+          </div>
+        </section>
+        <section class="block">
+          <div class="actions">
+            <button class="primary" id="simulateBtn" type="button">▶ SIMULATE RUN</button>
+            <button class="calibrate" id="calibrateBtn" type="button">CALIBRATE / 标定</button>
+            <button id="resetBtn" type="button">RESET</button>
+            <button id="copyBtn" type="button">COPY CLI</button>
+          </div>
+        </section>
+        <section class="block">
+          <div class="block-title"><strong>标定结果</strong><span class="step-no">RESULT</span></div>
+          <div class="status-line"><span>CALIBRATION QUALITY</span><span class="quality" id="quality">NOT CALIBRATED</span></div>
+          <div class="metrics">
+            <div class="metric"><span>Origin map X</span><strong id="resultOriginX">—</strong></div>
+            <div class="metric"><span>Origin map Y</span><strong id="resultOriginY">—</strong></div>
+            <div class="metric"><span>Rail yaw</span><strong id="resultYaw">—</strong></div>
+            <div class="metric"><span>Orthogonality</span><strong id="resultOrth">—</strong></div>
+            <div class="metric"><span>X / Y scale</span><strong id="resultScale">—</strong></div>
+            <div class="metric"><span>Residual RMS</span><strong id="resultRms">—</strong></div>
+          </div>
+          <div class="cli" id="cliOutput">--map-to-crane-origin-x … --map-to-crane-origin-y … --map-to-crane-yaw-deg …</div>
+          <p class="note">标定参数描述“起重机原点在 SLAM 地图中的位置”和“物理 +X 轨道在地图中的偏转角”。控制内部会把地图目标旋转到轨道坐标，网页仍显示地图坐标。</p>
+        </section>
+      </aside>
+    </main>
+  </div>
+  <script>
+    const canvas = document.getElementById('calibrationCanvas');
+    const ctx = canvas.getContext('2d');
+    const ids = [
+      'simYaw', 'simNoise', 'originX', 'originY', 'forwardDistance', 'lateralDistance',
+      'startX', 'startY', 'forwardX', 'forwardY', 'lateralX', 'lateralY'
+    ];
+    const fields = Object.fromEntries(ids.map(id => [id, document.getElementById(id)]));
+    const ui = {
+      phase: document.getElementById('motionPhase'), quality: document.getElementById('quality'),
+      originX: document.getElementById('resultOriginX'), originY: document.getElementById('resultOriginY'),
+      yaw: document.getElementById('resultYaw'), orth: document.getElementById('resultOrth'),
+      scale: document.getElementById('resultScale'), rms: document.getElementById('resultRms'),
+      cli: document.getElementById('cliOutput'), simulate: document.getElementById('simulateBtn'),
+      calibrate: document.getElementById('calibrateBtn'), copy: document.getElementById('copyBtn')
+    };
+    let measured = null;
+    let calibration = null;
+    let animation = { active: false, start: 0, progress: 1 };
+
+    const number = id => Number(fields[id].value);
+    const rotate = (x, y, yaw) => ({x: Math.cos(yaw) * x - Math.sin(yaw) * y, y: Math.sin(yaw) * x + Math.cos(yaw) * y});
+    const add = (a, b) => ({x: a.x + b.x, y: a.y + b.y});
+    const fmt = value => Number(value).toFixed(3);
+
+    function randomNoise(amplitude) {
+      return amplitude ? (Math.random() * 2 - 1) * amplitude : 0;
+    }
+
+    function writePoint(prefix, point) {
+      fields[prefix + 'X'].value = fmt(point.x);
+      fields[prefix + 'Y'].value = fmt(point.y);
+    }
+
+    function readMeasured() {
+      return {
+        start: {x: number('startX'), y: number('startY')},
+        forward: {x: number('forwardX'), y: number('forwardY')},
+        lateral: {x: number('lateralX'), y: number('lateralY')}
+      };
+    }
+
+    function simulate() {
+      const yaw = number('simYaw') * Math.PI / 180;
+      const noise = Math.max(0, number('simNoise'));
+      const origin = {x: number('originX'), y: number('originY')};
+      const perturb = point => ({x: point.x + randomNoise(noise), y: point.y + randomNoise(noise)});
+      const start = perturb(origin);
+      const idealForward = add(origin, rotate(number('forwardDistance'), 0, yaw));
+      const idealLateral = add(idealForward, rotate(0, number('lateralDistance'), yaw));
+      measured = {start, forward: perturb(idealForward), lateral: perturb(idealLateral)};
+      writePoint('start', measured.start);
+      writePoint('forward', measured.forward);
+      writePoint('lateral', measured.lateral);
+      calibration = null;
+      clearResult();
+      animation = {active: true, start: performance.now(), progress: 0};
+      ui.phase.textContent = 'FORWARD RUN / 大车移动';
+    }
+
+    function clearResult() {
+      ui.quality.className = 'quality';
+      ui.quality.textContent = 'NOT CALIBRATED';
+      [ui.originX, ui.originY, ui.yaw, ui.orth, ui.scale, ui.rms].forEach(el => el.textContent = '—');
+      ui.cli.textContent = '--map-to-crane-origin-x … --map-to-crane-origin-y … --map-to-crane-yaw-deg …';
+    }
+
+    async function calibrate() {
+      measured = readMeasured();
+      ui.calibrate.disabled = true;
+      ui.quality.className = 'quality';
+      ui.quality.textContent = 'CALCULATING…';
+      try {
+        const response = await fetch('/api/calibrate', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            start: measured.start,
+            afterForward: measured.forward,
+            afterLateral: measured.lateral,
+            forwardDistance: number('forwardDistance'),
+            lateralDistance: number('lateralDistance')
+          })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Calibration failed');
+        calibration = result;
+        showResult(result);
+        ui.phase.textContent = 'ALIGNED / 标定完成';
+      } catch (error) {
+        calibration = null;
+        ui.quality.className = 'quality error';
+        ui.quality.textContent = error.message;
+        ui.phase.textContent = 'INVALID OBSERVATION';
+      } finally {
+        ui.calibrate.disabled = false;
+      }
+    }
+
+    function showResult(result) {
+      const scaleError = Math.max(Math.abs(result.forwardScale - 1), Math.abs(result.lateralScale - 1));
+      const pass = result.orthogonalityErrorDeg <= 3 && scaleError <= .03 && result.residualRms <= .05;
+      ui.quality.className = 'quality ' + (pass ? 'pass' : 'warn');
+      ui.quality.textContent = pass ? 'PASS / 可用' : 'CHECK / 建议复测';
+      ui.originX.textContent = fmt(result.transform.originMapX) + ' m';
+      ui.originY.textContent = fmt(result.transform.originMapY) + ' m';
+      ui.yaw.textContent = fmt(result.transform.craneXAxisYawDeg) + '°';
+      ui.orth.textContent = fmt(result.orthogonalityErrorDeg) + '°';
+      ui.scale.textContent = result.forwardScale.toFixed(4) + ' / ' + result.lateralScale.toFixed(4);
+      ui.rms.textContent = fmt(result.residualRms) + ' m';
+      ui.cli.textContent = result.cliArgs;
+    }
+
+    function boundsFor(points) {
+      const xs = points.map(p => p.x), ys = points.map(p => p.y);
+      const dx = Math.max(2, Math.max(...xs) - Math.min(...xs));
+      const dy = Math.max(2, Math.max(...ys) - Math.min(...ys));
+      const pad = Math.max(dx, dy) * .28;
+      return {minX: Math.min(...xs) - pad, maxX: Math.max(...xs) + pad, minY: Math.min(...ys) - pad, maxY: Math.max(...ys) + pad};
+    }
+
+    function mapper(box, bounds) {
+      const sx = box.w / (bounds.maxX - bounds.minX);
+      const sy = box.h / (bounds.maxY - bounds.minY);
+      const scale = Math.min(sx, sy);
+      const usedW = (bounds.maxX - bounds.minX) * scale;
+      const usedH = (bounds.maxY - bounds.minY) * scale;
+      return point => ({
+        x: box.x + (box.w - usedW) / 2 + (point.x - bounds.minX) * scale,
+        y: box.y + (box.h + usedH) / 2 - (point.y - bounds.minY) * scale
+      });
+    }
+
+    function grid(box, map, bounds, label) {
+      ctx.save(); ctx.beginPath(); ctx.rect(box.x, box.y, box.w, box.h); ctx.clip();
+      ctx.fillStyle = '#0b151a'; ctx.fillRect(box.x, box.y, box.w, box.h);
+      ctx.strokeStyle = '#1d3038'; ctx.lineWidth = 1;
+      const step = Math.max(1, Math.ceil(Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY) / 8));
+      for (let x = Math.floor(bounds.minX / step) * step; x <= bounds.maxX; x += step) {
+        const p = map({x, y: 0}); ctx.beginPath(); ctx.moveTo(p.x, box.y); ctx.lineTo(p.x, box.y + box.h); ctx.stroke();
+      }
+      for (let y = Math.floor(bounds.minY / step) * step; y <= bounds.maxY; y += step) {
+        const p = map({x: 0, y}); ctx.beginPath(); ctx.moveTo(box.x, p.y); ctx.lineTo(box.x + box.w, p.y); ctx.stroke();
+      }
+      ctx.restore();
+      ctx.strokeStyle = '#2c414b'; ctx.strokeRect(box.x + .5, box.y + .5, box.w - 1, box.h - 1);
+      ctx.fillStyle = '#8ea2ad'; ctx.font = '700 10px monospace'; ctx.fillText(label, box.x + 12, box.y + 20);
+    }
+
+    function line(a, b, color, width = 2, dash = []) {
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+      ctx.strokeStyle = color; ctx.lineWidth = width; ctx.setLineDash(dash); ctx.stroke(); ctx.setLineDash([]);
+    }
+
+    function axis(origin, yaw, length, map, alpha = 1) {
+      const xEnd = add(origin, rotate(length, 0, yaw));
+      const yEnd = add(origin, rotate(0, length, yaw));
+      line(map(origin), map(xEnd), `rgba(244,185,66,${alpha})`, 3);
+      line(map(origin), map(yEnd), `rgba(92,174,232,${alpha})`, 3);
+      const xo = map(xEnd), yo = map(yEnd);
+      ctx.fillStyle = '#f4b942'; ctx.fillText('+X RAIL', xo.x + 5, xo.y - 4);
+      ctx.fillStyle = '#5caee8'; ctx.fillText('+Y RAIL', yo.x + 5, yo.y - 4);
+    }
+
+    function dot(point, map, color, label) {
+      const p = map(point); ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+      ctx.fillStyle = color; ctx.fill(); ctx.strokeStyle = '#f4f8fa'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle = color; ctx.font = '700 9px monospace'; ctx.fillText(label, p.x + 8, p.y - 7);
+    }
+
+    function interpolatePath(progress) {
+      if (!measured) return null;
+      if (progress < .58) {
+        const t = progress / .58;
+        return {x: measured.start.x + (measured.forward.x - measured.start.x) * t, y: measured.start.y + (measured.forward.y - measured.start.y) * t};
+      }
+      const t = (progress - .58) / .42;
+      return {x: measured.forward.x + (measured.lateral.x - measured.forward.x) * t, y: measured.forward.y + (measured.lateral.y - measured.forward.y) * t};
+    }
+
+    function drawMapPanel(box) {
+      const yaw = number('simYaw') * Math.PI / 180;
+      const origin = {x: number('originX'), y: number('originY')};
+      const fallback = [origin, add(origin, rotate(number('forwardDistance'), 0, yaw)), add(origin, rotate(number('forwardDistance'), number('lateralDistance'), yaw))];
+      const points = measured ? [measured.start, measured.forward, measured.lateral] : fallback;
+      const rail = add(origin, rotate(Math.max(Math.abs(number('forwardDistance')), Math.abs(number('lateralDistance'))) * 1.25, 0, yaw));
+      const bounds = boundsFor([...points, origin, rail]);
+      const map = mapper({x: box.x + 10, y: box.y + 32, w: box.w - 20, h: box.h - 42}, bounds);
+      grid(box, map, bounds, 'RAW SLAM MAP / 地图坐标未对齐');
+      axis(origin, yaw, Math.max(3, Math.abs(number('forwardDistance')) * 1.1), map, .85);
+      if (measured) {
+        line(map(measured.start), map(measured.forward), '#79d987', 3);
+        if (animation.progress > .58) line(map(measured.forward), map(measured.lateral), '#79d987', 3);
+        dot(measured.start, map, '#eaf2f5', 'START');
+        if (animation.progress >= .58) dot(measured.forward, map, '#79d987', 'X');
+        if (animation.progress >= 1) dot(measured.lateral, map, '#79d987', 'Y');
+        const car = interpolatePath(animation.progress);
+        if (car) dot(car, map, '#ef705d', 'CAR');
+      }
+      if (calibration) {
+        const estimatedOrigin = {x: calibration.transform.originMapX, y: calibration.transform.originMapY};
+        axis(estimatedOrigin, calibration.transform.craneXAxisYawDeg * Math.PI / 180, Math.max(3, Math.abs(number('forwardDistance'))), map, .6);
+      }
+    }
+
+    function mapToCrane(point) {
+      if (!calibration) return point;
+      const yaw = calibration.transform.craneXAxisYawDeg * Math.PI / 180;
+      const dx = point.x - calibration.transform.originMapX;
+      const dy = point.y - calibration.transform.originMapY;
+      return {x: Math.cos(yaw) * dx + Math.sin(yaw) * dy, y: -Math.sin(yaw) * dx + Math.cos(yaw) * dy};
+    }
+
+    function drawCorrectedPanel(box) {
+      const corrected = measured && calibration ? [mapToCrane(measured.start), mapToCrane(measured.forward), mapToCrane(measured.lateral)] : [{x:0,y:0}, {x:number('forwardDistance'),y:0}, {x:number('forwardDistance'),y:number('lateralDistance')}];
+      const bounds = boundsFor(corrected);
+      const map = mapper({x: box.x + 10, y: box.y + 32, w: box.w - 20, h: box.h - 42}, bounds);
+      grid(box, map, bounds, calibration ? 'CALIBRATED CRANE FRAME / 轨道坐标已对正' : 'CALIBRATED CRANE FRAME / WAITING');
+      line(map({x: bounds.minX, y: 0}), map({x: bounds.maxX, y: 0}), '#f4b942', 2);
+      line(map({x: 0, y: bounds.minY}), map({x: 0, y: bounds.maxY}), '#5caee8', 2);
+      ctx.fillStyle = '#f4b942'; ctx.fillText('CRANE +X →', box.x + box.w - 105, box.y + box.h - 12);
+      ctx.fillStyle = '#5caee8'; ctx.fillText('CRANE +Y ↑', box.x + 12, box.y + 48);
+      if (measured && calibration) {
+        line(map(corrected[0]), map(corrected[1]), '#49d6d0', 3);
+        line(map(corrected[1]), map(corrected[2]), '#49d6d0', 3);
+        dot(corrected[0], map, '#eaf2f5', '(0,0)'); dot(corrected[1], map, '#49d6d0', 'X'); dot(corrected[2], map, '#49d6d0', 'Y');
+      } else {
+        ctx.fillStyle = '#607681'; ctx.font = '11px monospace'; ctx.fillText('运行仿真并点击 CALIBRATE', box.x + 20, box.y + box.h / 2);
+      }
+    }
+
+    function resize() {
+      const rect = canvas.getBoundingClientRect();
+      const ratio = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.floor(rect.width * ratio));
+      canvas.height = Math.max(1, Math.floor(rect.height * ratio));
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    }
+
+    function draw(now) {
+      if (animation.active) {
+        animation.progress = Math.min(1, (now - animation.start) / 2400);
+        if (animation.progress < .58) ui.phase.textContent = 'FORWARD RUN / 大车移动';
+        else if (animation.progress < 1) ui.phase.textContent = 'LATERAL RUN / 小车移动';
+        else { animation.active = false; ui.phase.textContent = 'OBSERVATION READY / 可开始标定'; }
+      }
+      const width = canvas.clientWidth, height = canvas.clientHeight;
+      ctx.clearRect(0, 0, width, height);
+      const gap = 12;
+      if (width < 720) {
+        drawMapPanel({x: 10, y: 10, w: width - 20, h: (height - 30) / 2});
+        drawCorrectedPanel({x: 10, y: 20 + (height - 30) / 2, w: width - 20, h: (height - 30) / 2});
+      } else {
+        drawMapPanel({x: 10, y: 10, w: (width - 30) / 2, h: height - 20});
+        drawCorrectedPanel({x: 20 + (width - 30) / 2, y: 10, w: (width - 30) / 2, h: height - 20});
+      }
+      requestAnimationFrame(draw);
+    }
+
+    document.getElementById('simulateBtn').addEventListener('click', simulate);
+    document.getElementById('calibrateBtn').addEventListener('click', calibrate);
+    document.getElementById('resetBtn').addEventListener('click', () => { measured = null; calibration = null; animation = {active:false,start:0,progress:1}; clearResult(); ui.phase.textContent = 'IDLE / 等待仿真'; });
+    document.getElementById('copyBtn').addEventListener('click', async () => {
+      if (!calibration) return;
+      try { await navigator.clipboard.writeText(calibration.cliArgs); ui.copy.textContent = 'COPIED ✓'; }
+      catch (_) { ui.copy.textContent = 'SELECT CLI MANUALLY'; }
+      setTimeout(() => { ui.copy.textContent = 'COPY CLI'; }, 1600);
+    });
+    window.addEventListener('resize', resize);
+    resize(); simulate(); requestAnimationFrame(draw);
+  </script>
+</body>
+</html>"""
+
+
+def _parse_control_target(
+    body: str,
+    config: CraneConfig,
+    coordinate_transform: CoordinateTransform2D | None = None,
+) -> tuple[float, float, float]:
+    """Parse a map-frame web target and return validated crane coordinates."""
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
@@ -49,14 +574,16 @@ def _parse_control_target(body: str, config: CraneConfig) -> tuple[float, float,
     if not isinstance(payload, dict):
         raise ValueError('target payload must be a JSON object')
     try:
-        target = (
+        map_target = (
             float(payload['target_x']),
             float(payload['target_y']),
             float(payload['target_z']),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f'target_x, target_y, and target_z are required numbers: {exc}') from exc
-    return config.validate_target(target)
+    transform = coordinate_transform or CoordinateTransform2D.identity()
+    crane_x, crane_y = transform.map_to_crane_point(map_target[0], map_target[1])
+    return config.validate_target((crane_x, crane_y, map_target[2]))
 
 
 def _point_tuple(point: tuple[float, float, float]) -> dict[str, float]:
@@ -139,20 +666,28 @@ def build_live_payload(
 class LiveControlHooks(ControlHooks):
     """ControlHooks 实现 — 将每步 PD 状态写入 ControlState (供轮询) + 入队 (供 SSE)。"""
 
-    def __init__(self, control_state: ControlState | None = None):
+    def __init__(
+        self,
+        control_state: ControlState | None = None,
+        coordinate_transform: CoordinateTransform2D | None = None,
+    ):
         self._queue: queue.Queue = queue.Queue()
         self._event = threading.Event()    # 信号: 队列有新数据, 唤醒 SSE 消费者
         self._stop_flag = threading.Event()
         self._control_state = control_state  # 轮询 API 用的共享状态
+        self._coordinate_transform = (
+            coordinate_transform or CoordinateTransform2D.identity()
+        )
 
     def on_step(self, step_data: dict) -> None:
         """每步: 写 ControlState (供轮询) + 入队 (供 SSE)。"""
+        display_step = self._coordinate_transform.control_step_to_map(step_data)
         # 写入轮询状态 (主要数据通道)
         if self._control_state is not None:
-            self._control_state.set_step(step_data)
+            self._control_state.set_step(display_step)
         # 入队供 SSE (诊断通道)
         try:
-            self._queue.put_nowait({'type': 'step', 'data': step_data})
+            self._queue.put_nowait({'type': 'step', 'data': display_step})
             self._event.set()
         except queue.Full:
             pass
@@ -284,6 +819,18 @@ def render_live_html(plc_mode: bool = False) -> str:
       font-size: 12px;
       white-space: nowrap;
     }
+    .top-actions { display: flex; align-items: center; gap: 8px; pointer-events: auto; }
+    .calibration-link {
+      padding: 6px 9px;
+      border: 1px solid #4b716f;
+      border-radius: 4px;
+      background: rgba(23, 33, 43, 0.92);
+      color: var(--green);
+      font-size: 12px;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .calibration-link:hover { border-color: var(--green); color: var(--text); }
     .side {
       display: grid;
       grid-template-rows: auto auto auto 1fr;
@@ -619,7 +1166,10 @@ def render_live_html(plc_mode: bool = False) -> str:
       <canvas id="scene"></canvas>
       <div class="topbar">
         <h1>Crane Live Control</h1>
-        <div class="badge" id="rate">10 Hz</div>
+        <div class="top-actions">
+          <a class="calibration-link" href="/calibration">Coordinate Calibration</a>
+          <div class="badge" id="rate">10 Hz</div>
+        </div>
       </div>
     </section>
     <aside class="side">
@@ -1528,6 +2078,8 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == '/api/start-control':
             self._handle_start_control()
+        elif parsed.path == '/api/calibrate':
+            self._handle_calibrate()
         else:
             self._write(404, 'text/plain; charset=utf-8', b'not found')
 
@@ -1536,6 +2088,12 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         plc_mode = self.server.plc_actuator is not None
         if parsed.path in ('/', '/index.html'):
             self._write(200, 'text/html; charset=utf-8', render_live_html(plc_mode).encode('utf-8'))
+        elif parsed.path in ('/calibration', '/calibration.html'):
+            self._write(
+                200,
+                'text/html; charset=utf-8',
+                render_calibration_html().encode('utf-8'),
+            )
         elif parsed.path == '/simulation.json':
             if plc_mode:
                 self._write(400, 'application/json; charset=utf-8',
@@ -1563,6 +2121,34 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             self._handle_control_state()
         else:
             self._write(404, 'text/plain; charset=utf-8', b'not found')
+
+    def _handle_calibrate(self):
+        """POST /api/calibrate — estimate transform from browser observations."""
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+        except ValueError:
+            content_length = -1
+        if content_length <= 0 or content_length > _MAX_CALIBRATION_BODY_BYTES:
+            body = json.dumps({
+                'ok': False,
+                'error': 'Invalid calibration request size',
+            }).encode('utf-8')
+            self._write(413, 'application/json; charset=utf-8', body)
+            return
+
+        try:
+            request_body = self.rfile.read(content_length).decode('utf-8')
+            result = _calibrate_from_request(request_body)
+        except (UnicodeDecodeError, ValueError) as exc:
+            body = json.dumps({
+                'ok': False,
+                'error': str(exc),
+            }, ensure_ascii=False).encode('utf-8')
+            self._write(400, 'application/json; charset=utf-8', body)
+            return
+
+        body = json.dumps(result.as_dict(), ensure_ascii=False).encode('utf-8')
+        self._write(200, 'application/json; charset=utf-8', body)
 
     def _stream_localization(self):
         """SSE endpoint that streams the latest /localization_pose data at ~10 Hz."""
@@ -1647,7 +2233,11 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
 
         try:
             body = self.rfile.read(content_length).decode('utf-8')
-            target_x, target_y, target_z = _parse_control_target(body, server.config)
+            target_x, target_y, target_z = _parse_control_target(
+                body,
+                server.config,
+                server.coordinate_transform,
+            )
         except (UnicodeDecodeError, ValueError) as exc:
             self._write(400, 'application/json; charset=utf-8',
                         json.dumps({'ok': False, 'error': f'Invalid target: {exc}'}).encode('utf-8'))
@@ -1670,14 +2260,21 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                         json.dumps({'ok': False, 'error': 'No localization data — cannot start control'}).encode('utf-8'))
             return
         try:
+            crane_x, crane_y = server.coordinate_transform.map_to_crane_point(
+                pose['x'], pose['y']
+            )
             pose_x, pose_y, pose_z = server.config.validate_position(
-                (pose['x'], pose['y'], pose['z'])
+                (crane_x, crane_y, pose['z'])
             )
         except (KeyError, TypeError, ValueError) as exc:
             self._write(503, 'application/json; charset=utf-8',
                         json.dumps({'ok': False, 'error': f'Invalid localization data: {exc}'}).encode('utf-8'))
             return
-        pose = {**pose, 'x': pose_x, 'y': pose_y, 'z': pose_z}
+        map_pose = dict(pose)
+        crane_pose = {**pose, 'x': pose_x, 'y': pose_y, 'z': pose_z}
+        map_target_x, map_target_y = server.coordinate_transform.crane_to_map_point(
+            target_x, target_y
+        )
 
         if not server.reserve_control_run():
             self._write(409, 'application/json; charset=utf-8',
@@ -1687,18 +2284,25 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         # Create control state for frontend polling
         cs = ControlState()
         cs.set_start(
-            pos={'x': pose['x'], 'y': pose['y'], 'z': pose['z']},
-            target={'x': target_x, 'y': target_y, 'z': target_z},
+            pos={'x': map_pose['x'], 'y': map_pose['y'], 'z': map_pose['z']},
+            target={'x': map_target_x, 'y': map_target_y, 'z': target_z},
         )
         server.control_state = cs
 
         # Create control hooks — writes to ControlState (polling) + queue (SSE diagnostic)
-        hooks = LiveControlHooks(control_state=cs)
+        hooks = LiveControlHooks(
+            control_state=cs,
+            coordinate_transform=server.coordinate_transform,
+        )
         server.control_hooks = hooks
 
-        initial_state = CraneState(x0=pose['x'], y0=pose['y'], z0=pose['z'])
+        initial_state = CraneState(
+            x0=crane_pose['x'],
+            y0=crane_pose['y'],
+            z0=crane_pose['z'],
+        )
         # Update PlcActuator Z height to match current position
-        server.plc_actuator.set_z_reference(pose['z'])
+        server.plc_actuator.set_z_reference(crane_pose['z'])
 
         target_pos = (target_x, target_y, target_z)
 
@@ -1902,7 +2506,8 @@ class ControlState:
 class CraneLiveServer(ThreadingHTTPServer):
     def __init__(self, server_address, payload, payload_factory=None, plc=None,
                  ros_source=None, plc_actuator=None, config=None,
-                 initial_pos=None, update_hz=10.0, speed=1.0):
+                 initial_pos=None, update_hz=10.0, speed=1.0,
+                 coordinate_transform=None):
         super().__init__(server_address, _LiveRequestHandler)
         self.payload = payload
         self.payload_factory = payload_factory
@@ -1914,6 +2519,9 @@ class CraneLiveServer(ThreadingHTTPServer):
         self.initial_pos: tuple | None = initial_pos
         self.update_hz: float = update_hz
         self.speed: float = speed
+        self.coordinate_transform: CoordinateTransform2D = (
+            coordinate_transform or CoordinateTransform2D.identity()
+        )
         self.control_hooks: LiveControlHooks | None = None
         self.control_thread: threading.Thread | None = None
         self.control_state: ControlState | None = None
@@ -1966,6 +2574,7 @@ def serve_live_view(
     initial_pos=None,
     update_hz: float = 10.0,
     speed: float = 1.0,
+    coordinate_transform: CoordinateTransform2D | None = None,
 ):
     """Start a blocking browser live-view server.
 
@@ -1983,6 +2592,7 @@ def serve_live_view(
         ros_source=ros_source, plc_actuator=plc_actuator,
         config=config, initial_pos=initial_pos,
         update_hz=update_hz, speed=speed,
+        coordinate_transform=coordinate_transform,
     )
     actual_host, actual_port = server.server_address
     url = f'http://{actual_host}:{actual_port}'

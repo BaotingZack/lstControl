@@ -219,7 +219,7 @@ class CraneConfig:
 
     # --- 可选机械工作区 ---
     # 现场行程因设备而异，X/Y 不提供虚假的默认范围；PLC 部署时应显式配置。
-    # Z=0 为地面，因此即使未配置 workspace_z_bounds，也拒绝负高度。
+    # 坐标零点由现场约定；未配置 workspace_z_bounds 时不擅自限制 Z 的正负。
     workspace_x_bounds: tuple[float, float] | None = None
     workspace_y_bounds: tuple[float, float] | None = None
     workspace_z_bounds: tuple[float, float] | None = None
@@ -303,9 +303,6 @@ class CraneConfig:
         values = tuple(float(value) for value in coordinates)
         if not all(math.isfinite(value) for value in values):
             raise ValueError(f'{label} coordinates must be finite numbers')
-        if values[2] < 0.0:
-            raise ValueError(f'Z {label} must be non-negative')
-
         for axis_name, value, bounds in (
             ('X', values[0], self.workspace_x_bounds),
             ('Y', values[1], self.workspace_y_bounds),
@@ -680,6 +677,14 @@ def run_pd_control(
                 actuator.apply(vx_cmd, vy_cmd, vz_cmd, dt)
                 # 从定位数据更新 state
                 actuator.update_state(crane, pos)
+                # 没有可信原生速度时，统一使用位置差分后的滤波估计。
+                for axis_name, filtered_velocity in (
+                    ('x', vx_filtered),
+                    ('y', vy_filtered),
+                    ('z', vz_filtered),
+                ):
+                    if pos[f'v{axis_name}'] is None:
+                        getattr(crane, axis_name).velocity = filtered_velocity
                 disturbance_x = disturbance_y = disturbance_z = 0.0
 
             # --- STEP 5: 到达检测 ---
@@ -691,7 +696,11 @@ def run_pd_control(
             for name, axis, target, cmd in axis_data:
                 in_capture_window = abs(axis.position - target) < config.arrival_capture_pos_tol
                 command_settled = abs(cmd) < config.arrival_cmd_tol
-                if not locked[name] and (_axis_arrived(axis, target, config) or (in_capture_window and command_settled)):
+                velocity_settled = abs(axis.velocity) < config.velocity_deadband
+                if not locked[name] and (
+                    _axis_arrived(axis, target, config)
+                    or (in_capture_window and command_settled and velocity_settled)
+                ):
                     axis.position = target
                     axis.velocity = 0.0
                     locked[name] = True
