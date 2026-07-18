@@ -93,6 +93,15 @@ def test_plc_actuator_sends_updated_height_while_velocity_is_constant():
     assert plc.lift_commands == pytest.approx([1.02, 1.04, 1.06, 1.08, 1.10])
 
 
+def test_plc_actuator_does_not_silently_clamp_negative_z_coordinates():
+    plc = RecordingPLC()
+    actuator = PlcActuator(plc, initial_z=-2.0)
+
+    actuator.apply(0.0, 0.0, 0.2, 0.1)
+
+    assert plc.lift_commands == pytest.approx([-1.98])
+
+
 def test_plc_actuator_rejects_motion_when_connection_or_heartbeat_is_unhealthy():
     disconnected = PlcActuator(RecordingPLC(connected=False), initial_z=1.0)
     heartbeat_lost = PlcActuator(

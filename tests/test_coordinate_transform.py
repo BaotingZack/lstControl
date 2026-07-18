@@ -2,8 +2,10 @@ import math
 
 import pytest
 
+import live_server
 import main
 import ros_bridge
+from crane_model import CraneConfig
 from coordinate_transform import CoordinateTransform2D
 
 
@@ -114,3 +116,18 @@ def test_cli_builds_map_to_crane_transform():
     transform = main._coordinate_transform_from_args(args)
 
     assert transform.map_to_crane_point(10.0, 22.0) == pytest.approx((2.0, 0.0))
+
+
+def test_web_map_target_is_transformed_before_crane_workspace_validation():
+    transform = CoordinateTransform2D.from_degrees(10.0, 20.0, 90.0)
+    config = CraneConfig(
+        workspace_x_bounds=(0.0, 3.0),
+        workspace_y_bounds=(0.0, 4.0),
+    )
+    body = '{"target_x": 7, "target_y": 22, "target_z": -1.5}'
+
+    assert live_server._parse_control_target(
+        body,
+        config,
+        transform,
+    ) == pytest.approx((2.0, 3.0, -1.5))
