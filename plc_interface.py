@@ -85,7 +85,11 @@ class MockPLC(PLCInterface):
         self._heartbeat_running = threading.Event()
         self._heartbeat_healthy = False
         self._fail_count = 0
-        self._max_fails = 3
+        # 心跳失败容忍窗口: 连续失败达到该次数(10Hz→约1s)才判定心跳丢失。
+        # 工业现场网络(如 WiFi/交换机)偶发 100-300ms 抖动很常见, 阈值太小
+        # (旧值 3 次≈300ms) 会把正常抖动误判为心跳丢失, 导致 PD 控制中途
+        # 被安全停车提前结束。PLC 侧看门狗超时通常远大于此, 1s 仍在安全范围内。
+        self._max_fails = 10
         # Throttle motion prints: only print when value changes > threshold
         # or once per interval, to avoid 100 Hz spam.
         self._last_printed: dict[str, tuple[float, float]] = {}
@@ -152,7 +156,15 @@ class MockPLC(PLCInterface):
         return True
 
     def _heartbeat_loop(self) -> None:
-        """Background heartbeat at 10 Hz (100 ms interval)."""
+        """Background heartbeat at 10 Hz (100 ms interval).
+
+        自愈: 心跳失败达到阈值只是把 heartbeat_healthy 置为 False (供控制
+        循环安全停车), 循环本身绝不 break——必须持续重试发送, 一旦网络/PLC
+        恢复就立刻把 heartbeat_healthy 重新置 True。旧实现失败达阈值后会
+        break 退出线程, 心跳永久停止且再也不会恢复, 只能重启整个进程才能
+        继续控制——这是"PD 运行中偶尔提前结束且之后怎么点都无法恢复"的
+        根因之一。
+        """
         time.sleep(0.5)  # warm-up
         last_print = 0.0
         while self._heartbeat_running.is_set():
@@ -164,8 +176,7 @@ class MockPLC(PLCInterface):
                 if self._fail_count >= self._max_fails:
                     self._heartbeat_healthy = False
                     if self._verbose:
-                        print('[PLC] Heartbeat lost — PLC disconnected')
-                    break
+                        print('[PLC] Heartbeat lost — will keep retrying to self-heal')
             else:
                 self._fail_count = 0
                 self._heartbeat_healthy = True
@@ -230,7 +241,8 @@ class RealPLC(PLCInterface):
         self._heartbeat_running = threading.Event()
         self._heartbeat_healthy = False
         self._fail_count = 0
-        self._max_fails = 3
+        # 见 MockPLC._max_fails 注释: 10 次(约1s)容忍网络抖动, 避免误判丢失。
+        self._max_fails = 10
         self.last_vx: float = 0.0          # last-sent X velocity (for UI display)
         self.last_vy: float = 0.0          # last-sent Y velocity
         self.last_hz: float = 0.0          # last-sent Z height
@@ -317,6 +329,9 @@ class RealPLC(PLCInterface):
         return ok
 
     def _heartbeat_loop(self) -> None:
+        """自愈心跳循环: 见 MockPLC._heartbeat_loop 注释。绝不 break——失败达阈值
+        只置 heartbeat_healthy=False 供控制循环安全停车, 循环持续重试发送心跳,
+        网络/PLC 恢复后自动把 heartbeat_healthy 重新置 True, 无需重启进程。"""
         time.sleep(0.5)
         while self._heartbeat_running.is_set():
             ok = self.send_heartbeat()
@@ -325,8 +340,7 @@ class RealPLC(PLCInterface):
                 print(f'[PLC] heartbeat FAIL #{self._fail_count}')
                 if self._fail_count >= self._max_fails:
                     self._heartbeat_healthy = False
-                    print('[PLC] Heartbeat lost — PLC disconnected!')
-                    break
+                    print('[PLC] Heartbeat lost — retrying in background to self-heal')
             else:
                 self._fail_count = 0
                 self._heartbeat_healthy = True
@@ -397,61 +411,109 @@ class PlcActuator:
     实现 Actuator 接口，用于 PLC 模式的 run_pd_control()。
 
     职责:
-      - 速度指令通过 deadband 过滤后发送到 PLC
+      - 每个控制周期都把速度指令发送到 PLC (速度伺服需持续刷新, 否则
+        PLC 看门狗会停轴, 表现为运动断断续续)
       - Z 轴: 将速度指令积分为绝对高度, 再调用 liftctrl()
+      - 逐轴方向修正: 当驱动器正方向与定位坐标轴相反时翻转指令符号
       - 始终更新 plc.last_vx/vy/vz/hz 供前端轮询
       - 紧急停止
+
+    方向符号 (big_car_sign/small_car_sign/lift_sign):
+      +1 表示驱动正方向与定位轴一致; -1 表示相反, 需翻转速度指令。
+      定位轴与轨道存在旋转关系时用坐标标定 (yaw) 处理; 但"轴方向整体
+      取反"是镜像, 旋转无法表达, 必须用这里的逐轴符号翻转。
+
+    安全高度下限 (min_lift_height):
+      下发给 liftctrl 的绝对高度会被钳到 >= min_lift_height (默认 0.5m),
+      保证抓钩离地不小于该高度; 无论 PD 输出或目标怎么设, 都不会命令
+      抓钩降到该安全高度以下。
     """
 
-    _DEADBAND = 0.005  # [m/s or m] 最小变化阈值
+    _MIN_LIFT_HEIGHT_DEFAULT = 0.5  # [m] 抓钩离地最小安全高度
 
-    def __init__(self, plc: PLCInterface, initial_z: float = 0.0):
+    def __init__(
+        self,
+        plc: PLCInterface,
+        initial_z: float = 0.0,
+        *,
+        big_car_sign: float = 1.0,
+        small_car_sign: float = 1.0,
+        lift_sign: float = 1.0,
+        min_lift_height: float = _MIN_LIFT_HEIGHT_DEFAULT,
+    ):
         self._plc = plc
         self._command_lock = threading.RLock()
-        self._z_height = initial_z          # Z 轴绝对高度积分值
+        self._min_lift_height = float(min_lift_height)   # [m] 抓钩离地安全下限
+        self._z_height = initial_z          # Z 轴绝对高度设定值 (下发给 liftctrl)
+        # Z 目标高度 (由 PD 控制循环通过 set_z_target 注入)。liftctrl 是绝对位置
+        # 伺服, 故 Z 设定值需一路逼近目标, 而非每周期只领先实测一步。
+        self._z_target: float | None = None
+        self._z_target_descending = False   # 相对设目标时刻的运动方向 (防越过)
         self._last_vx: float | None = None
         self._last_vy: float | None = None
         self._last_z_height: float | None = None
         self._last_log: float = 0.0          # 上次 PD 日志时间
+        # 归一化为 ±1, 避免误传入的幅值改变速度大小。
+        self._big_car_sign = -1.0 if big_car_sign < 0 else 1.0
+        self._small_car_sign = -1.0 if small_car_sign < 0 else 1.0
+        self._lift_sign = -1.0 if lift_sign < 0 else 1.0
 
     _log_interval = 1.0  # [s] PD 输出日志最小间隔
+
+    def _clamp_lift_height(self, height: float) -> float:
+        """把下发高度钳到安全下限, 保证抓钩离地 >= min_lift_height。"""
+        return height if height >= self._min_lift_height else self._min_lift_height
 
     def apply(self, vx: float, vy: float, vz: float, dt: float) -> None:
         """发送速度指令到 PLC。
 
-        X/Y 轴: 直接发送速度指令 (含 deadband 过滤)
+        X/Y 轴: 每周期下发速度指令 (含方向修正)
         Z 轴:   vz * dt 积分 → 绝对高度 → liftctrl()
         """
         with self._command_lock:
             self._ensure_available()
 
+            # 方向修正: 驱动正方向与定位轴相反时翻转指令符号。
+            vx_out = self._big_car_sign * vx
+            vy_out = self._small_car_sign * vy
+            vz_out = self._lift_sign * vz
+
             # 定期打印 PD 输出 (每秒最多一次, 避免刷屏)
             now = time.time()
             if now - self._last_log > self._log_interval:
-                print(f'[PD] v_cmd=(x={vx:+.4f}, y={vy:+.4f}, z={vz:+.4f}) m/s  z_h={self._z_height:.3f}m')
+                print(f'[PD] v_cmd=(x={vx_out:+.4f}, y={vy_out:+.4f}, z={vz_out:+.4f}) '
+                      f'm/s  z_h={self._z_height:.3f}m')
                 self._last_log = now
 
-            # X/Y 的零速指令不能被 deadband 吞掉。
-            self._plc.last_vx = vx
-            if self._should_send_velocity(vx, self._last_vx):
-                self._plc.big_car_ctrl(vx)
-                self._last_vx = vx
+            # 速度伺服模式: 每个控制周期都必须刷新指令 (10Hz)，否则 PLC 看门狗
+            # 会在若干周期后停轴, 下一次指令又让它动一下 → 运动断断续续。
+            self._plc.big_car_ctrl(vx_out)
+            self._plc.last_vx = vx_out
+            self._last_vx = vx_out
 
-            self._plc.last_vy = vy
-            if self._should_send_velocity(vy, self._last_vy):
-                self._plc.small_car_ctrl(vy)
-                self._last_vy = vy
+            self._plc.small_car_ctrl(vy_out)
+            self._plc.last_vy = vy_out
+            self._last_vy = vy_out
 
-            # Z 轴 API 接收绝对高度。节流必须比较高度设定值，而不是 vz。
-            self._z_height += vz * dt
-            self._plc.last_vz = vz
+            # --- Z 轴: 绝对高度位置伺服 (liftctrl 接收绝对目标高度) ---
+            # 用 PD 速度指令积分出高度设定值, 并单调逼近目标 (不越过)。这样下发
+            # 给 liftctrl 的设定值会一路走到目标, PLC 内部位置环随即跟随; 而不是
+            # 每周期把设定值重锚到实测、只领先一步 vz*dt——后者遇到伺服/驱动死区
+            # 几乎不动, 表现为"Z 不受 PD 控制"。速度仍由 PD 决定 (含限速/阻尼)。
+            self._z_height += vz_out * dt
+            if self._z_target is not None:
+                # 防越过目标: 按"设目标时刻"的方向把设定值钳在目标一侧,
+                # 不受单帧速度噪声换向影响。
+                if self._z_target_descending:
+                    self._z_height = max(self._z_height, self._z_target)
+                else:
+                    self._z_height = min(self._z_height, self._z_target)
+            # 下发前钳到安全下限, 保证抓钩离地不小于 min_lift_height。
+            self._z_height = self._clamp_lift_height(self._z_height)
+            self._plc.last_vz = vz_out
             self._plc.last_hz = self._z_height
-            if (
-                self._last_z_height is None
-                or abs(self._z_height - self._last_z_height) >= self._DEADBAND
-            ):
-                self._plc.lift_ctrl(self._z_height)
-                self._last_z_height = self._z_height
+            self._plc.lift_ctrl(self._z_height)
+            self._last_z_height = self._z_height
 
     def _ensure_available(self) -> None:
         if not self._plc.check_connection():
@@ -459,19 +521,22 @@ class PlcActuator:
         if not self._plc.heartbeat_healthy:
             raise RuntimeError('PLC heartbeat is not healthy')
 
-    @staticmethod
-    def _should_send_velocity(value: float, previous: float | None) -> bool:
-        if previous is None:
-            return True
-        if value == 0.0 and previous != 0.0:
-            return True
-        return abs(value - previous) >= PlcActuator._DEADBAND
-
     def set_z_reference(self, height: float) -> None:
-        """Synchronize the Z integrator with a fresh localization measurement."""
+        """Synchronize the Z setpoint with a fresh hoist-height measurement."""
         with self._command_lock:
             self._z_height = float(height)
             self._last_z_height = None
+
+    def set_z_target(self, target_height: float) -> None:
+        """注入 Z 目标高度 (抓钩高度参考系), 供绝对高度设定值单调逼近。
+
+        目标同样钳到安全下限; 运动方向按当前设定值与目标的高低关系确定,
+        避免下降/上升过程中因单帧速度换向而把设定值提前吸附到目标。
+        """
+        with self._command_lock:
+            target = self._clamp_lift_height(float(target_height))
+            self._z_target = target
+            self._z_target_descending = target < self._z_height
 
     def update_state(self, state: CraneState, position: dict) -> None:
         """从 /localization_pose 数据更新 CraneState。
@@ -483,7 +548,9 @@ class PlcActuator:
             state.x.position = position['x']
             state.y.position = position['y']
             state.z.position = position['z']
-            self._z_height = position['z']
+            # 注意: 不要把 Z 设定值 (self._z_height) 重锚到实测高度。Z 是绝对位置
+            # 伺服, 设定值需领先实测一路走到目标; 若每周期重锚, 设定值只会领先一步
+            # vz*dt, 遇到伺服死区几乎不动。实测高度用于 PD 反馈 (state.z.position)。
 
             # 每个轴独立选择原生速度；缺失轴由控制循环填入差分估计值。
             for axis_name in ('x', 'y', 'z'):
@@ -492,18 +559,20 @@ class PlcActuator:
                     getattr(state, axis_name).velocity = velocity
 
     def stop_motion(self) -> None:
-        """正常到位：X/Y 归零，Z 保持当前绝对高度。"""
+        """正常到位：X/Y 归零，Z 保持当前绝对高度 (不低于安全下限)。"""
         with self._command_lock:
+            hold_height = self._clamp_lift_height(self._z_height)
+            self._z_height = hold_height
             self._plc.big_car_ctrl(0.0)
             self._plc.small_car_ctrl(0.0)
-            self._plc.lift_ctrl(self._z_height)
+            self._plc.lift_ctrl(hold_height)
             self._plc.last_vx = 0.0
             self._plc.last_vy = 0.0
             self._plc.last_vz = 0.0
-            self._plc.last_hz = self._z_height
+            self._plc.last_hz = hold_height
             self._last_vx = 0.0
             self._last_vy = 0.0
-            self._last_z_height = self._z_height
+            self._last_z_height = hold_height
 
     def emergency_stop(self) -> None:
         """安全停止 — 匹配 demo.cpp STOP ALL 模式。"""

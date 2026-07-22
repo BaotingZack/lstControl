@@ -142,6 +142,58 @@ def test_ros_position_source_outputs_crane_coordinates_and_ignores_unavailable_z
     assert position["vz"] is None
 
 
+def test_ros_position_source_uses_hoist_height_for_z_when_provider_given(monkeypatch):
+    # 180° heading flip about Z; Z unaffected by yaw.
+    transform = CoordinateTransform2D.from_degrees(crane_x_axis_yaw_deg=180.0)
+    monkeypatch.setattr(
+        ros_bridge,
+        "get_latest_pose",
+        lambda: {
+            "x": 2.0,
+            "y": 3.0,
+            "z": 99.0,   # unreliable SLAM Z — must be ignored
+            "vx": 0.2,
+            "vy": -0.1,
+            "vz": 0.5,
+            "stamp_sec": 1,
+            "stamp_nsec": 0,
+        },
+    )
+    source = ros_bridge.RosPositionSource(
+        coordinate_transform=transform,
+        lift_height_provider=lambda: 1.75,   # actual hoist encoder height
+    )
+
+    position = source.get_position()
+
+    # X/Y from SLAM (flipped by yaw 180), Z from hoist height (not SLAM 99.0).
+    assert (position["x"], position["y"]) == pytest.approx((-2.0, -3.0))
+    assert position["z"] == pytest.approx(1.75)
+    # Native XY velocity still rotated; Z velocity dropped (hoist-diff instead).
+    assert (position["vx"], position["vy"]) == pytest.approx((-0.2, 0.1))
+    assert position["vz"] is None
+
+
+def test_ros_position_source_falls_back_to_slam_z_when_hoist_height_unavailable(monkeypatch):
+    transform = CoordinateTransform2D.identity()
+    monkeypatch.setattr(
+        ros_bridge,
+        "get_latest_pose",
+        lambda: {
+            "x": 1.0, "y": 2.0, "z": 3.0,
+            "vx": 0.0, "vy": 0.0, "vz": 0.0,
+            "stamp_sec": 1, "stamp_nsec": 0,
+        },
+    )
+    # Provider returns None (e.g. MockPLC / no encoder) -> keep SLAM Z.
+    source = ros_bridge.RosPositionSource(
+        coordinate_transform=transform,
+        lift_height_provider=lambda: None,
+    )
+
+    assert source.get_position()["z"] == pytest.approx(3.0)
+
+
 def test_ros_position_source_rotates_native_xyz_velocity_when_explicitly_trusted(monkeypatch):
     transform = CoordinateTransform2D.from_degrees(
         origin_map_x=10.0,

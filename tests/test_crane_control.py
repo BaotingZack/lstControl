@@ -10,7 +10,7 @@ from visualizer import CraneVisualizer
 @pytest.fixture
 def default_config():
     return CraneConfig(
-        max_velocity_xy=0.3,
+        max_velocity_xy=0.2,
         max_velocity_z=0.2,
         kp_pos=0.6,
         kd_pos=0.45,
@@ -49,7 +49,7 @@ def test_dispatch_target_is_reached_by_position_to_velocity_control(default_conf
         initial_state=CraneState(x0=0.0, y0=0.0, z0=5.0),
         config=default_config,
         verbose=False,
-        max_time=90.0,
+        max_time=220.0,
     )
     final = history[-1]
 
@@ -74,7 +74,7 @@ def test_realistic_plant_adds_lag_disturbance_and_measurement_noise(default_conf
         initial_state=CraneState(x0=0.0, y0=0.0, z0=5.0),
         config=default_config,
         verbose=False,
-        max_time=90.0,
+        max_time=220.0,
     )
 
     assert max(abs(h["vx_cmd"] - h["vx"]) for h in history) > 0.005
@@ -90,7 +90,7 @@ def test_visualizer_writes_control_and_operation_plots(default_config, tmp_path)
         initial_state=CraneState(*initial_pos),
         config=default_config,
         verbose=False,
-        max_time=90.0,
+        max_time=220.0,
     )
     visualizer = CraneVisualizer(default_config)
 
@@ -118,7 +118,7 @@ def test_live_payload_uses_10hz_frames_for_single_target(default_config):
         initial_state=CraneState(*initial_pos),
         config=default_config,
         verbose=False,
-        max_time=90.0,
+        max_time=220.0,
     )
 
     payload = build_live_payload(

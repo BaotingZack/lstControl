@@ -10,9 +10,10 @@ Tested in noetic Docker container.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from coordinate_transform import CoordinateTransform2D
 
@@ -98,6 +99,12 @@ class RosPositionSource:
     每次 get_position() 阻塞直到新数据到达 (stamp 不同于上次)。
 
     超时保护: 2 秒无新数据 → 返回 None → 触发安全停止。
+
+    Z 轴位置来源:
+      SLAM 的 Map Z 在地图倾斜/漂移时不可靠。若提供 lift_height_provider
+      (通常是 PLC 的 GetActualLiftHeight)，Z 位置改用抓钩实测高度 (物理 Z,
+      Z=0 地面, 向上为正)，不经坐标旋转; 该情况下 Z 速度置 None, 由控制
+      循环用高度差分+低通估计。X/Y 仍来自 SLAM 定位。
     """
 
     _POSITION_TIMEOUT = 2.0  # [s] 定位断流超时
@@ -108,12 +115,14 @@ class RosPositionSource:
         *,
         use_native_xy_velocity: bool = True,
         use_native_z_velocity: bool = False,
+        lift_height_provider: Callable[[], float | None] | None = None,
     ):
         self._coordinate_transform = (
             coordinate_transform or CoordinateTransform2D.identity()
         )
         self._use_native_xy_velocity = use_native_xy_velocity
         self._use_native_z_velocity = use_native_z_velocity
+        self._lift_height_provider = lift_height_provider
         self._last_stamp: float | None = None   # ROS stamp (sec + nsec*1e-9)
         self._t0: float | None = None           # 首次数据到达的单调时间
         self._last_wall: float | None = None    # 上次 get_position 的单调时间
@@ -156,6 +165,16 @@ class RosPositionSource:
                     pose['x'], pose['y'], pose['z']
                 )
             )
+
+            # Z 位置优先取抓钩实测高度 (物理 Z, 不经坐标旋转); 取到有效值时
+            # 覆盖 SLAM 的 Map Z, 并令 Z 速度改由高度差分估计。
+            z_from_hoist = False
+            if self._lift_height_provider is not None:
+                lift_height = self._lift_height_provider()
+                if lift_height is not None and math.isfinite(lift_height):
+                    crane_z = float(lift_height)
+                    z_from_hoist = True
+
             vx = vy = vz = None
             if self._use_native_xy_velocity:
                 map_vx = pose.get('vx')
@@ -181,6 +200,11 @@ class RosPositionSource:
                         map_vx,
                         map_vy,
                     )
+
+            # 用抓钩高度做 Z 时, SLAM 的 Map Vz 与该高度无关, 一律弃用,
+            # 让控制循环从抓钩高度差分估计 Z 速度。
+            if z_from_hoist:
+                vz = None
 
             return {
                 'x': crane_x,

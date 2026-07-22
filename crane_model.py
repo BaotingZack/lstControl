@@ -162,7 +162,7 @@ class CraneConfig:
     """起重机控制配置参数 (所有参数均可在构造时覆盖)
 
     —— S曲线轨迹参数 ——
-    - max_velocity_xy: 大小行车最大速度 [m/s], 默认 0.3
+    - max_velocity_xy: 大小行车最大速度 [m/s], 默认 0.2
     - max_velocity_z:  抓钩最大升降速度 [m/s], 默认 0.2
     - max_acceleration_xy / _z: 最大加速度 [m/s²]
     - max_jerk_xy / _z: 最大 jerk (加加速度) [m/s³]
@@ -180,7 +180,7 @@ class CraneConfig:
     """
 
     # --- S曲线参数 ---
-    max_velocity_xy: float = 0.3       # [m/s] 大小行车最大速度
+    max_velocity_xy: float = 0.2       # [m/s] 大小行车最大速度
     max_velocity_z: float = 0.2        # [m/s] 抓钩最大升降速度
     max_acceleration_xy: float = 0.2   # [m/s²]
     max_acceleration_z: float = 0.15   # [m/s²]
@@ -216,6 +216,20 @@ class CraneConfig:
     velocity_deadband: float = 0.01
     arrival_capture_pos_tol: float = 0.02  # [m] 到位捕获位置窗口
     arrival_cmd_tol: float = 0.015         # [m/s] 到位捕获速度指令窗口
+    # 到位判定去抖: 需连续 N 个控制周期都满足到位条件才锁轴。防止单帧定位
+    # 跳变(异常值)恰好落在目标附近就把轴永久锁死, 表现为"离目标还差十几厘米
+    # 就停下、PD 结束"。10Hz 下 3 帧≈0.3s。设为 1 即退化为原单帧判定。
+    arrival_debounce_cycles: int = 3
+    # 定位跳变门限 [m]: 单个控制周期内位置跳变超过 (max_v*dt + 该余量) 视为
+    # 异常帧并丢弃, 避免异常值污染 D 项/差分速度并误触发到位。
+    localization_jump_margin: float = 0.30
+    # 单帧定位异常 (NaN/越界/dt 异常/跳变) 的容忍预算: 连续异常帧数不超过该值时
+    # 直接丢弃并继续控制 (常见于 SLAM/网络抖动的偶发坏帧); 超过则视为真实故障,
+    # 按原语义中止并安全停车。10Hz 下默认 10 帧 ≈ 1s。
+    max_consecutive_bad_frames: int = 10
+    # 防反向抽动保护带 [m]: 在尚未越过目标且 |误差| 小于该值时，禁止 PD 给出
+    # 远离目标方向的速度指令（速度伺服型行车"刹车"=指令归零而非反向脉冲）。
+    reverse_guard_tol: float = 0.05
 
     # --- 可选机械工作区 ---
     # 现场行程因设备而异，X/Y 不提供虚假的默认范围；PLC 部署时应显式配置。
@@ -253,6 +267,8 @@ class CraneConfig:
             'velocity_deadband': self.velocity_deadband,
             'arrival_capture_pos_tol': self.arrival_capture_pos_tol,
             'arrival_cmd_tol': self.arrival_cmd_tol,
+            'reverse_guard_tol': self.reverse_guard_tol,
+            'localization_jump_margin': self.localization_jump_margin,
             'disturbance_velocity_xy': self.disturbance_velocity_xy,
             'disturbance_velocity_z': self.disturbance_velocity_z,
             'measurement_noise_xy': self.measurement_noise_xy,
@@ -261,6 +277,16 @@ class CraneConfig:
         for name, value in non_negative_fields.items():
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f'{name} must be non-negative')
+
+        if int(self.arrival_debounce_cycles) != self.arrival_debounce_cycles \
+                or self.arrival_debounce_cycles < 1:
+            raise ValueError('arrival_debounce_cycles must be an integer >= 1')
+        self.arrival_debounce_cycles = int(self.arrival_debounce_cycles)
+
+        if int(self.max_consecutive_bad_frames) != self.max_consecutive_bad_frames \
+                or self.max_consecutive_bad_frames < 0:
+            raise ValueError('max_consecutive_bad_frames must be a non-negative integer')
+        self.max_consecutive_bad_frames = int(self.max_consecutive_bad_frames)
 
         for axis_name, bounds in (
             ('X', self.workspace_x_bounds),
@@ -576,10 +602,24 @@ def run_pd_control(
     filter_tau = config.velocity_filter_tau if is_simulation else config.velocity_filter_tau_plc
 
     # PD 控制器 — 两种模式完全共用
+    # 到位窗口内指令归零 (position_deadband) + 防反向抽动 (reverse_tol)，
+    # 抑制 10Hz 定位噪声在目标附近引起的速度指令换向。
     controllers = {
-        'x': PositionPDController(config.kp_pos, config.kd_pos, config.max_velocity_xy),
-        'y': PositionPDController(config.kp_pos, config.kd_pos, config.max_velocity_xy),
-        'z': PositionPDController(config.kp_pos, config.kd_pos, config.max_velocity_z),
+        'x': PositionPDController(
+            config.kp_pos, config.kd_pos, config.max_velocity_xy,
+            position_deadband=config.arrival_pos_tol,
+            reverse_tol=config.reverse_guard_tol,
+        ),
+        'y': PositionPDController(
+            config.kp_pos, config.kd_pos, config.max_velocity_xy,
+            position_deadband=config.arrival_pos_tol,
+            reverse_tol=config.reverse_guard_tol,
+        ),
+        'z': PositionPDController(
+            config.kp_pos, config.kd_pos, config.max_velocity_z,
+            position_deadband=config.arrival_pos_tol,
+            reverse_tol=config.reverse_guard_tol,
+        ),
     }
 
     # 速度滤波器 — 共用, PLC 模式使用更大的 tau
@@ -592,6 +632,12 @@ def run_pd_control(
     history: list[dict] = []
     arrival_events: list[tuple[float, str]] = []
     locked = {'x': False, 'y': False, 'z': False}
+    # 到位去抖计数: 连续满足到位条件的周期数, 出现一帧不满足即清零。
+    arrival_streak = {'x': 0, 'y': 0, 'z': 0}
+    # 上一帧被接受的测量位置 (用于定位跳变/异常帧检测)。
+    last_accepted_pos: dict[str, float] | None = None
+    # 连续被丢弃的异常帧计数 (NaN/越界/dt异常/跳变), 用于区分偶发噪声与真实故障。
+    consecutive_bad_frames = 0
 
     # PD 输出
     vx_cmd = vy_cmd = vz_cmd = 0.0
@@ -623,6 +669,11 @@ def run_pd_control(
     if hasattr(actuator, '_state'):
         actuator._state = crane
 
+    # Z 目标高度注入执行器 (抓钩高度参考系)。PLC 的 liftctrl 是绝对位置伺服,
+    # 执行器据此让 Z 设定值单调逼近目标, 使 Z 真正由 PD 驱动到位。
+    if hasattr(actuator, 'set_z_target'):
+        actuator.set_z_target(target_z)
+
     completed = False
     try:
         while not all(locked.values()):
@@ -641,7 +692,56 @@ def run_pd_control(
             if hooks is not None and hooks.should_stop():
                 raise ControlStoppedError(f'{mode_label} control stopped by external request')
 
-            pos = _validate_position_feedback(pos, config)
+            # --- 单帧异常值容忍 (仅 PLC/真实定位) ---
+            # SLAM/网络抖动会偶尔送来一帧 NaN/越界/dt 异常, 或一次幅度离谱的跳变。
+            # 若每次都让整段 PD 直接中止, 表现就是"运行过程中 PD 有时会中途提前
+            # 结束"——一次偶发坏帧不该终止整个作业。这里统一用 consecutive_bad_frames
+            # 预算容忍连续坏帧: 预算内丢弃该帧继续控制; 超出预算才视为真实故障并
+            # 按原语义中止 (安全停车)。仿真模式没有真实传感器噪声, 保持严格校验。
+            try:
+                validated = _validate_position_feedback(pos, config)
+            except PositionFeedbackError:
+                if (
+                    not is_simulation
+                    and last_accepted_pos is not None
+                    and consecutive_bad_frames < config.max_consecutive_bad_frames
+                ):
+                    consecutive_bad_frames += 1
+                    if verbose:
+                        print(f'[定位异常] 丢弃无效帧 (连续第 {consecutive_bad_frames} 帧)')
+                    continue
+                raise
+            pos = validated
+
+            # 跳变帧: 单周期位置变化远超物理可达 (max_v*dt + 余量), 视为定位异常值。
+            # 若送入控制会污染差分速度/D 项, 更危险的是恰好落在目标附近时会
+            # 误触发到位、把轴永久锁死 → 表现为"离目标十几厘米就停、PD 结束"。
+            if not is_simulation and last_accepted_pos is not None:
+                dt_guard = pos['dt'] if pos['dt'] and pos['dt'] > 0 else 0.1
+                max_step_xy = config.max_velocity_xy * dt_guard + config.localization_jump_margin
+                max_step_z = config.max_velocity_z * dt_guard + config.localization_jump_margin
+                jumped = (
+                    abs(pos['x'] - last_accepted_pos['x']) > max_step_xy
+                    or abs(pos['y'] - last_accepted_pos['y']) > max_step_xy
+                    or abs(pos['z'] - last_accepted_pos['z']) > max_step_z
+                )
+                if jumped:
+                    if consecutive_bad_frames < config.max_consecutive_bad_frames:
+                        consecutive_bad_frames += 1
+                        if verbose:
+                            print(
+                                f"[定位异常] 丢弃跳变帧 (连续第 {consecutive_bad_frames} 帧) dxyz="
+                                f"({pos['x'] - last_accepted_pos['x']:+.2f}, "
+                                f"{pos['y'] - last_accepted_pos['y']:+.2f}, "
+                                f"{pos['z'] - last_accepted_pos['z']:+.2f})m"
+                            )
+                        continue
+                    raise PositionFeedbackError(
+                        f'定位连续 {consecutive_bad_frames + 1} 帧跳变异常, '
+                        f'疑似传感器/网络故障 (超出容忍预算)'
+                    )
+            last_accepted_pos = {'x': pos['x'], 'y': pos['y'], 'z': pos['z']}
+            consecutive_bad_frames = 0
 
             x_measured = pos['x']
             y_measured = pos['y']
@@ -660,9 +760,16 @@ def run_pd_control(
             vy_raw, vy_filtered = filters['y'].update(y_measured, dt)
             vz_raw, vz_filtered = filters['z'].update(z_measured, dt)
 
-            vx_cmd = 0.0 if locked['x'] else controllers['x'].update(target_x, x_measured, vx_filtered)
-            vy_cmd = 0.0 if locked['y'] else controllers['y'].update(target_y, y_measured, vy_filtered)
-            vz_cmd = 0.0 if locked['z'] else controllers['z'].update(target_z, z_measured, vz_filtered)
+            # D 项速度反馈: 优先使用位置源提供的原生速度 (如 Odometry twist)，
+            # 缺失时才退回到位置差分后的低通滤波速度。对 10Hz 量化定位做差分噪声大，
+            # 直接进入 D 项会让速度指令在目标附近抖动、频繁换向。
+            vx_damp = pos['vx'] if pos['vx'] is not None else vx_filtered
+            vy_damp = pos['vy'] if pos['vy'] is not None else vy_filtered
+            vz_damp = pos['vz'] if pos['vz'] is not None else vz_filtered
+
+            vx_cmd = 0.0 if locked['x'] else controllers['x'].update(target_x, x_measured, vx_damp)
+            vy_cmd = 0.0 if locked['y'] else controllers['y'].update(target_y, y_measured, vy_damp)
+            vz_cmd = 0.0 if locked['z'] else controllers['z'].update(target_z, z_measured, vz_damp)
 
             # --- STEP 4: 执行 — 委托给 Actuator ---
             if is_simulation:
@@ -694,13 +801,18 @@ def run_pd_control(
                 ('z', crane.z, target_z, vz_cmd),
             ]
             for name, axis, target, cmd in axis_data:
+                if locked[name]:
+                    continue
                 in_capture_window = abs(axis.position - target) < config.arrival_capture_pos_tol
                 command_settled = abs(cmd) < config.arrival_cmd_tol
                 velocity_settled = abs(axis.velocity) < config.velocity_deadband
-                if not locked[name] and (
+                arrived_now = (
                     _axis_arrived(axis, target, config)
                     or (in_capture_window and command_settled and velocity_settled)
-                ):
+                )
+                # 去抖: 连续满足才累加, 一旦有一帧不满足立即清零。
+                arrival_streak[name] = arrival_streak[name] + 1 if arrived_now else 0
+                if arrival_streak[name] >= config.arrival_debounce_cycles:
                     axis.position = target
                     axis.velocity = 0.0
                     locked[name] = True

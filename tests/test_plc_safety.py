@@ -1,6 +1,7 @@
 import math
 import json
 import threading
+import time
 
 import pytest
 
@@ -93,9 +94,105 @@ def test_plc_actuator_sends_updated_height_while_velocity_is_constant():
     assert plc.lift_commands == pytest.approx([1.02, 1.04, 1.06, 1.08, 1.10])
 
 
-def test_plc_actuator_does_not_silently_clamp_negative_z_coordinates():
+def test_plc_actuator_resends_velocity_every_cycle_while_constant():
+    """Velocity servo needs continuous refresh; a constant command must still be
+    re-sent each cycle, otherwise the PLC watchdog stops the axis (stutter)."""
     plc = RecordingPLC()
-    actuator = PlcActuator(plc, initial_z=-2.0)
+    actuator = PlcActuator(plc, initial_z=1.0)  # above the 0.5m safety floor
+
+    for _ in range(4):
+        actuator.apply(0.2, 0.2, 0.0, 0.1)
+
+    assert plc.big_car_commands == pytest.approx([0.2, 0.2, 0.2, 0.2])
+    assert plc.small_car_commands == pytest.approx([0.2, 0.2, 0.2, 0.2])
+    # Held height is re-sent every cycle (stays at 1.0, above floor).
+    assert plc.lift_commands == pytest.approx([1.0, 1.0, 1.0, 1.0])
+
+
+def test_plc_actuator_inverts_axis_command_direction():
+    """Per-axis sign flips the command when the drive positive direction is
+    opposite to the localization axis (a reflection SLAM yaw cannot express)."""
+    plc = RecordingPLC()
+    actuator = PlcActuator(
+        plc,
+        initial_z=1.0,  # above safety floor so the inverted Z is observable
+        big_car_sign=-1.0,
+        small_car_sign=-1.0,
+        lift_sign=-1.0,
+    )
+
+    actuator.apply(0.2, 0.1, 0.2, 0.1)
+
+    assert plc.big_car_commands == pytest.approx([-0.2])
+    assert plc.small_car_commands == pytest.approx([-0.1])
+    # vz inverted before integration -> height moves down (1.0 - 0.2*0.1)
+    assert plc.lift_commands == pytest.approx([0.98])
+
+
+def test_plc_actuator_z_setpoint_marches_all_the_way_to_target():
+    """liftctrl 是绝对位置伺服: 设 Z 目标后, 高度设定值必须一路走到目标并停住,
+    而不是每周期只领先一步 (旧逻辑会因 update_state 重锚导致设定值几乎不动)。"""
+    plc = RecordingPLC()
+    actuator = PlcActuator(plc, initial_z=5.0)  # target 2.0 > floor 0.5
+    actuator.set_z_target(2.0)
+
+    for _ in range(300):
+        # 模拟控制循环: 先下发速度, 再用实测高度更新状态 (不得重锚设定值)。
+        actuator.apply(0.0, 0.0, -0.2, 0.1)
+        actuator.update_state(
+            CraneState(0.0, 0.0, plc.lift_commands[-1]),
+            position(x=0.0, y=0.0, z=plc.lift_commands[-1]),
+        )
+
+    # 设定值单调下行、精确停在目标、且从不越过目标。
+    assert plc.lift_commands[-1] == pytest.approx(2.0)
+    assert min(plc.lift_commands) >= 2.0 - 1e-9
+    assert plc.lift_commands[0] == pytest.approx(4.98)  # 5.0 + (-0.2 * 0.1)
+
+
+def test_plc_actuator_z_setpoint_does_not_overshoot_ascending_target():
+    plc = RecordingPLC()
+    actuator = PlcActuator(plc, initial_z=1.0)
+    actuator.set_z_target(3.0)
+
+    for _ in range(300):
+        actuator.apply(0.0, 0.0, 0.2, 0.1)
+
+    assert plc.lift_commands[-1] == pytest.approx(3.0)
+    assert max(plc.lift_commands) <= 3.0 + 1e-9  # 不越过目标
+
+
+def test_plc_actuator_enforces_minimum_lift_height_floor():
+    """The hoist command must never be driven below the safety floor (0.5m),
+    keeping the gripper at least 0.5m above ground regardless of PD/target."""
+    plc = RecordingPLC()
+    actuator = PlcActuator(plc, initial_z=0.6)  # default floor = 0.5m
+
+    # Descend 0.2 m/s: 0.6 -> 0.58 -> ... would pass below 0.5 without the floor.
+    for _ in range(7):
+        actuator.apply(0.0, 0.0, -0.2, 0.1)
+
+    assert min(plc.lift_commands) == pytest.approx(0.5)
+    assert all(h >= 0.5 - 1e-9 for h in plc.lift_commands)
+    # Later cycles are pinned to the floor instead of going negative.
+    assert plc.lift_commands[-1] == pytest.approx(0.5)
+
+
+def test_plc_actuator_min_lift_height_is_configurable():
+    plc = RecordingPLC()
+    actuator = PlcActuator(plc, initial_z=1.0, min_lift_height=0.8)
+
+    for _ in range(20):
+        actuator.apply(0.0, 0.0, -0.2, 0.1)
+
+    assert min(plc.lift_commands) == pytest.approx(0.8)
+
+
+def test_plc_actuator_floor_can_be_disabled_for_full_range():
+    """Setting the floor very low restores the un-clamped absolute-height
+    behavior for callers that intentionally need the full range."""
+    plc = RecordingPLC()
+    actuator = PlcActuator(plc, initial_z=-2.0, min_lift_height=float('-inf'))
 
     actuator.apply(0.0, 0.0, 0.2, 0.1)
 
@@ -137,12 +234,18 @@ def test_timeout_always_emergency_stops_and_cleans_up():
 
 def test_successful_arrival_explicitly_stops_motion_and_cleans_up():
     actuator = StubActuator()
-    source = SequenceSource([position(x=0.01, y=0.01, z=0.01)])
+    config = CraneConfig()
+    # 到位需连续 arrival_debounce_cycles 帧满足条件才锁轴 (防单帧异常值误锁)。
+    frames = [
+        position(x=0.01, y=0.01, z=0.01, t=0.1 * (i + 1), stamp=i + 1)
+        for i in range(config.arrival_debounce_cycles)
+    ]
+    source = SequenceSource(frames)
 
     _, arrivals = run_pd_control(
         source=source,
         actuator=actuator,
-        config=CraneConfig(),
+        config=config,
         target_pos=(0.01, 0.01, 0.01),
         initial_state=CraneState(0.01, 0.01, 0.01),
         verbose=False,
@@ -153,6 +256,135 @@ def test_successful_arrival_explicitly_stops_motion_and_cleans_up():
     assert actuator.stop_calls == 1
     assert actuator.emergency_stop_calls == 0
     assert actuator.cleanup_calls == 1
+
+
+def test_localization_outlier_frame_is_discarded_and_does_not_lock_axis():
+    """单帧定位跳变(异常值)必须被丢弃, 不得进入控制/误触发到位锁轴。
+
+    复现"某轴离目标十几厘米就停、PD 结束"的根因: 一个恰好落在目标附近或
+    幅值离谱的定位跳变帧, 在旧逻辑里会被单帧判定直接锁轴。现要求既能过滤
+    离谱跳变帧, 又需连续多帧才锁轴。
+    """
+    actuator = StubActuator()
+    config = CraneConfig()
+    n = config.arrival_debounce_cycles
+    frames = [position(x=0.01, y=0.01, z=0.01, t=0.1, stamp=1)]
+    # 中间插入一个远超物理可达 (max_v*dt+margin) 的跳变帧, 必须被丢弃。
+    frames.append(position(x=10.0, y=10.0, z=10.0, t=0.2, stamp=2))
+    for i in range(1, n):
+        frames.append(position(x=0.01, y=0.01, z=0.01, t=0.1 * (i + 2), stamp=i + 2))
+    source = SequenceSource(frames)
+
+    _, arrivals = run_pd_control(
+        source=source,
+        actuator=actuator,
+        config=config,
+        target_pos=(0.01, 0.01, 0.01),
+        initial_state=CraneState(0.01, 0.01, 0.01),
+        verbose=False,
+        is_simulation=False,
+    )
+
+    assert {axis for _, axis in arrivals} == {"x", "y", "z"}
+    # 跳变帧在进入 apply 之前就被丢弃: apply 次数 == 被接受的帧数 (n)。
+    assert len(actuator.apply_calls) == n
+
+
+def test_single_invalid_frame_mid_run_is_tolerated_not_fatal():
+    """一次偶发坏帧 (NaN/dt异常) 不该让整段 PD 直接中止。
+
+    复现"运行过程中 PD 算法控制有时候会中途提前结束"的一个根因: 单帧定位
+    异常在旧逻辑里直接 raise PositionFeedbackError, 整个作业跟着结束, 需要
+    操作员重新下发目标。现要求预算内的偶发坏帧被丢弃, 控制继续直至到位。
+    """
+    actuator = StubActuator()
+    config = CraneConfig()
+    n = config.arrival_debounce_cycles
+    frames = [position(x=0.01, y=0.01, z=0.01, t=0.1, stamp=1)]
+    # 中间插入一帧 dt=NaN 的畸形数据, 必须被丢弃而不是终止整个 PD。
+    frames.append({**position(x=0.01, y=0.01, z=0.01, t=0.2, stamp=2), "dt": math.nan})
+    for i in range(1, n):
+        frames.append(position(x=0.01, y=0.01, z=0.01, t=0.1 * (i + 2), stamp=i + 2))
+    source = SequenceSource(frames)
+
+    _, arrivals = run_pd_control(
+        source=source,
+        actuator=actuator,
+        config=config,
+        target_pos=(0.01, 0.01, 0.01),
+        initial_state=CraneState(0.01, 0.01, 0.01),
+        verbose=False,
+        is_simulation=False,
+    )
+
+    assert {axis for _, axis in arrivals} == {"x", "y", "z"}
+
+
+def test_persistent_invalid_frames_beyond_budget_still_abort():
+    """坏帧容忍预算不是无限的: 连续异常帧超出预算必须视为真实故障并
+    按原语义中止 + 安全停车, 而不是无限期容忍下去。"""
+    actuator = StubActuator()
+    config = CraneConfig()
+    frames = [position(x=0.0, y=0.0, z=0.0, t=0.1, stamp=1)]
+    # 预算 + 1 帧连续畸形数据 -> 最后一帧必须真正触发中止。
+    for i in range(config.max_consecutive_bad_frames + 1):
+        frames.append({**position(t=0.1 * (i + 2), stamp=i + 2), "dt": math.nan})
+    source = SequenceSource(frames)
+
+    with pytest.raises(RuntimeError, match="invalid position feedback"):
+        run_pd_control(
+            source=source,
+            actuator=actuator,
+            config=config,
+            target_pos=(1.0, 1.0, 1.0),
+            initial_state=CraneState(0.0, 0.0, 0.0),
+            verbose=False,
+            is_simulation=False,
+        )
+
+    assert actuator.emergency_stop_calls == 1
+
+
+class FlakyHeartbeatPLC(MockPLC):
+    """Simulates a transient network blip: heartbeat sends fail for a burst
+    of cycles, then start succeeding again — like real S7/TCP jitter."""
+
+    def __init__(self, fail_cycles: int):
+        super().__init__()
+        self._connected = True
+        self._sends = 0
+        self._fail_cycles = fail_cycles
+
+    def send_heartbeat(self) -> bool:
+        self._sends += 1
+        ok = self._sends > self._fail_cycles
+        if ok:
+            self._fail_count = 0
+            self._heartbeat_healthy = True
+        return ok
+
+
+def test_heartbeat_self_heals_after_transient_failure_burst():
+    """一次瞬时网络抖动(心跳连续失败超过阈值)必须只是短暂标记不健康,
+    绝不能让后台心跳线程退出——线程退出后 heartbeat_healthy 永远无法恢复,
+    只能重启整个进程才能继续控制。这是"PD 有时中途提前结束、且之后重新
+    下发目标也无法恢复"的根因之一。"""
+    plc = FlakyHeartbeatPLC(fail_cycles=15)  # > _max_fails(10), 模拟瞬时抖动
+    plc.start_heartbeat()
+    try:
+        deadline = time.monotonic() + 3.0
+        while plc.heartbeat_healthy and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not plc.heartbeat_healthy, 'sustained failures should mark unhealthy'
+        assert plc._heartbeat_thread.is_alive(), 'heartbeat thread must keep retrying, not exit'
+
+        deadline = time.monotonic() + 3.0
+        while not plc.heartbeat_healthy and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert plc.heartbeat_healthy, 'heartbeat must self-heal once sends succeed again'
+        assert plc._heartbeat_thread.is_alive()
+    finally:
+        plc.disconnect()
 
 
 def test_position_timeout_is_an_error_instead_of_normal_completion():

@@ -24,6 +24,7 @@ PLC 每个周期读取位置反馈，估计并滤波速度，使用 PD 输出速
 from __future__ import annotations
 
 import argparse
+import math
 import time
 
 # Must be set before any matplotlib import (headless mode, no tkinter)
@@ -109,6 +110,18 @@ def _build_arg_parser():
                         help='yaw of the crane +X rail in the SLAM map, in degrees')
     parser.add_argument('--use-native-z-velocity', action='store_true',
                         help='trust Odometry twist.linear.z instead of height-derived velocity')
+    parser.add_argument('--invert-big-car', action='store_true',
+                        help='flip big-car (X) command sign when the drive positive '
+                             'direction is opposite to the localization X axis')
+    parser.add_argument('--invert-small-car', action='store_true',
+                        help='flip small-car (Y) command sign when the drive positive '
+                             'direction is opposite to the localization Y axis')
+    parser.add_argument('--invert-lift', action='store_true',
+                        help='flip hoist (Z) command sign when the drive positive '
+                             'direction is opposite to the localization Z axis')
+    parser.add_argument('--min-lift-height', type=float, default=0.5,
+                        help='minimum hoist height (m) sent to liftctrl; keeps the '
+                             'gripper at least this far above ground (default 0.5)')
     for axis in ('x', 'y', 'z'):
         parser.add_argument(f'--workspace-{axis}-min', type=float, default=None,
                             help=f'minimum allowed {axis.upper()} target in PLC workspace')
@@ -132,7 +145,7 @@ def _workspace_bounds_from_args(args, axis: str) -> tuple[float, float] | None:
 
 def _config_from_args(args) -> CraneConfig:
     return CraneConfig(
-        max_velocity_xy=0.3,
+        max_velocity_xy=0.2,
         max_velocity_z=0.2,
         kp_pos=0.6,
         kd_pos=0.45,
@@ -217,6 +230,10 @@ def main(argv=None):
             while get_latest_pose() is None and waited < 5.0:
                 time.sleep(0.1)
                 waited += 0.1
+            # Z 位置来自抓钩实测高度 (物理 Z), SLAM 只提供 X/Y。
+            hoist_z = plc.get_lift_height()
+            has_hoist_z = hoist_z is not None and math.isfinite(hoist_z)
+
             pose = get_latest_pose()
             if pose is not None:
                 px, py, pz = config.validate_position(
@@ -224,10 +241,14 @@ def main(argv=None):
                         pose['x'], pose['y'], pose['z']
                     )
                 )
+                # 有抓钩高度时用它作为初始 Z, 否则退回 SLAM Z。
+                if has_hoist_z:
+                    pz = float(hoist_z)
                 crane0 = CraneState(x0=px, y0=py, z0=pz)
                 print(
                     f'Localization received: map=({pose["x"]:.2f}, {pose["y"]:.2f}, {pz:.2f}), '
-                    f'crane=({px:.2f}, {py:.2f}, {pz:.2f})'
+                    f'crane=({px:.2f}, {py:.2f}, {pz:.2f}), '
+                    f'Z source={"hoist" if has_hoist_z else "slam"}'
                 )
             else:
                 print('Warning: /localization_pose timeout, using default initial position')
@@ -240,13 +261,22 @@ def main(argv=None):
             initial_pos = (
                 pose['x'] if pose is not None else fallback_map[0],
                 pose['y'] if pose is not None else fallback_map[1],
-                pose['z'] if pose is not None else fallback_map[2],
+                # Z 用抓钩高度 (映射回 map)；crane0.z 已优先取抓钩高度。
+                fallback_map[2],
             )
             ros_source = RosPositionSource(
                 coordinate_transform=coordinate_transform,
                 use_native_z_velocity=args.use_native_z_velocity,
+                lift_height_provider=plc.get_lift_height,
             )
-            plc_actuator = PlcActuator(plc, initial_z=crane0.z.position)
+            plc_actuator = PlcActuator(
+                plc,
+                initial_z=crane0.z.position,
+                big_car_sign=-1.0 if args.invert_big_car else 1.0,
+                small_car_sign=-1.0 if args.invert_small_car else 1.0,
+                lift_sign=-1.0 if args.invert_lift else 1.0,
+                min_lift_height=args.min_lift_height,
+            )
 
             if args.live:
                 # PLC 实时控制模式: 开 UI, 等用户 Apply Target

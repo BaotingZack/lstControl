@@ -16,6 +16,7 @@ Supports two rendering modes:
 from __future__ import annotations
 
 import json
+import math
 import queue
 import socket
 import threading
@@ -1389,6 +1390,9 @@ def render_live_html(plc_mode: bool = False) -> str:
     let _controlActive = false;
     let _lastStepCount = -1;
     let _lastTrailTime = -1;  // 1Hz trail decimation
+    // PD 结束后冻结轨迹: 保留起点→目标点的完整轨迹在画面上, 阻止实时定位
+    // 直播用其 30 帧滑动窗口覆盖/裁掉这条轨迹, 方便展示成果。
+    let _trajectoryFrozen = false;
 
     const els = {
       rate: document.getElementById('rate'),
@@ -1536,7 +1540,8 @@ def render_live_html(plc_mode: bool = False) -> str:
       ctx.fillStyle = '#89bce8';
       ctx.fillRect(p0.x - cap / 2, p0.y - 16, cap, 32);
       ctx.fillRect(p1.x - cap / 2, p1.y - 16, cap, 32);
-      const speedMark = Math.min(1, Math.abs(current.vx) / 0.3);
+      const xyLimit = payload && payload.velocityLimits ? payload.velocityLimits.xy : 0.2;
+      const speedMark = Math.min(1, Math.abs(current.vx) / xyLimit);
       ctx.fillStyle = `rgba(240, 168, 59, ${0.25 + speedMark * 0.45})`;
       ctx.fillRect(p0.x - 4, p0.y - 23, 8, 46);
       ctx.fillRect(p1.x - 4, p1.y - 23, 8, 46);
@@ -1774,6 +1779,10 @@ def render_live_html(plc_mode: bool = False) -> str:
               els.ctrlMsg.textContent = 'Control started — polling...';
               els.ctrlMsg.style.color = '#5ebd72';
               _lastStepCount = -1;  // reset so first step triggers Start marker
+              // 新一轮控制: 解冻并清空上一次的轨迹, 重新开始记录。
+              _trajectoryFrozen = false;
+              _lastTrailTime = -1;
+              if (payload && payload.frames) payload.frames.length = 0;
             } else {
               els.ctrlMsg.textContent = 'Error: ' + (data.error || 'unknown');
               els.ctrlMsg.style.color = '#e05a47';
@@ -1835,7 +1844,7 @@ def render_live_html(plc_mode: bool = False) -> str:
         target: defaultPos,
         initial: defaultPos,
         bounds: { xMin: -2, xMax: 10, yMin: -2, yMax: 8, zMin: 0, zMax: 7 },
-        velocityLimits: {xy: 0.3, z: 0.2},
+        velocityLimits: {xy: 0.2, z: 0.2},
         phaseBoundaries: [],
         frames: [{t: 0, x: 0, y: 0, z: 5, vx: 0, vy: 0, vz: 0,
                   vxCmd: 0, vyCmd: 0, vzCmd: 0, phaseLabel: 'Waiting for localization...'}],
@@ -1900,8 +1909,9 @@ def render_live_html(plc_mode: bool = False) -> str:
       els.locoStatus.textContent = 'Connected — /localization_pose';
       els.locoStatus.style.color = '#5ebd72';
 
-      // PLC mode — use localization data to drive Canvas when no control is active
-      if (PLC_MODE && !_controlActive) {
+      // PLC mode — use localization data to drive Canvas when no control is active.
+      // 冻结时 (PD 刚结束) 不再往 payload.frames 里推流并裁剪, 以保留完整轨迹。
+      if (PLC_MODE && !_controlActive && !_trajectoryFrozen) {
         const pos = {x: data.x, y: data.y, z: data.z};
         const vel = {vx: data.vx, vy: data.vy, vz: data.vz};
         if (!payload) {
@@ -1914,7 +1924,7 @@ def render_live_html(plc_mode: bool = False) -> str:
               yMin: data.y - 2, yMax: data.y + 2,
               zMin: data.z - 2, zMax: data.z + 2,
             },
-            velocityLimits: {xy: 0.3, z: 0.2},
+            velocityLimits: {xy: 0.2, z: 0.2},
             phaseBoundaries: [],
             frames: [],
           };
@@ -1968,6 +1978,12 @@ def render_live_html(plc_mode: bool = False) -> str:
             return;
           }
           if (s.stopped) {
+            if (_controlActive || !_trajectoryFrozen) {
+              // 冻结并重绘: 保留已走过的部分轨迹, 便于查看停止位置。
+              _trajectoryFrozen = true;
+              frame = Math.max(0, payload.frames.length - 1);
+              draw();
+            }
             _controlActive = false;
             els.phase.textContent = 'Control Stopped';
             els.ctrlMsg.textContent = s.stop_reason || 'Stopped by operator';
@@ -1984,6 +2000,10 @@ def render_live_html(plc_mode: bool = False) -> str:
               els.ctrlMsg.style.color = '#5ebd72';
               els.applyTarget.disabled = false;
               els.applyTarget.textContent = 'Apply Target';
+              // 冻结并重绘: 把起点→目标点的完整轨迹定格在画面上。
+              _trajectoryFrozen = true;
+              frame = Math.max(0, payload.frames.length - 1);
+              draw();
             }
             return;
           }
@@ -2043,7 +2063,8 @@ def render_live_html(plc_mode: bool = False) -> str:
           els.vx.textContent = (d.vx_cmd || 0).toFixed(2);
           els.vy.textContent = (d.vy_cmd || 0).toFixed(2);
           els.vz.textContent = (d.vz_cmd || 0).toFixed(2);
-          const xyLimit = 0.3, zLimit = 0.2;
+          const xyLimit = (payload && payload.velocityLimits) ? payload.velocityLimits.xy : 0.2;
+          const zLimit = (payload && payload.velocityLimits) ? payload.velocityLimits.z : 0.2;
           els.coordVx.style.borderColor = speedColor(Math.abs(d.vx_cmd), xyLimit);
           els.coordVy.style.borderColor = speedColor(Math.abs(d.vy_cmd), xyLimit);
           els.coordVz.style.borderColor = speedColor(Math.abs(d.vz_cmd), zLimit);
@@ -2271,17 +2292,47 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         self._write(200, 'application/json; charset=utf-8', body)
 
     def _stream_localization(self):
-        """SSE endpoint that streams the latest /localization_pose data at ~10 Hz."""
+        """SSE endpoint that streams the latest /localization_pose data at ~10 Hz.
+
+        Z 轴一致性: 控制环的 Z 反馈用的是 PLC 抓钩实测高度 (物理 Z), 而非
+        SLAM 的 Map Z。若这里仍推送 SLAM Z, 前端监视面板与预填的目标 Z 就会
+        落在与控制不同的参考系, 导致 (1) 看起来"Z 没用抓钩高度", (2) 操作员
+        据此设定的目标 Z 与实际物理高度差出几十公分。因此 PLC 模式下这里也把
+        Z (及 Z 速度) 替换为抓钩高度, 使显示/预填/控制三者同一参考系。
+        """
+        server = self.server
+        plc = getattr(server, 'plc', None)
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Cache-Control', 'no-cache')
         self.send_header('Connection', 'keep-alive')
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
+        last_hoist_z: float | None = None
+        last_hoist_wall: float | None = None
         try:
             while True:
                 pose = get_latest_pose()
                 if pose is not None:
+                    # PLC 模式: 用抓钩实测高度覆盖 Z, 并由高度差分估计 Z 速度,
+                    # 与控制环 (RosPositionSource + lift_height_provider) 完全一致。
+                    if plc is not None:
+                        try:
+                            hoist_z = plc.get_lift_height()
+                        except Exception:
+                            hoist_z = None
+                        if hoist_z is not None and math.isfinite(hoist_z):
+                            pose = dict(pose)
+                            hoist_z = float(hoist_z)
+                            now = time.monotonic()
+                            if last_hoist_z is not None and last_hoist_wall is not None:
+                                dt = now - last_hoist_wall
+                                pose['vz'] = (hoist_z - last_hoist_z) / dt if dt > 1e-6 else 0.0
+                            else:
+                                pose['vz'] = 0.0
+                            pose['z'] = hoist_z
+                            last_hoist_z = hoist_z
+                            last_hoist_wall = now
                     data = json.dumps(pose, ensure_ascii=False)
                     self.wfile.write(f'data: {data}\n\n'.encode('utf-8'))
                     self.wfile.flush()
@@ -2391,6 +2442,13 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             return
         map_pose = dict(pose)
         crane_pose = {**pose, 'x': pose_x, 'y': pose_y, 'z': pose_z}
+        # Z 位置优先取抓钩实测高度 (物理 Z); origin_z=0 且无 roll/pitch 时
+        # map Z 与 crane Z 相同, 故显示与控制共用同一高度值。
+        if server.plc is not None:
+            hoist_z = server.plc.get_lift_height()
+            if hoist_z is not None and math.isfinite(hoist_z):
+                crane_pose['z'] = float(hoist_z)
+                map_pose['z'] = float(hoist_z)
         map_target_x, map_target_y, map_target_z = (
             server.coordinate_transform.crane_to_map_position(
                 target_x,
