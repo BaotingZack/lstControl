@@ -43,8 +43,6 @@ extern "C"
     int ReadPlcHeartbeatMonitor();            // 读取心跳值
     bool CheckPlcConnection();                // PLC连接检查
     bool CheckHeartbeatStatus();              // 心跳状态检查
-    int GetGripperOnStatus(int *status);      // 读取吊具打开状态
-    int GetGripperOffStatus(int *status);     // 读取吊具释放状态
 
 #ifdef __cplusplus
 }

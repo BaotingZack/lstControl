@@ -26,7 +26,54 @@ static const int HEARTBEAT_INTERVAL_MS = 100;  /* 100ms = 10Hz */
 static const int HEARTBEAT_WARMUP_MS    = 500;  /* 连接后等 500ms 再开始 */
 static const int MAX_CONSECUTIVE_FAILS  = 3;    /* 连续失败 3 次才算真断开 */
 
+/* =====================================================================
+ * 抓钩 / 复位控制配置
+ * ---------------------------------------------------------------------
+ * DB7 命令位布局（来自 libsscarctrl.so 反汇编）：
+ *   GripperClampOnControl(v)  -> 把 v 写入 DB7.DBX48.0  (现场实测 1=释放)
+ *   GripperClampOffControl(v) -> 把 v 写入 DB7.DBX48.1  (现场实测 1=夹紧)
+ *   ResetControl(v)           -> 把 v 写入 DB7.DBX48.2  (=遥控"复位"键)
+ *   EmergencyBrake(v)         -> 把 v 写入 DB7.DBX48.3  (急停)
+ *
+ * 重要：夹紧/释放位是【电平保持】，写 1 保持该动作、写 0 撤销该动作。
+ * 因此绝对不能"写 1 后再写 0"当脉冲用 —— 那会让抓钩"夹一下又松开"。
+ * 夹紧与释放互斥：置其一为 1 时必须把另一位清 0。
+ *
+ * "复位"位则是模拟遥控上的复位【按键】，属于瞬动信号，用脉冲(1->0)即可。
+ * ===================================================================== */
+static const int RESET_PULSE_MS = 300;  /* 软件复位脉冲宽度, 需 >= PLC 扫描周期 */
+
 static std::atomic<bool> heartbeatRunning{true};
+
+/* =====================================================================
+ * 软件复位 —— 模拟遥控器"复位"键的一次瞬动按压 (置 1 -> 保持 -> 置 0)
+ * ===================================================================== */
+static void PlcResetPulse(const std::string& ip)
+{
+    ResetControl(true,  ip.c_str());
+    std::this_thread::sleep_for(std::chrono::milliseconds(RESET_PULSE_MS));
+    ResetControl(false, ip.c_str());
+}
+
+/* =====================================================================
+ * 抓钩夹紧 —— 电平保持
+ * 现场实测极性: DB7.DBX48.1 (GripperClampOffControl) = 1 才是夹紧
+ * ===================================================================== */
+static void GripperClamp(const std::string& ip)
+{
+    GripperClampOnControl(false,  ip.c_str());  /* 释放位清 0 (互斥) */
+    GripperClampOffControl(true,  ip.c_str());  /* 夹紧位置 1 并保持 */
+}
+
+/* =====================================================================
+ * 抓钩释放 —— 电平保持
+ * 现场实测极性: DB7.DBX48.0 (GripperClampOnControl) = 1 才是释放
+ * ===================================================================== */
+static void GripperRelease(const std::string& ip)
+{
+    GripperClampOffControl(false, ip.c_str());  /* 夹紧位清 0 (互斥) */
+    GripperClampOnControl(true,   ip.c_str());  /* 释放位置 1 并保持 */
+}
 
 /* =====================================================================
  * 后台心跳线程 —— 独立运行，不受菜单阻塞影响
@@ -82,6 +129,12 @@ static void ShowPlcStatus()
     std::cout << "  吊钩实际高度:    " << std::fixed << std::setprecision(2)
               << h << " m\n";
 
+    int onStat = 0, offStat = 0;
+    GetGripperOnStatus(&onStat);
+    GetGripperOffStatus(&offStat);
+    std::cout << "  抓钩夹紧到位:    " << (onStat ? "是" : "否") << "\n";
+    std::cout << "  抓钩释放到位:    " << (offStat ? "是" : "否") << "\n";
+
     std::cout << "=========================================================\n"
               << std::endl;
 }
@@ -128,9 +181,11 @@ static void DispMainMenu()
               << "    1. big car ++         2. big car --\n"
               << "    3. small car ++       4. small car --\n"
               << "    5. hoist 0.6m         6. hoist 0.7m\n"
-              << "    7. STOP ALL\n"
+              << "    7. 抓钩夹紧           8. 抓钩释放\n"
+              << "    9. STOP ALL (仅停运动, 不动抓钩)\n"
+              << "   10. 复位(模拟遥控复位键)\n"
               << "  诊断:\n"
-              << "    8. PLC 状态 (单次)    9. PLC 持续监控\n"
+              << "   11. PLC 状态 (单次)   12. PLC 持续监控\n"
               << "---------------------------------------------------------\n"
               << "    0. Exit\n"
               << "---------------------------------------------------------\n"
@@ -205,17 +260,33 @@ int main()
             break;
 
         case 7:
-            BigCarCtrl(0, ip.c_str(), 0x047F);
-            SmallcarCtrl(0, ip.c_str(), 0x047F);
-            liftctrl(0, ip.c_str());
-            std::cout << "STOP ALL" << std::endl;
+            GripperClamp(ip);
+            std::cout << "send 抓钩夹紧 (电平保持)" << std::endl;
             break;
 
         case 8:
+            GripperRelease(ip);
+            std::cout << "send 抓钩释放 (电平保持)" << std::endl;
+            break;
+            
+        case 9:
+            /* 只停运动, 不改抓钩位: 避免急停时松开抓钩掉载 */
+            BigCarCtrl(0, ip.c_str(), 0x047F);
+            SmallcarCtrl(0, ip.c_str(), 0x047F);
+            liftctrl(0, ip.c_str());
+            std::cout << "STOP ALL (运动已停, 抓钩状态保持)" << std::endl;
+            break;
+            
+        case 10:
+            PlcResetPulse(ip);
+            std::cout << "send 复位脉冲 (模拟遥控复位键)" << std::endl;
+            break;
+
+        case 11:
             ShowPlcStatus();
             break;
 
-        case 9:
+        case 12:
             MonitorPlcStatus();
             break;
 
