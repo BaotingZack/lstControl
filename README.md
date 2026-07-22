@@ -126,7 +126,7 @@ rostopic echo -n 1 /localization_pose
 
 ```bash
 python3 main.py \
-  --plc-ip 192.168.1.100 \
+  --plc-ip 192.168.0.1 \
   --live \
   --host 0.0.0.0 \
   --port 8000 \
@@ -170,7 +170,7 @@ D 项使用位置差分后低通滤波得到的速度，避免原始差分速度
 | 命令 | 模式 | 位置来源 | 执行 | 交互 |
 |------|------|----------|------|------|
 | `python3 main.py` | 实验室仿真 | 仿真对象模型 (100Hz) | 仿真对象 | 命令行 target → 自动运行 → 回放 |
-| `python3 main.py --plc-ip 192.168.1.100 --live` | PLC 控制 | ROS `/localization_pose` (10Hz) | `ctypes` → Snap7 → 西门子 S7 PLC | 开 UI → 实时定位 → Apply Target → 实时控制 |
+| `python3 main.py --plc-ip 192.168.0.1 --live` | PLC 控制 | ROS `/localization_pose` (10Hz) | `ctypes` → Snap7 → 西门子 S7 PLC | 开 UI → 实时定位 → Apply Target → 实时控制 |
 
 ### 实验室仿真（默认）
 
@@ -183,7 +183,7 @@ python3 main.py --target-x 10 --target-y 5 --target-z 2 --live
 ### 真实 PLC 控制
 
 ```bash
-python3 main.py --plc-ip 192.168.1.100 --live
+python3 main.py --plc-ip 192.168.0.1 --live
 ```
 
 指定 `--plc-ip` 后：
@@ -245,7 +245,7 @@ ROS /localization_pose ──► RosPositionSource ──► PD 控制循环
 真实设备部署应按机械行程显式设置三轴工作区，例如：
 
 ```bash
-python3 main.py --plc-ip 192.168.1.100 --live \
+python3 main.py --plc-ip 192.168.0.1 --live \
   --workspace-x-min 0 --workspace-x-max 30 \
   --workspace-y-min -10 --workspace-y-max 10 \
   --workspace-z-min 0 --workspace-z-max 15
@@ -282,7 +282,7 @@ crane_point = R^T * (map_point - map_origin)
 例如地图中的起重机原点为 `(10, 20, 1.5)`，地图相对真实地面 roll 为 2°、pitch 为 -4°，大车 +X 在地图里指向 90°：
 
 ```bash
-python3 main.py --plc-ip 192.168.1.100 --live \
+python3 main.py --plc-ip 192.168.0.1 --live \
   --map-to-crane-origin-x 10 \
   --map-to-crane-origin-y 20 \
   --map-to-crane-origin-z 1.5 \
