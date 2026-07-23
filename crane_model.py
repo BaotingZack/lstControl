@@ -227,6 +227,11 @@ class CraneConfig:
     # 直接丢弃并继续控制 (常见于 SLAM/网络抖动的偶发坏帧); 超过则视为真实故障,
     # 按原语义中止并安全停车。10Hz 下默认 10 帧 ≈ 1s。
     max_consecutive_bad_frames: int = 10
+    # actuator.apply() 瞬时失败 (PLC 连接/心跳抖动) 的容忍预算: 连续失败次数
+    # 不超过该值时跳过本周期继续控制 (心跳线程会在背后持续重试自愈);
+    # 超过则视为真实故障, 按原语义中止并安全停车。10Hz 下默认 10 次 ≈ 1s,
+    # 与心跳自身的失败容忍窗口 (见 plc_interface._max_fails) 保持一致量级。
+    max_consecutive_actuator_errors: int = 10
     # 防反向抽动保护带 [m]: 在尚未越过目标且 |误差| 小于该值时，禁止 PD 给出
     # 远离目标方向的速度指令（速度伺服型行车"刹车"=指令归零而非反向脉冲）。
     reverse_guard_tol: float = 0.05
@@ -287,6 +292,11 @@ class CraneConfig:
                 or self.max_consecutive_bad_frames < 0:
             raise ValueError('max_consecutive_bad_frames must be a non-negative integer')
         self.max_consecutive_bad_frames = int(self.max_consecutive_bad_frames)
+
+        if int(self.max_consecutive_actuator_errors) != self.max_consecutive_actuator_errors \
+                or self.max_consecutive_actuator_errors < 0:
+            raise ValueError('max_consecutive_actuator_errors must be a non-negative integer')
+        self.max_consecutive_actuator_errors = int(self.max_consecutive_actuator_errors)
 
         for axis_name, bounds in (
             ('X', self.workspace_x_bounds),
@@ -638,6 +648,9 @@ def run_pd_control(
     last_accepted_pos: dict[str, float] | None = None
     # 连续被丢弃的异常帧计数 (NaN/越界/dt异常/跳变), 用于区分偶发噪声与真实故障。
     consecutive_bad_frames = 0
+    # 连续 actuator.apply() 失败计数 (PLC 连接/心跳瞬时抖动), 与上面计数器
+    # 分开维护, 避免定位帧恢复正常就重置了执行器故障计数 (二者是不同故障源)。
+    consecutive_actuator_errors = 0
 
     # PD 输出
     vx_cmd = vy_cmd = vz_cmd = 0.0
@@ -780,8 +793,24 @@ def run_pd_control(
                     disturbance_y = plant.update_axis('y', crane.y, vy_cmd, target_y, locked['y'], dt, t)
                     disturbance_z = plant.update_axis('z', crane.z, vz_cmd, target_z, locked['z'], dt, t)
             else:
-                # PLC 模式: 发送指令到真实 PLC
-                actuator.apply(vx_cmd, vy_cmd, vz_cmd, dt)
+                # PLC 模式: 发送指令到真实 PLC。连接/心跳的瞬时抖动 (已在
+                # PlcActuator/心跳线程做了容忍与背后自愈) 不应让这一次瞬时
+                # 失败直接终止整段作业——否则表现为"距离目标还很远时 PD 就
+                # 结束、输出速度为 0"。预算内跳过本周期继续控制; 超出预算
+                # 才视为真实故障, 按原语义中止并安全停车。
+                try:
+                    actuator.apply(vx_cmd, vy_cmd, vz_cmd, dt)
+                except RuntimeError as exc:
+                    if consecutive_actuator_errors < config.max_consecutive_actuator_errors:
+                        consecutive_actuator_errors += 1
+                        if verbose:
+                            print(
+                                f'[PLC异常] 执行器暂时不可用 '
+                                f'(连续第 {consecutive_actuator_errors} 次): {exc}'
+                            )
+                        continue
+                    raise
+                consecutive_actuator_errors = 0
                 # 从定位数据更新 state
                 actuator.update_state(crane, pos)
                 # 没有可信原生速度时，统一使用位置差分后的滤波估计。

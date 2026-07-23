@@ -266,3 +266,113 @@ def test_web_map_target_is_transformed_before_crane_workspace_validation():
         config,
         transform,
     ) == pytest.approx((2.0, 3.0, 4.0))
+
+
+def test_map_to_crane_target_bypasses_rotation_for_hoist_height_z():
+    # A calibrated origin_map_z=30 would normally shift Z by -30m; with
+    # z_is_hoist_height=True the Z value must pass through untouched since
+    # it is a direct physical hoist-height reading, not a SLAM map Z.
+    transform = CoordinateTransform2D.from_degrees(
+        origin_map_x=10.0,
+        origin_map_y=20.0,
+        origin_map_z=30.0,
+        crane_x_axis_yaw_deg=90.0,
+    )
+
+    crane_target = transform.map_to_crane_target(
+        14.0, 22.0, 1.75, z_is_hoist_height=True,
+    )
+
+    # X/Y still go through the yaw transform exactly like map_to_crane_point.
+    assert crane_target[:2] == pytest.approx(transform.map_to_crane_point(14.0, 22.0))
+    # Z is untouched hoist height, not shifted by origin_map_z.
+    assert crane_target[2] == pytest.approx(1.75)
+
+    # Without the flag, Z would be heavily distorted by the 3D transform
+    # (shifted by -origin_map_z here) — exactly the bug this fix avoids.
+    rotated_target = transform.map_to_crane_target(
+        14.0, 22.0, 1.75, z_is_hoist_height=False,
+    )
+    assert rotated_target[2] == pytest.approx(1.75 - 30.0)
+
+
+def test_crane_to_map_display_is_inverse_of_map_to_crane_target_for_hoist_z():
+    transform = CoordinateTransform2D.from_degrees(
+        origin_map_x=10.0,
+        origin_map_y=20.0,
+        origin_map_z=30.0,
+        crane_x_axis_yaw_deg=90.0,
+    )
+
+    crane_target = transform.map_to_crane_target(14.0, 22.0, 1.75, z_is_hoist_height=True)
+    map_display = transform.crane_to_map_display(*crane_target, z_is_hoist_height=True)
+
+    assert map_display == pytest.approx((14.0, 22.0, 1.75))
+
+
+def test_parse_control_target_treats_target_z_as_hoist_height_when_flagged():
+    # With z_is_hoist_height=True the entered target_z must survive untouched
+    # (matching the raw hoist-height feedback used by the control loop),
+    # instead of being shifted by origin_map_z — otherwise PD converges to a
+    # height far from the physical target and stops early with v=0.
+    transform = CoordinateTransform2D.from_degrees(
+        origin_map_x=10.0,
+        origin_map_y=20.0,
+        origin_map_z=30.0,
+        crane_x_axis_yaw_deg=90.0,
+    )
+    config = CraneConfig(
+        workspace_x_bounds=(-5.0, 5.0),
+        workspace_y_bounds=(-5.0, 5.0),
+    )
+    body = '{"target_x": 14, "target_y": 22, "target_z": 1.75}'
+
+    target = live_server._parse_control_target(
+        body,
+        config,
+        transform,
+        z_is_hoist_height=True,
+    )
+
+    assert target[:2] == pytest.approx(transform.map_to_crane_point(14.0, 22.0))
+    assert target[2] == pytest.approx(1.75)
+
+    # Sanity: without the flag the same body would resolve to a Z shifted by
+    # -origin_map_z (28.0/33.0-ish region), not the entered hoist height.
+    unflagged_target = live_server._parse_control_target(body, config, transform)
+    assert unflagged_target[2] != pytest.approx(1.75)
+
+
+def test_control_step_to_map_keeps_hoist_height_z_unrotated():
+    transform = CoordinateTransform2D.from_degrees(
+        10.0,
+        20.0,
+        90.0,
+        origin_map_z=5.0,
+    )
+    crane_step = {
+        "x": 2.0,
+        "y": 3.0,
+        "z": 1.2,
+        "p_ref_x": 4.0,
+        "p_ref_y": 5.0,
+        "p_ref_z": 1.5,
+        "vx": 1.0,
+        "vy": 0.0,
+        "vz": 0.2,
+        "vz_cmd": -0.1,
+        "vx_cmd": 0.5,
+        "vy_cmd": -0.25,
+    }
+
+    map_step = transform.control_step_to_map(crane_step, z_is_hoist_height=True)
+
+    # X/Y still rotated into map frame as usual.
+    assert (map_step["x"], map_step["y"]) == pytest.approx((7.0, 22.0))
+    assert (map_step["p_ref_x"], map_step["p_ref_y"]) == pytest.approx((5.0, 24.0))
+    # Z (position + velocity) passes through untouched — it's the physical
+    # hoist height/velocity, not a SLAM-map coordinate to rotate/translate.
+    assert map_step["z"] == pytest.approx(1.2)
+    assert map_step["p_ref_z"] == pytest.approx(1.5)
+    assert map_step["vz"] == pytest.approx(0.2)
+    assert map_step["vz_cmd"] == pytest.approx(-0.1)

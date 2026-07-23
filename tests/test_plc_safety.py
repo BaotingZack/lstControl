@@ -345,6 +345,76 @@ def test_persistent_invalid_frames_beyond_budget_still_abort():
     assert actuator.emergency_stop_calls == 1
 
 
+class FlakyApplyActuator(StubActuator):
+    """Simulates actuator.apply() raising RuntimeError for a transient burst
+    of cycles (PLC connection/heartbeat blip) before recovering — like the
+    _ensure_available() guard in PlcActuator would raise while the heartbeat
+    thread is mid-recovery."""
+
+    def __init__(self, fail_calls: int):
+        super().__init__()
+        self._fail_calls = fail_calls
+        self._calls = 0
+
+    def apply(self, vx, vy, vz, dt):
+        self._calls += 1
+        if self._calls <= self._fail_calls:
+            raise RuntimeError('PLC heartbeat is not healthy')
+        super().apply(vx, vy, vz, dt)
+
+
+def test_transient_actuator_error_mid_run_is_tolerated_not_fatal():
+    """一次瞬时 actuator.apply() 失败 (PLC 连接/心跳抖动) 不该让整段 PD
+    直接中止——否则表现为"距离目标还很远时 PD 就结束、输出速度为 0"。"""
+    actuator = FlakyApplyActuator(fail_calls=3)
+    config = CraneConfig()
+    n = config.arrival_debounce_cycles
+    frames = [
+        position(x=0.01, y=0.01, z=0.01, t=0.1 * (i + 1), stamp=i + 1)
+        for i in range(3 + n)
+    ]
+    source = SequenceSource(frames)
+
+    _, arrivals = run_pd_control(
+        source=source,
+        actuator=actuator,
+        config=config,
+        target_pos=(0.01, 0.01, 0.01),
+        initial_state=CraneState(0.01, 0.01, 0.01),
+        verbose=False,
+        is_simulation=False,
+    )
+
+    assert {axis for _, axis in arrivals} == {"x", "y", "z"}
+    # The 3 failed calls should not have reached the recording apply().
+    assert len(actuator.apply_calls) == n
+
+
+def test_persistent_actuator_errors_beyond_budget_still_abort():
+    """执行器失败容忍预算不是无限的: 连续失败超出预算必须视为真实故障并
+    按原语义中止 + 安全停车。"""
+    config = CraneConfig()
+    actuator = FlakyApplyActuator(fail_calls=config.max_consecutive_actuator_errors + 1)
+    frames = [
+        position(t=0.1 * (i + 1), stamp=i + 1)
+        for i in range(config.max_consecutive_actuator_errors + 1)
+    ]
+    source = SequenceSource(frames)
+
+    with pytest.raises(RuntimeError, match="PLC heartbeat is not healthy"):
+        run_pd_control(
+            source=source,
+            actuator=actuator,
+            config=config,
+            target_pos=(1.0, 1.0, 1.0),
+            initial_state=CraneState(0.0, 0.0, 0.0),
+            verbose=False,
+            is_simulation=False,
+        )
+
+    assert actuator.emergency_stop_calls == 1
+
+
 class FlakyHeartbeatPLC(MockPLC):
     """Simulates a transient network blip: heartbeat sends fail for a burst
     of cycles, then start succeeding again — like real S7/TCP jitter."""

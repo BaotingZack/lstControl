@@ -194,8 +194,61 @@ class CoordinateTransform2D:
         mapped = self.crane_to_map_vector3(crane_x, crane_y, 0.0)
         return mapped[0], mapped[1]
 
-    def control_step_to_map(self, crane_step: dict) -> dict:
-        """Convert a control-loop snapshot back to map coordinates for the UI."""
+    # ------------------------------------------------------------------
+    # 抓钩高度 (物理 Z, 地面=0) 与 SLAM map 3D 旋转/平移变换解耦的辅助方法。
+    #
+    # 背景: 当 Z 反馈改用 PLC 抓钩实测高度 (GetActualLiftHeight) 时, 该 Z 值
+    # 是与 SLAM 地图完全独立的物理量, 不应再套用 map↔crane 的 3D 旋转/平移。
+    # 若目标 Z 仍走全量 map_to_crane_position (含 origin_map_z 平移、
+    # roll/pitch 旋转), 会与"反馈直接用抓钩高度"产生参考系不一致——现场
+    # 只要标定了 origin_map_z 或 roll/pitch, 二者就会出现常数级偏差,
+    # 表现为 PD 收敛到一个和真实目标差很远的高度就提前结束 (v=0)。
+    # ------------------------------------------------------------------
+
+    def map_to_crane_target(
+        self,
+        map_x: float,
+        map_y: float,
+        z_value: float,
+        *,
+        z_is_hoist_height: bool = False,
+    ) -> Vector3:
+        """把网页/CLI 输入的目标点转换为 crane 坐标。
+
+        z_is_hoist_height=True 时, z_value 就是抓钩离地高度 (物理量), 直接
+        原样返回, 不参与旋转/平移; X/Y 仍走标定变换 (假定目标与标定原点
+        位于同一地面高度, 与 is_planar 场景下的行为一致)。
+        """
+        if z_is_hoist_height:
+            crane_x, crane_y = self.map_to_crane_point(map_x, map_y)
+            return (crane_x, crane_y, z_value)
+        return self.map_to_crane_position(map_x, map_y, z_value)
+
+    def crane_to_map_display(
+        self,
+        crane_x: float,
+        crane_y: float,
+        z_value: float,
+        *,
+        z_is_hoist_height: bool = False,
+    ) -> Vector3:
+        """把 crane 坐标转换回网页展示用的坐标 (map_to_crane_target 的逆操作)。"""
+        if z_is_hoist_height:
+            map_x, map_y = self.crane_to_map_point(crane_x, crane_y)
+            return (map_x, map_y, z_value)
+        return self.crane_to_map_position(crane_x, crane_y, z_value)
+
+    def control_step_to_map(
+        self,
+        crane_step: dict,
+        *,
+        z_is_hoist_height: bool = False,
+    ) -> dict:
+        """Convert a control-loop snapshot back to map coordinates for the UI.
+
+        z_is_hoist_height=True 时, 位置/速度的 Z 通道保持原样 (抓钩高度,
+        与地图旋转无关)，只转换 X/Y；否则按完整 3D 变换转换 X/Y/Z。
+        """
         map_step = dict(crane_step)
         for x_key, y_key, z_key in (
             ('x', 'y', 'z'),
@@ -203,13 +256,19 @@ class CoordinateTransform2D:
             ('x_measured', 'y_measured', 'z_measured'),
         ):
             if all(key in crane_step for key in (x_key, y_key, z_key)):
-                map_step[x_key], map_step[y_key], map_step[z_key] = (
-                    self.crane_to_map_position(
+                if z_is_hoist_height:
+                    map_step[x_key], map_step[y_key] = self.crane_to_map_point(
                         crane_step[x_key],
                         crane_step[y_key],
-                        crane_step[z_key],
                     )
-                )
+                else:
+                    map_step[x_key], map_step[y_key], map_step[z_key] = (
+                        self.crane_to_map_position(
+                            crane_step[x_key],
+                            crane_step[y_key],
+                            crane_step[z_key],
+                        )
+                    )
             elif x_key in crane_step and y_key in crane_step:
                 map_step[x_key], map_step[y_key] = self.crane_to_map_point(
                     crane_step[x_key],
@@ -225,13 +284,19 @@ class CoordinateTransform2D:
             ('disturbance_x', 'disturbance_y', 'disturbance_z'),
         ):
             if all(key in crane_step for key in (x_key, y_key, z_key)):
-                map_step[x_key], map_step[y_key], map_step[z_key] = (
-                    self.crane_to_map_vector3(
+                if z_is_hoist_height:
+                    map_step[x_key], map_step[y_key] = self.crane_to_map_vector(
                         crane_step[x_key],
                         crane_step[y_key],
-                        crane_step[z_key],
                     )
-                )
+                else:
+                    map_step[x_key], map_step[y_key], map_step[z_key] = (
+                        self.crane_to_map_vector3(
+                            crane_step[x_key],
+                            crane_step[y_key],
+                            crane_step[z_key],
+                        )
+                    )
         return map_step
 
     def as_dict(self) -> dict[str, float]:

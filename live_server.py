@@ -686,8 +686,17 @@ def _parse_control_target(
     body: str,
     config: CraneConfig,
     coordinate_transform: CoordinateTransform2D | None = None,
+    *,
+    z_is_hoist_height: bool = False,
 ) -> tuple[float, float, float]:
-    """Parse a map-frame web target and return validated crane coordinates."""
+    """Parse a map-frame web target and return validated crane coordinates.
+
+    z_is_hoist_height: 当前 Z 反馈是否来自 PLC 抓钩实测高度 (物理量, 与
+    SLAM 地图旋转无关)。为 True 时 target_z 被当作直接输入的抓钩高度,
+    不经过 map↔crane 的 3D 旋转/平移——否则一旦标定了 origin_map_z 或
+    roll/pitch, 目标 Z 与反馈 Z 就会出现参考系不一致的常数级偏差, 导致
+    PD 收敛到一个远离真实目标的高度就提前结束 (v=0)。
+    """
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
@@ -695,15 +704,16 @@ def _parse_control_target(
     if not isinstance(payload, dict):
         raise ValueError('target payload must be a JSON object')
     try:
-        map_target = (
-            float(payload['target_x']),
-            float(payload['target_y']),
-            float(payload['target_z']),
-        )
+        map_target_x = float(payload['target_x'])
+        map_target_y = float(payload['target_y'])
+        map_target_z = float(payload['target_z'])
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f'target_x, target_y, and target_z are required numbers: {exc}') from exc
     transform = coordinate_transform or CoordinateTransform2D.identity()
-    crane_target = transform.map_to_crane_position(*map_target)
+    crane_target = transform.map_to_crane_target(
+        map_target_x, map_target_y, map_target_z,
+        z_is_hoist_height=z_is_hoist_height,
+    )
     return config.validate_target(crane_target)
 
 
@@ -791,6 +801,8 @@ class LiveControlHooks(ControlHooks):
         self,
         control_state: ControlState | None = None,
         coordinate_transform: CoordinateTransform2D | None = None,
+        *,
+        z_is_hoist_height: bool = False,
     ):
         self._queue: queue.Queue = queue.Queue()
         self._event = threading.Event()    # 信号: 队列有新数据, 唤醒 SSE 消费者
@@ -799,10 +811,16 @@ class LiveControlHooks(ControlHooks):
         self._coordinate_transform = (
             coordinate_transform or CoordinateTransform2D.identity()
         )
+        # Z 反馈来自抓钩实测高度时, 展示给前端的 Z 也不应被地图旋转/平移
+        # 改写——否则实时轮询显示的 Z 会和 Apply Target 输入框里的抓钩高度
+        # 不是同一个参考系, 让人误以为"Z 没有用抓钩高度"。
+        self._z_is_hoist_height = z_is_hoist_height
 
     def on_step(self, step_data: dict) -> None:
         """每步: 写 ControlState (供轮询) + 入队 (供 SSE)。"""
-        display_step = self._coordinate_transform.control_step_to_map(step_data)
+        display_step = self._coordinate_transform.control_step_to_map(
+            step_data, z_is_hoist_height=self._z_is_hoist_height,
+        )
         # 写入轮询状态 (主要数据通道)
         if self._control_state is not None:
             self._control_state.set_step(display_step)
@@ -2402,18 +2420,6 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                         json.dumps({'ok': False, 'error': 'Invalid control request size'}).encode('utf-8'))
             return
 
-        try:
-            body = self.rfile.read(content_length).decode('utf-8')
-            target_x, target_y, target_z = _parse_control_target(
-                body,
-                server.config,
-                server.coordinate_transform,
-            )
-        except (UnicodeDecodeError, ValueError) as exc:
-            self._write(400, 'application/json; charset=utf-8',
-                        json.dumps({'ok': False, 'error': f'Invalid target: {exc}'}).encode('utf-8'))
-            return
-
         plc = server.plc
         if plc is None or not plc.check_connection():
             self._write(503, 'application/json; charset=utf-8',
@@ -2422,6 +2428,26 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         if not plc.heartbeat_healthy:
             self._write(503, 'application/json; charset=utf-8',
                         json.dumps({'ok': False, 'error': 'PLC heartbeat is not healthy'}).encode('utf-8'))
+            return
+
+        # Z 反馈是否用抓钩实测高度 (物理量, 与 SLAM 地图旋转无关)。必须在解析
+        # 目标之前就确定这个标志, 否则 target_z 和当前 z_measured 会落在不同
+        # 参考系——一旦标定了 origin_map_z 或 roll/pitch, PD 就会朝着一个和
+        # 真实目标差着常数偏移的高度收敛, 表现为"距离目标很远时就提前结束"。
+        hoist_z = plc.get_lift_height()
+        has_hoist_z = hoist_z is not None and math.isfinite(hoist_z)
+
+        try:
+            body = self.rfile.read(content_length).decode('utf-8')
+            target_x, target_y, target_z = _parse_control_target(
+                body,
+                server.config,
+                server.coordinate_transform,
+                z_is_hoist_height=has_hoist_z,
+            )
+        except (UnicodeDecodeError, ValueError) as exc:
+            self._write(400, 'application/json; charset=utf-8',
+                        json.dumps({'ok': False, 'error': f'Invalid target: {exc}'}).encode('utf-8'))
             return
 
         # Get current position from localization
@@ -2442,18 +2468,17 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             return
         map_pose = dict(pose)
         crane_pose = {**pose, 'x': pose_x, 'y': pose_y, 'z': pose_z}
-        # Z 位置优先取抓钩实测高度 (物理 Z); origin_z=0 且无 roll/pitch 时
-        # map Z 与 crane Z 相同, 故显示与控制共用同一高度值。
-        if server.plc is not None:
-            hoist_z = server.plc.get_lift_height()
-            if hoist_z is not None and math.isfinite(hoist_z):
-                crane_pose['z'] = float(hoist_z)
-                map_pose['z'] = float(hoist_z)
+        # Z 位置优先取抓钩实测高度 (物理 Z); 复用上面已经读取的 hoist_z,
+        # 与 target_z 的解析共用同一次读数、同一参考系。
+        if has_hoist_z:
+            crane_pose['z'] = float(hoist_z)
+            map_pose['z'] = float(hoist_z)
         map_target_x, map_target_y, map_target_z = (
-            server.coordinate_transform.crane_to_map_position(
+            server.coordinate_transform.crane_to_map_display(
                 target_x,
                 target_y,
                 target_z,
+                z_is_hoist_height=has_hoist_z,
             )
         )
 
@@ -2478,6 +2503,7 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         hooks = LiveControlHooks(
             control_state=cs,
             coordinate_transform=server.coordinate_transform,
+            z_is_hoist_height=has_hoist_z,
         )
         server.control_hooks = hooks
 

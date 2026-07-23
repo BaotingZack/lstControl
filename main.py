@@ -217,9 +217,6 @@ def main(argv=None):
 
     # ---- PLC 模式 ----
     if args.plc_ip:
-        target_pos = config.validate_target(
-            coordinate_transform.map_to_crane_position(*map_target_pos)
-        )
         plc = _connect_plc(args)
         try:
             start_ros_bridge()
@@ -233,6 +230,16 @@ def main(argv=None):
             # Z 位置来自抓钩实测高度 (物理 Z), SLAM 只提供 X/Y。
             hoist_z = plc.get_lift_height()
             has_hoist_z = hoist_z is not None and math.isfinite(hoist_z)
+
+            # target_pos 的 Z 必须和 has_hoist_z 用同一个参考系: 有抓钩高度时
+            # --target-z 被当作直接输入的抓钩高度, 不经过 map↔crane 的 3D
+            # 旋转/平移——否则一旦标定了 origin_map_z 或 roll/pitch, 目标 Z
+            # 和反馈 Z 就会出现常数级偏差, 导致 PD 提前收敛到错误高度。
+            target_pos = config.validate_target(
+                coordinate_transform.map_to_crane_target(
+                    *map_target_pos, z_is_hoist_height=has_hoist_z,
+                )
+            )
 
             pose = get_latest_pose()
             if pose is not None:
@@ -253,15 +260,16 @@ def main(argv=None):
             else:
                 print('Warning: /localization_pose timeout, using default initial position')
 
-            fallback_map = coordinate_transform.crane_to_map_position(
+            fallback_map = coordinate_transform.crane_to_map_display(
                 crane0.x.position,
                 crane0.y.position,
                 crane0.z.position,
+                z_is_hoist_height=has_hoist_z,
             )
             initial_pos = (
                 pose['x'] if pose is not None else fallback_map[0],
                 pose['y'] if pose is not None else fallback_map[1],
-                # Z 用抓钩高度 (映射回 map)；crane0.z 已优先取抓钩高度。
+                # Z 用抓钩高度 (物理量, 不经旋转/平移)；crane0.z 已优先取抓钩高度。
                 fallback_map[2],
             )
             ros_source = RosPositionSource(
