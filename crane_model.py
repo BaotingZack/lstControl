@@ -188,10 +188,13 @@ class CraneConfig:
     max_jerk_z: float = 0.1            # [m/s³]
 
     # --- PLC 速度控制器参数 ---
-    kp_pos: float = 0.5                # 位置环比例增益 [1/s]
-    kd_pos: float = 0.35               # 速度阻尼增益, 用于 PD 的 D 项
+    # 现场调参说明 (2026-07): 大车停止阶段速度指令频繁正负切换会导致抓钩
+    # 摆动。降低 Kp、提高 Kd 与 PLC 速度滤波 τ, 并扩大到位死区/防反向保护带,
+    # 让 vx_cmd 更早、更稳地归零, 而不是在 ±小速度之间来回切。
+    kp_pos: float = 0.4                # 位置环比例增益 [1/s] (原 0.5~0.6, 降低以减少近目标急刹)
+    kd_pos: float = 0.55               # 速度阻尼增益, 用于 PD 的 D 项 (原 0.35~0.45, 提高以抑制过冲回摆)
     velocity_filter_tau: float = 0.25  # [s] SLAM/差分速度低通滤波时间常数（仿真模式）
-    velocity_filter_tau_plc: float = 0.50  # [s] PLC 模式速度滤波时间常数（10Hz 需更大 τ 补偿大 dt）
+    velocity_filter_tau_plc: float = 0.80  # [s] PLC 模式速度滤波 (原 0.50, 加大以平滑 D 项、减少换向)
 
     # --- 伺服/扰动模型 ---
     servo_time_constant_xy: float = 0.18   # [s] XY 速度环一阶响应时间常数
@@ -210,12 +213,12 @@ class CraneConfig:
 
     # --- 仿真参数 ---
     dt: float = 0.01                   # [s] 仿真步长
-    arrival_pos_tol: float = 0.01      # [m] 到达判断位置容差
+    arrival_pos_tol: float = 0.025     # [m] 到达判断位置容差; 同时用作 PD 速度指令死区 (原 0.01)
     arrival_vel_tol: float = 0.005     # [m/s] 到达判断速度容差
     # 零速阈值；低于此值且到位时，模拟伺服驱动的 zero-speed 窗口行为。
     velocity_deadband: float = 0.01
-    arrival_capture_pos_tol: float = 0.02  # [m] 到位捕获位置窗口
-    arrival_cmd_tol: float = 0.015         # [m/s] 到位捕获速度指令窗口
+    arrival_capture_pos_tol: float = 0.04  # [m] 到位捕获位置窗口 (原 0.02, 扩大以更早软着陆)
+    arrival_cmd_tol: float = 0.025         # [m/s] 到位捕获速度指令窗口 (原 0.015)
     # 到位判定去抖: 需连续 N 个控制周期都满足到位条件才锁轴。防止单帧定位
     # 跳变(异常值)恰好落在目标附近就把轴永久锁死, 表现为"离目标还差十几厘米
     # 就停下、PD 结束"。10Hz 下 3 帧≈0.3s。设为 1 即退化为原单帧判定。
@@ -234,7 +237,7 @@ class CraneConfig:
     max_consecutive_actuator_errors: int = 10
     # 防反向抽动保护带 [m]: 在尚未越过目标且 |误差| 小于该值时，禁止 PD 给出
     # 远离目标方向的速度指令（速度伺服型行车"刹车"=指令归零而非反向脉冲）。
-    reverse_guard_tol: float = 0.05
+    reverse_guard_tol: float = 0.10    # 原 0.05; 扩大以减少目标附近反向脉冲→抓钩摆动
 
     # --- 可选机械工作区 ---
     # 现场行程因设备而异，X/Y 不提供虚假的默认范围；PLC 部署时应显式配置。

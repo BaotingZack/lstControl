@@ -147,8 +147,6 @@ def _config_from_args(args) -> CraneConfig:
     return CraneConfig(
         max_velocity_xy=0.2,
         max_velocity_z=0.2,
-        kp_pos=0.6,
-        kd_pos=0.45,
         dt=0.01,
         workspace_x_bounds=_workspace_bounds_from_args(args, 'x'),
         workspace_y_bounds=_workspace_bounds_from_args(args, 'y'),
