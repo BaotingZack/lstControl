@@ -26,6 +26,14 @@
 
 详细说明见下文「控制律」「Z 轴特殊处理」「常见问题」与「参数调节」各节。
 
+### 更新历史
+
+| 日期 | Commit | 主要改动 |
+|------|--------|----------|
+| 2026-07-23 | [`4aa6314`](https://github.com/BaotingZack/lstControl/commit/4aa6314) | **抓钩高度读数过滤**：`_LiftHeightSanitizer` 过滤 S7 抖动期间的 0/垂圾值/不可能跳变；README 补充 `libsscarctrl.so` 心跳超时日志含义解读 |
+| 2026-07-23 | [`f5e14e3`](https://github.com/BaotingZack/lstControl/commit/f5e14e3) | **目标 Z 参考系一致性**：`map_to_crane_target(z_is_hoist_height=True)` 让目标/显示/反馈 Z 统一为抓钩物理高度；**执行器瞬时故障容错** `max_consecutive_actuator_errors` |
+| 2026-07-23 | [`a704d41`](https://github.com/BaotingZack/lstControl/commit/a704d41) | **PD 稳定性**：到位去抖、定位坏帧容忍、心跳自愈；**Z 轴**统一抓钩高度反馈 + 绝对高度伺服单调逼近；方向修正、0.2 m/s 限速、UI 轨迹冻结、安全高度下限 |
+
 ## 快速运行
 
 ### 1. 准备 Python 环境
