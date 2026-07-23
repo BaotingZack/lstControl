@@ -10,6 +10,7 @@ import main
 from crane_model import ControlHooks, CraneConfig, CraneState, run_pd_control
 from live_server import ControlState, CraneLiveServer
 from plc_interface import MockPLC, PlcActuator, create_plc
+from plc_interface import _LiftHeightSanitizer
 
 
 class RecordingPLC(MockPLC):
@@ -745,3 +746,95 @@ def test_plc_connection_failure_stops_startup(monkeypatch):
 
     assert plc.heartbeat_started is False
     assert plc.disconnected is True
+
+
+# ---------------------------------------------------------------------------
+# _LiftHeightSanitizer — 过滤 GetActualLiftHeight() 的异常读数
+# ---------------------------------------------------------------------------
+
+def test_lift_height_sanitizer_passes_through_stable_readings():
+    """连续稳定的合理读数应原样通过, 不被误判。"""
+    s = _LiftHeightSanitizer()
+    t = 1000.0
+    for raw in (1.60, 1.61, 1.59, 1.62):
+        value, reason = s.sanitize(raw, now=t)
+        assert value == pytest.approx(raw)
+        assert reason is None
+        t += 0.1
+    assert s.bad_streak == 0
+
+
+def test_lift_height_sanitizer_rejects_near_zero_sentinel_and_holds_last_good():
+    """复现现场日志: 心跳/连接抖动期间 GetActualLiftHeight() 返回 0 (或极小
+    的 denormalized 垂圾值) 作兜底, 必须被丢弃并沿用上一次可信读数, 而不是
+    让 Z 出现"跳到 0 再跳回正确高度"的抽动。"""
+    s = _LiftHeightSanitizer()
+    value, reason = s.sanitize(1.59695, now=0.0)
+    assert value == pytest.approx(1.59695)
+    assert reason is None
+
+    # 0 作兜底值
+    value, reason = s.sanitize(0.0, now=0.1)
+    assert value == pytest.approx(1.59695)
+    assert reason == 'near-zero sentinel'
+    assert s.bad_streak == 1
+
+    # 形如日志中 4.49863e-312 的 denormalized 垂圾值, 同样被视为"近零异常"。
+    value, reason = s.sanitize(4.49863e-312, now=0.2)
+    assert value == pytest.approx(1.59695)
+    assert reason == 'near-zero sentinel'
+    assert s.bad_streak == 2
+
+    # 恢复正常读数后立即采纳, 计数器清零。
+    value, reason = s.sanitize(1.59695, now=0.3)
+    assert value == pytest.approx(1.59695)
+    assert reason is None
+    assert s.bad_streak == 0
+
+
+def test_lift_height_sanitizer_rejects_implausible_jump_and_nan():
+    s = _LiftHeightSanitizer()
+    s.sanitize(1.60, now=0.0)
+
+    # 单个 ~0.1s 周期内不可能出现的巨大跳变 (非近零, 走跳变分支)。
+    value, reason = s.sanitize(5.0, now=0.1)
+    assert value == pytest.approx(1.60)
+    assert reason == 'implausible jump'
+
+    # NaN/Inf 一律拒绝。
+    value, reason = s.sanitize(math.nan, now=0.2)
+    assert value == pytest.approx(1.60)
+    assert reason == 'non-finite'
+    value, reason = s.sanitize(math.inf, now=0.3)
+    assert value == pytest.approx(1.60)
+    assert reason == 'non-finite'
+
+
+def test_lift_height_sanitizer_gives_up_cached_value_after_stale_timeout():
+    """异常读数容忍窗口不是无限的: 持续异常超过 STALE_TIMEOUT 后不再假装
+    缓存值可信, 返回 None 交给上层 (通常回退 SLAM Z 或判定不可用)。"""
+    s = _LiftHeightSanitizer()
+    s.sanitize(1.60, now=0.0)
+
+    value, reason = s.sanitize(0.0, now=1.0)
+    assert value == pytest.approx(1.60)  # 仍在容忍窗口内
+    assert reason == 'near-zero sentinel'
+
+    value, reason = s.sanitize(0.0, now=1.0 + _LiftHeightSanitizer.STALE_TIMEOUT + 0.1)
+    assert value is None  # 超出容忍窗口, 放弃缓存值
+    assert reason == 'near-zero sentinel'
+
+
+def test_lift_height_sanitizer_reset_clears_cached_state():
+    s = _LiftHeightSanitizer()
+    s.sanitize(1.60, now=0.0)
+    s.sanitize(0.0, now=0.1)
+    assert s.bad_streak == 1
+
+    s.reset()
+
+    # 重置后没有缓存值, 任意有限读数都直接采纳 (不会被当成"近零异常"拒绝)。
+    value, reason = s.sanitize(0.0, now=0.2)
+    assert value == pytest.approx(0.0)
+    assert reason is None
+    assert s.bad_streak == 0

@@ -18,10 +18,79 @@ PLC API reference (from ss_car_control.h / demo.cpp):
 from __future__ import annotations
 
 import ctypes
+import math
 import threading
 import time
 
 from crane_model import CraneState
+
+
+# ---------------------------------------------------------------------------
+# GetActualLiftHeight() 异常读数过滤
+# ---------------------------------------------------------------------------
+
+class _LiftHeightSanitizer:
+    """过滤 GetActualLiftHeight() 的异常读数, 避免抓钩高度反馈"跳到 0/垂圾值
+    再跳回正确高度"的抽动, 污染 D 项差分速度或误触发到位判定。
+
+    现场日志显示: 每当底层闭源库打印
+      "CheckPlcConnection: Heartbeat timeout/difference too large"
+    (S7 连接瞬时抖动) 时, 紧跟着的 GetActualLiftHeight() 读数经常是恰好 0,
+    或形如 4.49863e-312 的 denormalized 垂圾值 (典型的连接抖动期间兜底值/
+    竞态读取残留)。这是闭源库内部行为, 无法在 Python 侧修复库本身, 只能
+    在读数进入控制/展示之前过滤掉——识别为异常时沿用上一次可信读数;
+    若异常持续超过容忍窗口才放弃缓存 (返回 None, 交给上层回退 SLAM Z
+    或判定为真实故障), 避免无限期相信一个已经过期的缓存值。
+    """
+
+    _ZERO_SENTINEL_EPS = 0.05    # [m] 判定"近零"为异常兜底值的门限 (低于安全下限 0.5m 很多)
+    _MAX_RATE = 1.0              # [m/s] 认为物理上合理的最大高度变化速率 (含较大余量)
+    _JUMP_MARGIN = 0.10          # [m] 跳变判定的固定余量, 补偿调用间隔抖动
+    STALE_TIMEOUT = 2.0          # [s] 缓存值信任窗口, 与定位反馈超时保持一致量级
+
+    def __init__(self) -> None:
+        self._last_good: float | None = None
+        self._last_good_time: float = 0.0
+        self.bad_streak = 0
+
+    def reset(self) -> None:
+        """PLC (重新) 连接后调用: 旧缓存值可能已过期, 清空重新累积。"""
+        self._last_good = None
+        self._last_good_time = 0.0
+        self.bad_streak = 0
+
+    def sanitize(self, raw: float, now: float | None = None) -> tuple[float | None, str | None]:
+        """返回 (采纳的高度或 None, 拒绝原因或 None)。"""
+        now = time.time() if now is None else now
+        reason = self._reject_reason(raw, now)
+        if reason is None:
+            self._last_good = raw
+            self._last_good_time = now
+            self.bad_streak = 0
+            return raw, None
+
+        self.bad_streak += 1
+        if self._last_good is not None and (now - self._last_good_time) < self.STALE_TIMEOUT:
+            return self._last_good, reason
+        return None, reason
+
+    def _reject_reason(self, raw: float, now: float) -> str | None:
+        if not math.isfinite(raw):
+            return 'non-finite'
+        if (
+            self._last_good is not None
+            and abs(raw) < self._ZERO_SENTINEL_EPS
+            and abs(self._last_good) >= self._ZERO_SENTINEL_EPS
+        ):
+            # 库在连接抖动期间常返回 0 (或极小的 denormalized 垂圾值) 作兜底,
+            # 而不是保持上一次真实读数。
+            return 'near-zero sentinel'
+        if self._last_good is not None:
+            dt = max(now - self._last_good_time, 0.01)
+            max_jump = self._MAX_RATE * dt + self._JUMP_MARGIN
+            if abs(raw - self._last_good) > max_jump:
+                return 'implausible jump'
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +316,10 @@ class RealPLC(PLCInterface):
         self.last_vy: float = 0.0          # last-sent Y velocity
         self.last_hz: float = 0.0          # last-sent Z height
         self.last_vz: float = 0.0          # last-sent Z velocity
+        # GetActualLiftHeight() 异常读数过滤 (见 _LiftHeightSanitizer 说明)。
+        self._lift_height_lock = threading.Lock()
+        self._lift_height_sanitizer = _LiftHeightSanitizer()
+        self._last_lift_height_warn = 0.0
         self._lib.connect_to_plc.argtypes = [ctypes.c_char_p]
         self._lib.connect_to_plc.restype = ctypes.c_int
 
@@ -297,6 +370,9 @@ class RealPLC(PLCInterface):
             print(f'[PLC] connect_to_plc({ip}) FAILED, ret={ret}')
         else:
             print(f'[PLC] connect_to_plc({ip}) OK')
+        # (重新) 连接后旧的抓钩高度缓存值可能已过期, 清空重新累积。
+        with self._lift_height_lock:
+            self._lift_height_sanitizer.reset()
         return ret
 
     def disconnect(self) -> None:
@@ -366,7 +442,29 @@ class RealPLC(PLCInterface):
     # -- readback -----------------------------------------------------------
 
     def get_lift_height(self) -> float | None:
-        return self._lib.GetActualLiftHeight()
+        """读取抓钩实测高度, 过滤连接抖动期间的 0/垂圾值/不可能跳变 (见
+        _LiftHeightSanitizer)。持续异常超过其容忍窗口时返回 None, 交给
+        上层判定 (通常回退 SLAM Z 或视为定位不可用)。"""
+        raw = self._lib.GetActualLiftHeight()
+        with self._lift_height_lock:
+            accepted, reason = self._lift_height_sanitizer.sanitize(raw)
+        if reason is not None:
+            # 异常读数通常连续出现 (整段抖动期间), 节流打印避免刷屏。
+            now = time.time()
+            if now - self._last_lift_height_warn > 1.0:
+                if accepted is not None:
+                    print(
+                        f'[PLC] GetActualLiftHeight 异常读数已丢弃 '
+                        f'(raw={raw!r}, {reason}), 沿用上次读数 {accepted:.3f}m'
+                    )
+                else:
+                    print(
+                        f'[PLC] GetActualLiftHeight 持续异常超过 '
+                        f'{_LiftHeightSanitizer.STALE_TIMEOUT:.0f}s (raw={raw!r}, {reason}), '
+                        f'放弃缓存值'
+                    )
+                self._last_lift_height_warn = now
+        return accepted
 
     # -- safety -------------------------------------------------------------
 

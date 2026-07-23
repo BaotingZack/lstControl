@@ -22,6 +22,7 @@
 | **UI** | PLC 模式下 `/localization/stream` 的 Z 也显示抓钩高度；PD **完成后冻结轨迹**（起点→目标），不再被实时定位 30 帧滑动窗口冲掉 |
 | **目标 Z 参考系一致性** | 修复 Apply Target 输入的目标 Z 仍走 map↔crane **3D 旋转/平移**、而反馈 Z 已改用抓钩实测高度（不旋转/不平移）导致的参考系错位：一旦标定了 `origin_map_z` 或 roll/pitch，目标与反馈就会出现常数级偏差，PD 会朝错误高度收敛并在**远离真实目标**时就提前结束（v=0）。现在 Z 反馈来自抓钩高度时，目标 Z、实时轮询显示 Z 与控制反馈 Z 统一为同一物理量，不再经过旋转/平移 |
 | **执行器瞬时故障容错** | `actuator.apply()` 因 PLC 连接/心跳瞬时抖动抛出的 `RuntimeError` 不再直接终止整段作业；预算内（`max_consecutive_actuator_errors`，默认 10 次≈1s）跳过本周期继续控制，超出预算才视为真实故障并安全停车 |
+| **抓钩高度读数过滤** | `GetActualLiftHeight()` 在 PLC 连接抖动期间会返回 0 或 `4.49863e-312` 一类的 denormalized 垂圾值，导致 Z 出现"跳到 0 再跳回正确高度"的抽动；新增 `_LiftHeightSanitizer` 在 `RealPLC.get_lift_height()` 内过滤此类近零/不可能跳变/非数值读数，异常时沿用上一次可信读数，持续异常超过 2s 才放弃缓存值 |
 
 详细说明见下文「控制律」「Z 轴特殊处理」「常见问题」与「参数调节」各节。
 
@@ -178,6 +179,14 @@ python3 main.py \
   - *瞬时心跳丢失*（PLC 通信短暂抖动）：心跳失败连续达到阈值（默认 10 次≈1s）会短暂标记不健康、暂停当前控制运行，但心跳线程会持续重试并在恢复后自动重新置为健康——无需重启进程即可重新 Apply Target。
   - *执行器瞬时不可用*（`actuator.apply()` 因连接/心跳抖动抛异常）：预算内（`max_consecutive_actuator_errors`，默认 10 次≈1s）跳过本周期继续控制，不再让一次瞬时失败直接终止整段作业；超出预算才视为真实故障并安全停车。
   - *定位断流 ≥2s*、*控制超时（10 分钟）*、*PLC 断线*：这些仍视为真实故障，按设计中止并安全停车，检查 ROS 话题、网络与 PLC 连接。
+- **Z 轴数值抽动：偶尔跳到 0，然后又跳回正确高度**：`GetActualLiftHeight()` 在底层 S7 连接短暂抖动期间会返回 0，或形如 `4.49863e-312` 的 denormalized 垂圾值，而不是保持上一次真实读数——这是闭源库 `libsscarctrl.so` 自身的行为，无法从 Python 侧修改库本身。现已在 `RealPLC.get_lift_height()` 内新增 `_LiftHeightSanitizer` 过滤：识别“近零骤降”“非数值 (NaN/Inf)”“单周期内物理上不可能的跳变”三类异常读数，异常时沿用上一次可信高度，仅当异常持续超过 2s 才放弃缓存值（返回 `None`，交给上层回退 SLAM Z 或判定为反馈不可用）。UI 显示、目标预填、PD 反馈都从同一个 `get_lift_height()` 读取，因此这一处过滤对全链路生效。
+- **终端打印 `SendPlcHeartbeat: N` / `CheckPlcConnection: Heartbeat timeout!...` / `CheckPlcConnection: Heartbeat difference too large!...` / `Actual Lift Height: ...`**：这些**不是我们 Python 代码打印的**，而是闭源库 `libsscarctrl.so` 内部在 `SendPlcHeartbeat()` / `CheckPlcConnection()` / `GetActualLiftHeight()` 被调用时自带的调试输出（`strings libsscarctrl.so` 可确认）。含义：
+  - `SendPlcHeartbeat: N`：库内部心跳发送计数器，每次调用自增，正常现象，不代表异常。
+  - `CheckPlcConnection: Heartbeat timeout! No update for N consecutive checks.` / `Heartbeat difference too large! Diff=... (max allowed=10)`：库内部维护的心跳**回读/校验**长时间没有被确认更新，或与参考值差异过大——**这确实反映了一次真实的 S7 通信异常/抖动**，不是无意义的噪声；但它是否致命取决于持续时长：
+    - 若只是偶发几次（对应我们侧的心跳自愈 + `max_consecutive_actuator_errors` 容忍窗口，约 1s），控制会自动跳过继续，不需要人工干预。
+    - 若像日志里那样连续 700+ 次没有更新（10Hz 下约 70s 以上），说明通信链路已经处于持续不稳定状态（网络、交换机、PLC 侧 CPU 负载或 S7 连接数超限都可能是原因），仅靠软件容忍无法根治，需要检查物理网络/PLC 端。
+  - `Actual Lift Height: X`：`GetActualLiftHeight()` 被调用时库自带的打印，紧跟在 `Heartbeat timeout/difference too large` 之后出现 `X=0` 或 denormalized 垂圾值并非偶然——正是本节上一条要修复的现象，现已在 Python 侧过滤。
+  - 这些打印刷屏本身不会影响功能，但若频繁出现建议排查现场网络稳定性；无法通过修改闭源库消除这些打印。
 
 ---
 
@@ -445,6 +454,8 @@ run_pd_control(source, actuator, target):
 PLC 的 `liftctrl` 接收**绝对高度** (m)，而非速度。与 X/Y 速度伺服不同，Z 由 PLC 内部位置环跟随下发的高度设定值。
 
 **反馈**：`RosPositionSource` 通过 `GetActualLiftHeight()` 提供抓钩实测高度作为 `z_measured`；UI 的 `/localization/stream` 在 PLC 模式下同样用抓钩高度覆盖 SLAM Map Z，保证显示、预填目标与 PD 反馈同一参考系。
+
+**读数过滤**：`libsscarctrl.so` 在 S7 连接抖动期间会让 `GetActualLiftHeight()` 返回 0 或 denormalized 垂圾值（而不是保持上次真实值）。`RealPLC.get_lift_height()` 内置 `_LiftHeightSanitizer`，对每次原始读数做三项检查——非数值 (NaN/Inf)、相对上次读数的“近零骤降”、单周期内物理上不可能的跳变——命中任意一项即丢弃该帧、沿用上一次可信高度；仅当异常连续超过 2s（`_LiftHeightSanitizer.STALE_TIMEOUT`）才放弃缓存值返回 `None`。这是唯一的读数入口，UI 展示、目标预填、`RosPositionSource`、`PD` 反馈全部共用，因此过滤对全链路生效，不会出现"跳到 0 再跳回正确高度"的抽动。
 
 **目标解析同样要跳过地图旋转/平移**：抓钩高度是与 SLAM 地图完全独立的物理量（地面 = 0），不该套用 map↔crane 的 3D 变换。`_handle_start_control`（网页 Apply Target）与 `main.py` 的命令行 PLC 分支在检测到抓钩高度可用时，会用 `CoordinateTransform2D.map_to_crane_target(..., z_is_hoist_height=True)` 解析目标——X/Y 仍走标定变换，Z 直接取网页/CLI 输入的抓钩高度，不经过 `origin_map_z` 平移或 roll/pitch 旋转；展示回网页同理使用 `crane_to_map_display(...)` 反向跳过 Z。控制过程中实时轮询显示的 Z（`LiveControlHooks`/`control_step_to_map`）也用同一开关保持不旋转。**若目标 Z 仍按旧逻辑走完整 3D 变换，一旦标定了 `origin_map_z` 或 roll/pitch，目标与反馈就会出现常数级偏差，PD 会朝错误高度收敛、在离真实目标很远时就提前结束。**
 
