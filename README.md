@@ -31,7 +31,7 @@
 
 | 日期 | Commit | 主要改动 |
 |------|--------|----------|
-| 2026-07-23 | [`18f404a`](https://github.com/BaotingZack/lstControl/commit/18f404a) | **停止阶段抗抖动调参**：`kp_pos` 0.4、`kd_pos` 0.55、`velocity_filter_tau_plc` 0.80 s；扩大 `arrival_pos_tol`(2.5 cm)、`reverse_guard_tol`(10 cm)、到位捕获窗口；`main.py` 不再覆盖 Kp/Kd |
+| 2026-07-23 | [`8d7ba19`](https://github.com/BaotingZack/lstControl/commit/8d7ba19) | **停止阶段抗抖动调参**：`kp_pos` 0.4、`kd_pos` 0.55、`velocity_filter_tau_plc` 0.80 s；扩大 `arrival_pos_tol`(2.5 cm)、`reverse_guard_tol`(10 cm)、到位捕获窗口；`main.py` 不再覆盖 Kp/Kd |
 | 2026-07-23 | [`9af12f3`](https://github.com/BaotingZack/lstControl/commit/9af12f3) | **README 更新历史**：汇总近期三次功能 commit |
 | 2026-07-23 | [`4aa6314`](https://github.com/BaotingZack/lstControl/commit/4aa6314) | **抓钩高度读数过滤**：`_LiftHeightSanitizer` 过滤 S7 抖动期间的 0/垂圾值/不可能跳变；README 补充 `libsscarctrl.so` 心跳超时日志含义解读 |
 | 2026-07-23 | [`f5e14e3`](https://github.com/BaotingZack/lstControl/commit/f5e14e3) | **目标 Z 参考系一致性**：`map_to_crane_target(z_is_hoist_height=True)` 让目标/显示/反馈 Z 统一为抓钩物理高度；**执行器瞬时故障容错** `max_consecutive_actuator_errors` |
