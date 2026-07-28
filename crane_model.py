@@ -211,6 +211,13 @@ class CraneConfig:
     grab_delay: float = 0.5            # [s] 抓取延时
     release_delay: float = 0.5         # [s] 释放延时
 
+    # --- 作业调度安全高度 (绝对高度, 相对于地面) ---
+    approach_safe_z: float = 1.0       # [m] 取货阶段安全高度 (Z 轴)
+    transport_safe_z: float = 1.5      # [m] 运输阶段安全高度 (Z 轴)
+    return_safe_z: float = 1.6         # [m] 作业完成后 Z 归位高度
+    stabilize_delay: float = 1.0       # [s] XY 到达后抓钩稳定等待
+    gripper_safety_delay: float = 0.5  # [s] 抓钩动作确认后等待
+
     # --- 仿真参数 ---
     dt: float = 0.01                   # [s] 仿真步长
     arrival_pos_tol: float = 0.025     # [m] 到达判断位置容差; 同时用作 PD 速度指令死区 (原 0.01)
@@ -270,6 +277,11 @@ class CraneConfig:
             'safe_height_offset': self.safe_height_offset,
             'grab_delay': self.grab_delay,
             'release_delay': self.release_delay,
+            'approach_safe_z': self.approach_safe_z,
+            'transport_safe_z': self.transport_safe_z,
+            'return_safe_z': self.return_safe_z,
+            'stabilize_delay': self.stabilize_delay,
+            'gripper_safety_delay': self.gripper_safety_delay,
             'arrival_pos_tol': self.arrival_pos_tol,
             'arrival_vel_tol': self.arrival_vel_tol,
             'velocity_deadband': self.velocity_deadband,

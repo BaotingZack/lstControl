@@ -50,6 +50,62 @@ def get_latest_pose() -> dict[str, Any] | None:
         return dict(_latest_pose)
 
 
+# ---- gripper status from /crane/cmd_vel/anguler (thread-safe) ----
+
+_latest_gripper: dict[str, Any] | None = None
+_gripper_lock = threading.Lock()
+
+# Gripper status constants decoded from angular.x:
+#   -1 = gripper open/released (开启/释放)
+#    1 = gripper closed/clamped (关闭/夹紧)
+GRIPPER_OPEN = -1
+GRIPPER_CLOSED = 1
+
+
+def _gripper_callback(msg: Any) -> None:
+    """Store latest gripper status from /crane/cmd_vel/anguler.
+
+    Subscribes to geometry_msgs/Twist. The gripper state is in angular.x:
+      angular.x = -1  → gripper released (open / 开启)
+      angular.x =  1  → gripper clamped (closed / 关闭)
+    """
+    global _latest_gripper
+    with _gripper_lock:
+        _latest_gripper = {
+            'angular_x': msg.angular.x,
+            'angular_y': msg.angular.y,
+            'angular_z': msg.angular.z,
+        }
+
+
+def get_gripper_status() -> dict[str, Any] | None:
+    """Return a copy of the latest gripper status, or None if no data yet.
+
+    Returns:
+        dict with 'angular_x' (-1=open, 1=closed) and other fields, or None.
+    """
+    with _gripper_lock:
+        if _latest_gripper is None:
+            return None
+        return dict(_latest_gripper)
+
+
+def is_gripper_clamped() -> bool | None:
+    """Convenience: True if gripper is clamped (closed), False if released (open),
+    None if no data available or value is ambiguous."""
+    status = get_gripper_status()
+    if status is None:
+        return None
+    ax = status.get('angular_x')
+    if ax is None:
+        return None
+    if ax >= 0.5:
+        return True   # 1 = closed/clamped
+    if ax <= -0.5:
+        return False  # -1 = open/released
+    return None  # ambiguous value
+
+
 def _ros_spin() -> None:
     """Blocking ROS 1 spin loop — runs in a daemon thread."""
     try:
@@ -64,6 +120,12 @@ def _ros_spin() -> None:
         print('[ros_bridge] nav_msgs not available — localization data will be empty')
         return
 
+    try:
+        from geometry_msgs.msg import Twist
+    except ImportError:
+        print('[ros_bridge] geometry_msgs not available — gripper status will be unavailable')
+        Twist = None
+
     # Initialize ROS node (safe if already initialized in-process)
     try:
         rospy.init_node('lst_control_localization', anonymous=True, disable_signals=True)
@@ -75,6 +137,15 @@ def _ros_spin() -> None:
 
     rospy.Subscriber('/localization_pose', Odometry, _odom_callback)
     print('[ros_bridge] Subscribed to /localization_pose (nav_msgs/Odometry)')
+
+    if Twist is not None:
+        try:
+            rospy.Subscriber('/crane/cmd_vel/anguler', Twist, _gripper_callback)
+            print('[ros_bridge] Subscribed to /crane/cmd_vel/anguler (geometry_msgs/Twist)')
+        except Exception as exc:
+            print(f'[ros_bridge] Failed to subscribe to /crane/cmd_vel/anguler: {exc}')
+            print('[ros_bridge] Gripper status via ROS will be unavailable')
+
     rospy.spin()
 
 

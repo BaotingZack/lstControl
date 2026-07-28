@@ -39,6 +39,7 @@ from crane_model import (
     PositionFeedbackTimeout,
     run_pd_control,
 )
+from operation_scheduler import OperationScheduler, OperationPhase
 from ros_bridge import get_latest_pose, RosPositionSource
 from plc_interface import PlcActuator
 from visualizer import CraneVisualizer
@@ -717,6 +718,47 @@ def _parse_control_target(
     return config.validate_target(crane_target)
 
 
+def _parse_operation_positions(
+    body: str,
+    config: CraneConfig,
+    coordinate_transform: CoordinateTransform2D | None = None,
+    *,
+    z_is_hoist_height: bool = False,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Parse map-frame start and target positions from a browser request.
+
+    Returns ((start_x, start_y, start_z), (target_x, target_y, target_z))
+    in validated crane coordinates.
+    """
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'invalid JSON: {exc.msg}') from exc
+    if not isinstance(payload, dict):
+        raise ValueError('payload must be a JSON object')
+
+    transform = coordinate_transform or CoordinateTransform2D.identity()
+
+    def _parse_pos(key_prefix: str) -> tuple[float, float, float]:
+        try:
+            x = float(payload[f'{key_prefix}_x'])
+            y = float(payload[f'{key_prefix}_y'])
+            z = float(payload[f'{key_prefix}_z'])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f'{key_prefix}_x, {key_prefix}_y, and {key_prefix}_z '
+                f'are required numbers: {exc}'
+            ) from exc
+        crane_pos = transform.map_to_crane_target(
+            x, y, z, z_is_hoist_height=z_is_hoist_height,
+        )
+        return config.validate_target(crane_pos)
+
+    start_pos = _parse_pos('start')
+    target_pos = _parse_pos('target')
+    return start_pos, target_pos
+
+
 def _point_tuple(point: tuple[float, float, float]) -> dict[str, float]:
     return {'x': point[0], 'y': point[1], 'z': point[2]}
 
@@ -1293,6 +1335,30 @@ def render_live_html(plc_mode: bool = False) -> str:
       transition: background 0.15s;
     }
     .btn-reset:hover { background: #283b4d; }
+    /* ---- Job points dropdown ---- */
+    .jp-row { display: flex; align-items: center; gap: 5px; margin-bottom: 10px; }
+    .jp-sel {
+      flex: 1; min-width: 0; padding: 6px 6px;
+      border: 1px solid var(--line); border-radius: 4px;
+      background: #0f161d; color: var(--text); font: inherit; font-size: 11px;
+      cursor: pointer;
+    }
+    .jp-sel:focus { outline: 1px solid var(--blue); border-color: var(--blue); }
+    .jp-sel option { background: #17212b; color: var(--text); padding: 4px; }
+    .jp-sel option:checked { color: var(--amber); }
+    .jp-sel.placeholder { color: var(--muted); }
+    .jp-btn {
+      padding: 4px 8px; border: 1px solid var(--line); border-radius: 3px;
+      background: transparent; color: var(--muted); font: inherit; font-size: 10px;
+      font-weight: 600; cursor: pointer; white-space: nowrap; transition: color 0.15s, border-color 0.15s;
+    }
+    .jp-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+    .jp-btn-add { border-color: var(--amber); color: var(--amber); }
+    .jp-btn-add:hover { border-color: var(--amber); color: #ffc263; background: rgba(240,168,59,0.08); }
+    .jp-btn-del { color: #5a4a4a; }
+    .jp-btn-del:hover { border-color: var(--red); color: var(--red); }
+    .jp-btn-del:disabled { opacity: 0.3; cursor: default; border-color: var(--line); color: var(--muted); }
+    .jp-label { font-size: 11px; color: var(--muted); white-space: nowrap; flex-shrink: 0; }
     @media (max-width: 980px) {
       .shell { grid-template-columns: 1fr; }
       canvas { min-height: 520px; }
@@ -1332,13 +1398,29 @@ def render_live_html(plc_mode: bool = False) -> str:
         </div>
       </section>
       <section class="command">
-        <div class="command-title">Target Command</div>
-        <div class="target-grid">
-          <label>X <input id="targetX" type="number" step="0.1"></label>
-          <label>Y <input id="targetY" type="number" step="0.1"></label>
-          <label>Z <input id="targetZ" type="number" step="0.1"></label>
+        <div class="jp-row">
+          <span class="jp-label">作业点库</span>
+          <select class="jp-sel" id="jpSel">
+            <option value="">(空)</option>
+          </select>
+          <button class="jp-btn" id="jpToPick" type="button" title="填入起始位置">取</button>
+          <button class="jp-btn" id="jpToPlace" type="button" title="填入卸货位置">卸</button>
+          <button class="jp-btn jp-btn-add" id="jpAdd" type="button" title="保存当前起始位置为作业点">+</button>
+          <button class="jp-btn jp-btn-del" id="jpDel" type="button" disabled title="删除选中作业点">×</button>
         </div>
-        <button class="apply-target" id="applyTarget" type="button">Apply Target</button>
+        <div class="command-title">Pick Position / 起始位置</div>
+        <div class="target-grid" style="position:relative" id="pickGroup">
+          <label>X <input id="startX" type="number" step="0.01" autocomplete="off"></label>
+          <label>Y <input id="startY" type="number" step="0.01" autocomplete="off"></label>
+          <label>Z <input id="startZ" type="number" step="0.01" autocomplete="off"></label>
+        </div>
+        <div class="command-title" style="margin-top:12px;">Place Position / 卸货位置</div>
+        <div class="target-grid" style="position:relative" id="placeGroup">
+          <label>X <input id="targetX" type="number" step="0.01" autocomplete="off"></label>
+          <label>Y <input id="targetY" type="number" step="0.01" autocomplete="off"></label>
+          <label>Z <input id="targetZ" type="number" step="0.01" autocomplete="off"></label>
+        </div>
+        <button class="apply-target" id="applyTarget" type="button">Start Operation / 开始作业</button>
       </section>
       <section class="bottom-panel">
         <nav class="tab-bar">
@@ -1427,6 +1509,9 @@ def render_live_html(plc_mode: bool = False) -> str:
       coordVx: document.getElementById('coordVx'),
       coordVy: document.getElementById('coordVy'),
       coordVz: document.getElementById('coordVz'),
+      startX: document.getElementById('startX'),
+      startY: document.getElementById('startY'),
+      startZ: document.getElementById('startZ'),
       targetX: document.getElementById('targetX'),
       targetY: document.getElementById('targetY'),
       targetZ: document.getElementById('targetZ'),
@@ -1454,7 +1539,90 @@ def render_live_html(plc_mode: bool = False) -> str:
       hbStatusText: document.getElementById('hbStatusText'),
       btnStop: document.getElementById('btnStop'),
       btnReset: document.getElementById('btnReset'),
+      jpSel: document.getElementById('jpSel'),
+      jpToPick: document.getElementById('jpToPick'),
+      jpToPlace: document.getElementById('jpToPlace'),
+      jpAdd: document.getElementById('jpAdd'),
+      jpDel: document.getElementById('jpDel'),
     };
+
+    /* ================================================================
+       Job points — single compact dropdown row
+       ================================================================ */
+    const JP_KEY = 'crane_job_points', JP_MAX = 20;
+
+    function _jpLoad() { try { return JSON.parse(localStorage.getItem(JP_KEY)) || []; } catch(_) { return []; } }
+    function _jpSave(pts) { try { localStorage.setItem(JP_KEY, JSON.stringify(pts)); } catch(_) {} }
+    function _fmt2(v) { return Number(v).toFixed(2); }
+
+    function _jpRender() {
+      var pts = _jpLoad(), sel = els.jpSel;
+      sel.innerHTML = pts.length
+        ? '<option value="">(' + pts.length + ' pts)</option>'
+          + pts.map(function(p, i) {
+              return '<option value="' + i + '">' + p.n + '  (' + _fmt2(p.x) + ', ' + _fmt2(p.y) + ', ' + _fmt2(p.z) + ')</option>';
+            }).join('')
+        : '<option value="">(空)</option>';
+      els.jpDel.disabled = true;
+    }
+
+    /* Fill pick position */
+    function _jpFillPick() {
+      var idx = parseInt(els.jpSel.value); if (isNaN(idx)) return;
+      var p = _jpLoad()[idx]; if (!p) return;
+      els.startX.value = _fmt2(p.x); els.startY.value = _fmt2(p.y); els.startZ.value = _fmt2(p.z);
+    }
+
+    /* Fill place position */
+    function _jpFillPlace() {
+      var idx = parseInt(els.jpSel.value); if (isNaN(idx)) return;
+      var p = _jpLoad()[idx]; if (!p) return;
+      els.targetX.value = _fmt2(p.x); els.targetY.value = _fmt2(p.y); els.targetZ.value = _fmt2(p.z);
+    }
+
+    /* Add: save current pick position as a new point */
+    function _jpAdd() {
+      var sx = parseFloat(els.startX.value), sy = parseFloat(els.startY.value), sz = parseFloat(els.startZ.value);
+      if (isNaN(sx) || isNaN(sy) || isNaN(sz)) {
+        els.ctrlMsg.textContent = 'Fill Pick Position XYZ first / 先填起始位置坐标';
+        els.ctrlMsg.style.color = '#e05a47'; return;
+      }
+      var n = prompt('Point name / 作业点名:', '');
+      if (!n || !n.trim()) return;
+      n = n.trim();
+      var pts = _jpLoad();
+      pts = pts.filter(function(p) { return p.n !== n; });
+      pts.unshift({n: n, x: sx, y: sy, z: sz});
+      if (pts.length > JP_MAX) pts.length = JP_MAX;
+      _jpSave(pts); _jpRender();
+      els.jpSel.value = '0';  // select the new point
+      els.jpDel.disabled = false;
+      els.ctrlMsg.textContent = 'Saved: ' + n;
+      els.ctrlMsg.style.color = '#5ebd72';
+    }
+
+    /* Delete selected point */
+    function _jpDel() {
+      var idx = parseInt(els.jpSel.value); if (isNaN(idx)) return;
+      var pts = _jpLoad(); var name = pts[idx].n;
+      pts.splice(idx, 1);
+      _jpSave(pts); _jpRender();
+      els.ctrlMsg.textContent = 'Deleted: ' + name;
+      els.ctrlMsg.style.color = '#e05a47';
+    }
+
+    /* Enable/disable Del button based on selection */
+    els.jpSel.addEventListener('change', function() {
+      els.jpDel.disabled = isNaN(parseInt(this.value));
+    });
+
+    els.jpToPick.addEventListener('click', _jpFillPick);
+    els.jpToPlace.addEventListener('click', _jpFillPlace);
+    els.jpAdd.addEventListener('click', _jpAdd);
+    els.jpDel.addEventListener('click', _jpDel);
+
+    /* Init */
+    _jpRender();
 
     function resize() {
       const rect = canvas.getBoundingClientRect();
@@ -1777,24 +1945,37 @@ def render_live_html(plc_mode: bool = False) -> str:
 
     function applyTargetCommand() {
       if (PLC_MODE) {
-        // PLC real-time mode: POST target → start control
-        const target = {
-          target_x: parseFloat(els.targetX.value),
-          target_y: parseFloat(els.targetY.value),
-          target_z: parseFloat(els.targetZ.value),
+        // PLC real-time mode: POST start + target positions → start operation
+        var sx = parseFloat(els.startX.value);
+        var sy = parseFloat(els.startY.value);
+        var sz = parseFloat(els.startZ.value);
+        var tx = parseFloat(els.targetX.value);
+        var ty = parseFloat(els.targetY.value);
+        var tz = parseFloat(els.targetZ.value);
+        const command = {
+          start_x: sx, start_y: sy, start_z: sz,
+          target_x: tx, target_y: ty, target_z: tz,
         };
+        // Validate all inputs
+        for (const key of ['start_x','start_y','start_z','target_x','target_y','target_z']) {
+          if (isNaN(command[key])) {
+            els.ctrlMsg.textContent = 'Error: ' + key + ' must be a number';
+            els.ctrlMsg.style.color = '#e05a47';
+            return;
+          }
+        }
         els.applyTarget.disabled = true;
-        els.applyTarget.textContent = 'Starting...';
+        els.applyTarget.textContent = 'Running...';
         els.ctrlMsg.textContent = '';
         fetch('/api/start-control', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(target),
+          body: JSON.stringify(command),
         })
           .then(r => r.json())
           .then(data => {
             if (data.ok) {
-              els.ctrlMsg.textContent = 'Control started — polling...';
+              els.ctrlMsg.textContent = 'Operation started — ' + (data.phase_label || 'running...');
               els.ctrlMsg.style.color = '#5ebd72';
               _lastStepCount = -1;  // reset so first step triggers Start marker
               // 新一轮控制: 解冻并清空上一次的轨迹, 重新开始记录。
@@ -1805,14 +1986,14 @@ def render_live_html(plc_mode: bool = False) -> str:
               els.ctrlMsg.textContent = 'Error: ' + (data.error || 'unknown');
               els.ctrlMsg.style.color = '#e05a47';
               els.applyTarget.disabled = false;
-              els.applyTarget.textContent = 'Apply Target';
+              els.applyTarget.textContent = 'Start Operation / 开始作业';
             }
           })
           .catch(err => {
             els.ctrlMsg.textContent = 'Failed: ' + err.message;
             els.ctrlMsg.style.color = '#e05a47';
             els.applyTarget.disabled = false;
-            els.applyTarget.textContent = 'Apply Target';
+            els.applyTarget.textContent = 'Start Operation / 开始作业';
           });
         return;
       }
@@ -1851,7 +2032,10 @@ def render_live_html(plc_mode: bool = False) -> str:
       els.time.textContent = '0.0s';
       els.frame.textContent = '—';
       els.speed.textContent = 'Live';
-      // Initialize target inputs empty
+      // Initialize all position inputs empty
+      els.startX.value = '';
+      els.startY.value = '';
+      els.startZ.value = '';
       els.targetX.value = '';
       els.targetY.value = '';
       els.targetZ.value = '';
@@ -1992,7 +2176,7 @@ def render_live_html(plc_mode: bool = False) -> str:
             els.ctrlMsg.textContent = 'Error: ' + s.error;
             els.ctrlMsg.style.color = '#e05a47';
             els.applyTarget.disabled = false;
-            els.applyTarget.textContent = 'Apply Target';
+            els.applyTarget.textContent = 'Start Operation / 开始作业';
             return;
           }
           if (s.stopped) {
@@ -2007,17 +2191,18 @@ def render_live_html(plc_mode: bool = False) -> str:
             els.ctrlMsg.textContent = s.stop_reason || 'Stopped by operator';
             els.ctrlMsg.style.color = '#e05a47';
             els.applyTarget.disabled = false;
-            els.applyTarget.textContent = 'Apply Target';
+            els.applyTarget.textContent = 'Start Operation / 开始作业';
             return;
           }
           if (s.done) {
             if (_controlActive) {
               _controlActive = false;
-              els.phase.textContent = 'Target Reached';
-              els.ctrlMsg.textContent = 'Control complete — all axes arrived';
+              els.phase.textContent = s.scheduler_phase_label || 'Target Reached';
+              els.phase.style.color = '#5ebd72';
+              els.ctrlMsg.textContent = 'Operation complete';
               els.ctrlMsg.style.color = '#5ebd72';
               els.applyTarget.disabled = false;
-              els.applyTarget.textContent = 'Apply Target';
+              els.applyTarget.textContent = 'Start Operation / 开始作业';
               // 冻结并重绘: 把起点→目标点的完整轨迹定格在画面上。
               _trajectoryFrozen = true;
               frame = Math.max(0, payload.frames.length - 1);
@@ -2069,11 +2254,17 @@ def render_live_html(plc_mode: bool = False) -> str:
           var ey = ((d.p_ref_y||0) - (d.y||0)).toFixed(2);
           var ez = ((d.p_ref_z||0) - (d.z||0)).toFixed(2);
           els.time.textContent = (d.t || 0).toFixed(1) + 's';
-          els.phase.textContent = 'PD#' + s.step_count
-            + ' err=(' + ex + ',' + ey + ',' + ez + ')m'
-            + ' cmd=(' + (d.vx_cmd||0).toFixed(2) + ',' + (d.vy_cmd||0).toFixed(2) + ',' + (d.vz_cmd||0).toFixed(2) + ')m/s';
-          els.phase.style.color = '#f0a83b';
-          els.ctrlMsg.textContent = 'PD step #' + s.step_count;
+          // Show scheduler phase if available, otherwise PD info
+          if (s.scheduler_phase_label) {
+            els.phase.textContent = s.scheduler_phase_label;
+            els.phase.style.color = '#59a7e8';
+          } else {
+            els.phase.textContent = 'PD#' + s.step_count
+              + ' err=(' + ex + ',' + ey + ',' + ez + ')m'
+              + ' cmd=(' + (d.vx_cmd||0).toFixed(2) + ',' + (d.vy_cmd||0).toFixed(2) + ',' + (d.vz_cmd||0).toFixed(2) + ')m/s';
+            els.phase.style.color = '#f0a83b';
+          }
+          els.ctrlMsg.textContent = s.scheduler_phase_label || ('PD step #' + s.step_count);
           els.ctrlMsg.style.color = '#5ebd72';
           els.x.textContent = (d.x || 0).toFixed(2);
           els.y.textContent = (d.y || 0).toFixed(2);
@@ -2402,7 +2593,8 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             traceback.print_exc()
 
     def _handle_start_control(self):
-        """POST /api/start-control — parse target and start PLC PD control thread."""
+        """POST /api/start-control — parse start+target positions and run the
+        full multi-phase operation scheduler."""
         server = self.server
         if server.plc_actuator is None or server.ros_source is None or server.config is None:
             self._write(400, 'application/json; charset=utf-8',
@@ -2430,24 +2622,22 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                         json.dumps({'ok': False, 'error': 'PLC heartbeat is not healthy'}).encode('utf-8'))
             return
 
-        # Z 反馈是否用抓钩实测高度 (物理量, 与 SLAM 地图旋转无关)。必须在解析
-        # 目标之前就确定这个标志, 否则 target_z 和当前 z_measured 会落在不同
-        # 参考系——一旦标定了 origin_map_z 或 roll/pitch, PD 就会朝着一个和
-        # 真实目标差着常数偏移的高度收敛, 表现为"距离目标很远时就提前结束"。
+        # Z 反馈是否用抓钩实测高度 (物理量, 与 SLAM 地图旋转无关)。
         hoist_z = plc.get_lift_height()
         has_hoist_z = hoist_z is not None and math.isfinite(hoist_z)
 
         try:
             body = self.rfile.read(content_length).decode('utf-8')
-            target_x, target_y, target_z = _parse_control_target(
-                body,
-                server.config,
-                server.coordinate_transform,
-                z_is_hoist_height=has_hoist_z,
-            )
+            (start_x, start_y, start_z), (target_x, target_y, target_z) = \
+                _parse_operation_positions(
+                    body,
+                    server.config,
+                    server.coordinate_transform,
+                    z_is_hoist_height=has_hoist_z,
+                )
         except (UnicodeDecodeError, ValueError) as exc:
             self._write(400, 'application/json; charset=utf-8',
-                        json.dumps({'ok': False, 'error': f'Invalid target: {exc}'}).encode('utf-8'))
+                        json.dumps({'ok': False, 'error': f'Invalid positions: {exc}'}).encode('utf-8'))
             return
 
         # Get current position from localization
@@ -2468,16 +2658,20 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             return
         map_pose = dict(pose)
         crane_pose = {**pose, 'x': pose_x, 'y': pose_y, 'z': pose_z}
-        # Z 位置优先取抓钩实测高度 (物理 Z); 复用上面已经读取的 hoist_z,
-        # 与 target_z 的解析共用同一次读数、同一参考系。
         if has_hoist_z:
             crane_pose['z'] = float(hoist_z)
             map_pose['z'] = float(hoist_z)
+
+        # Map target back to map frame for display
+        map_start_x, map_start_y, map_start_z = (
+            server.coordinate_transform.crane_to_map_display(
+                start_x, start_y, start_z,
+                z_is_hoist_height=has_hoist_z,
+            )
+        )
         map_target_x, map_target_y, map_target_z = (
             server.coordinate_transform.crane_to_map_display(
-                target_x,
-                target_y,
-                target_z,
+                target_x, target_y, target_z,
                 z_is_hoist_height=has_hoist_z,
             )
         )
@@ -2497,9 +2691,19 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                 'z': map_target_z,
             },
         )
+        # Store the start position as well for display
+        cs.start_pos = {
+            'x': map_pose['x'], 'y': map_pose['y'], 'z': map_pose['z'],
+        }
+        # Also store pick position
+        cs.pick_pos = {
+            'x': map_start_x, 'y': map_start_y, 'z': map_start_z,
+        }
+        cs.scheduler_phase = None
+        cs.scheduler_phase_label = OperationPhase.IDLE.label
         server.control_state = cs
 
-        # Create control hooks — writes to ControlState (polling) + queue (SSE diagnostic)
+        # Create control hooks — for SSE diagnostic channel
         hooks = LiveControlHooks(
             control_state=cs,
             coordinate_transform=server.coordinate_transform,
@@ -2507,64 +2711,58 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         )
         server.control_hooks = hooks
 
-        initial_state = CraneState(
-            x0=crane_pose['x'],
-            y0=crane_pose['y'],
-            z0=crane_pose['z'],
-        )
-        # Update PlcActuator Z height to match current position
+        # Sync PlcActuator Z with current position
         server.plc_actuator.set_z_reference(crane_pose['z'])
 
+        start_pos = (start_x, start_y, start_z)
         target_pos = (target_x, target_y, target_z)
 
-        # Start control in background thread
+        # Create scheduler with coordinate transform for proper frontend display
+        scheduler = OperationScheduler(
+            plc=plc,
+            source=server.ros_source,
+            actuator=server.plc_actuator,
+            config=server.config,
+            is_simulation=False,
+            coordinate_transform=server.coordinate_transform,
+            z_is_hoist_height=has_hoist_z,
+        )
+
+        # Store scheduler reference for stop/reset
+        server._scheduler = scheduler
+
+        # Start operation in background thread
         def _run():
-            print(f'[PLC control] Starting PD: target=({target_x:.2f}, {target_y:.2f}, {target_z:.2f}), '
-                  f'start=({initial_state.x.position:.2f}, {initial_state.y.position:.2f}, {initial_state.z.position:.2f})')
+            print(f'[Scheduler] Starting operation: '
+                  f'pick=({start_x:.2f}, {start_y:.2f}, {start_z:.2f}), '
+                  f'place=({target_x:.2f}, {target_y:.2f}, {target_z:.2f}), '
+                  f'from=({crane_pose["x"]:.2f}, {crane_pose["y"]:.2f}, {crane_pose["z"]:.2f})')
             try:
-                history, events = run_pd_control(
-                    source=server.ros_source,
-                    actuator=server.plc_actuator,
-                    config=server.config,
+                result = scheduler.execute(
+                    start_pos=start_pos,
                     target_pos=target_pos,
-                    initial_state=initial_state,
-                    hooks=hooks,
-                    verbose=True,
-                    is_simulation=False,
-                    max_time=600.0,  # 10min max — same as expected max operation time
+                    control_state=cs,
                 )
-                print(f'[PLC control] PD complete — {len(history)} steps, arrivals: {[(t, a) for t, a in events]}')
-                if hooks.should_stop():
-                    cs.set_stopped('Stopped by operator')
-                else:
+                print(f'[Scheduler] Operation result: {result.phase.name} — {result.message}')
+                # Terminal state was already set by scheduler.execute() internally.
+                # Only send the SSE completion event — on success only.
+                if result.success:
                     hooks.done()
-                    cs.set_done()
-            except ControlStoppedError as exc:
-                msg = str(exc)
-                print(f'[PLC control] {msg}')
-                cs.set_stopped(msg)
-            except PositionFeedbackTimeout as exc:
-                msg = f'{exc}. Check ROS /localization_pose.'
-                print(f'[PLC control] {msg}')
-                hooks.send_error(msg)
-                cs.set_error(msg)
-            except TimeoutError as exc:
-                msg = (f'Timeout after 10 min — axes did not all arrive. '
-                       f'Check PLC connection or localization: {exc}')
-                print(f'[PLC control] {msg}')
-                hooks.send_error(msg)
-                cs.set_error(msg)
+                elif result.phase == OperationPhase.STOPPED:
+                    pass  # scheduler already set cs.set_stopped + emergency_stop
+                else:
+                    hooks.send_error(result.message)
             except Exception as exc:
                 import traceback
-                print(f'[PLC control] Error: {exc}')
+                print(f'[Scheduler] Fatal error: {exc}')
                 traceback.print_exc()
-                hooks.send_error(str(exc))
                 cs.set_error(str(exc))
+                hooks.send_error(str(exc))
             finally:
                 server.release_control_run()
-                print('[PLC control] Thread exiting')
+                print('[Scheduler] Thread exiting')
 
-        control_thread = threading.Thread(target=_run, name='plc-control', daemon=True)
+        control_thread = threading.Thread(target=_run, name='scheduler-control', daemon=True)
         server.set_control_thread(control_thread)
         try:
             control_thread.start()
@@ -2573,18 +2771,29 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             self._write(500, 'application/json; charset=utf-8',
                         json.dumps({'ok': False, 'error': f'Failed to start control: {exc}'}).encode('utf-8'))
             return
-        print('[PLC control] Thread started')
+        print('[Scheduler] Thread started')
 
         self._write(200, 'application/json; charset=utf-8',
-                    json.dumps({'ok': True, 'message': 'Control started'}).encode('utf-8'))
+                    json.dumps({
+                        'ok': True,
+                        'message': 'Operation started',
+                        'phase': OperationPhase.APPROACH_XY.name,
+                        'phase_label': OperationPhase.APPROACH_XY.label,
+                    }).encode('utf-8'))
 
     def _handle_stop(self):
-        """STOP ALL: send zero velocity to all three axes (matches demo.cpp pattern)."""
+        """STOP ALL: stop scheduler + send zero velocity to all axes."""
         server = self.server
-        # 先置停止标志，再通过执行器锁下发最终 STOP，保证 STOP 后没有运动指令穿插。
+        # Stop the scheduler first — it will set the final stop_reason on
+        # ControlState internally via scheduler.hooks.set_stopped().
+        scheduler = getattr(server, '_scheduler', None)
+        if scheduler is not None:
+            scheduler.hooks.stop()
         if server.control_hooks is not None:
             server.control_hooks.stop()
-        if server.control_state is not None:
+        # Only set stopped when there's no scheduler running (idle stop);
+        # otherwise the scheduler thread owns the terminal state transition.
+        if server.control_state is not None and scheduler is None:
             server.control_state.set_stopped('Stopped by operator')
         if server.plc_actuator is not None:
             server.plc_actuator.emergency_stop()
@@ -2647,6 +2856,9 @@ class ControlState:
         self.running: bool = False
         self.start_pos: dict | None = None  # {'x','y','z'} at Apply Target time
         self.target_pos: dict | None = None  # {'x','y','z'} target
+        self.pick_pos: dict | None = None  # {'x','y','z'} pick position (start of operation)
+        self.scheduler_phase: str | None = None
+        self.scheduler_phase_label: str | None = None
         self.step_count: int = 0
         self.arrivals: list = []            # [{'axis': 'x', 't': 1.23}, ...]
         self.done: bool = False
@@ -2665,6 +2877,8 @@ class ControlState:
             self.stop_reason = None
             self.step_count = 0
             self.arrivals = []
+            self.scheduler_phase = None
+            self.scheduler_phase_label = None
 
     def set_step(self, step_data: dict):
         with self.lock:
@@ -2700,6 +2914,11 @@ class ControlState:
 
     def snapshot(self) -> dict:
         with self.lock:
+            phase = self.scheduler_phase
+            phase_label = self.scheduler_phase_label
+            pick_pos = self.pick_pos
+            # scheduler_phase may be an OperationPhase enum or None
+            phase_name = phase.name if hasattr(phase, 'name') else None
             return {
                 'running': self.running,
                 'done': self.done,
@@ -2709,6 +2928,9 @@ class ControlState:
                 'step_count': self.step_count,
                 'start_pos': self.start_pos,
                 'target_pos': self.target_pos,
+                'pick_pos': pick_pos,
+                'scheduler_phase': phase_name,
+                'scheduler_phase_label': phase_label,
                 'arrivals': list(self.arrivals),
                 'latest': dict(self.latest) if self.latest else None,
             }
@@ -2814,6 +3036,10 @@ def serve_live_view(
     except KeyboardInterrupt:
         print('\nLive view stopped.')
     finally:
+        # Stop scheduler first (signals nested PD loops)
+        scheduler = getattr(server, '_scheduler', None)
+        if scheduler is not None:
+            scheduler.hooks.stop()
         if server.control_hooks is not None:
             server.control_hooks.stop()
         if server.plc_actuator is not None:

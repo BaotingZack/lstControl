@@ -130,6 +130,22 @@ class PLCInterface:
     def reset(self) -> None:
         raise NotImplementedError
 
+    def gripper_clamp(self) -> None:
+        """Close gripper — level-hold, mutually exclusive with release."""
+        raise NotImplementedError
+
+    def gripper_release(self) -> None:
+        """Open gripper — level-hold, mutually exclusive with clamp."""
+        raise NotImplementedError
+
+    def get_gripper_clamped(self) -> bool | None:
+        """Return True if gripper is fully clamped, False if not, None if unknown."""
+        raise NotImplementedError
+
+    def get_gripper_released(self) -> bool | None:
+        """Return True if gripper is fully released, False if not, None if unknown."""
+        raise NotImplementedError
+
     @property
     def heartbeat_healthy(self) -> bool:
         raise NotImplementedError
@@ -169,6 +185,11 @@ class MockPLC(PLCInterface):
         self.last_vy: float = 0.0          # last-sent Y velocity
         self.last_hz: float = 0.0          # last-sent Z height
         self.last_vz: float = 0.0          # last-sent Z velocity
+        self.last_gripper: str = 'unknown'  # last-sent gripper command for UI
+        # Gripper state simulation — follows demo.cpp level-hold semantics:
+        # GripperClampOnControl(true) = release; GripperClampOffControl(true) = clamp.
+        self._gripper_clamped: bool = False   # True = clamp bit is 1 (夹紧)
+        self._gripper_released: bool = False  # True = release bit is 1 (释放)
 
     # -- connection ---------------------------------------------------------
 
@@ -288,6 +309,42 @@ class MockPLC(PLCInterface):
     def reset(self) -> None:
         print('[PLC] ResetControl()')
 
+    # -- gripper control (follows demo.cpp field-tested wrappers) ---------
+
+    def gripper_clamp(self) -> None:
+        """Close gripper — 电平保持, 互斥: 先清释放位再置夹紧位。
+
+        demo.cpp GripperClamp::
+            GripperClampOnControl(false, ip);   // 释放位清 0
+            GripperClampOffControl(true, ip);   // 夹紧位置 1 并保持
+        """
+        self._gripper_released = False
+        self._gripper_clamped = True
+        self.last_gripper = 'clamped'
+        if self._verbose:
+            print('[PLC] GripperClamp (电平保持 — 夹紧位置1, 释放位清0)')
+
+    def gripper_release(self) -> None:
+        """Open gripper — 电平保持, 互斥: 先清夹紧位再置释放位。
+
+        demo.cpp GripperRelease::
+            GripperClampOffControl(false, ip);  // 夹紧位清 0
+            GripperClampOnControl(true, ip);    // 释放位置 1 并保持
+        """
+        self._gripper_clamped = False
+        self._gripper_released = True
+        self.last_gripper = 'released'
+        if self._verbose:
+            print('[PLC] GripperRelease (电平保持 — 释放位置1, 夹紧位清0)')
+
+    def get_gripper_clamped(self) -> bool | None:
+        """Return True if gripper is fully clamped (夹紧到位)."""
+        return self._gripper_clamped
+
+    def get_gripper_released(self) -> bool | None:
+        """Return True if gripper is fully released (释放到位)."""
+        return self._gripper_released
+
 
 # ---------------------------------------------------------------------------
 # Real PLC — ctypes wrapper for libsscarctrl.so (ARM aarch64 target)
@@ -316,6 +373,7 @@ class RealPLC(PLCInterface):
         self.last_vy: float = 0.0          # last-sent Y velocity
         self.last_hz: float = 0.0          # last-sent Z height
         self.last_vz: float = 0.0          # last-sent Z velocity
+        self.last_gripper: str = 'unknown'  # last-sent gripper command (for UI display)
         # GetActualLiftHeight() 异常读数过滤 (见 _LiftHeightSanitizer 说明)。
         self._lift_height_lock = threading.Lock()
         self._lift_height_sanitizer = _LiftHeightSanitizer()
@@ -354,6 +412,18 @@ class RealPLC(PLCInterface):
         self._lib.EmergencyBrake.restype = None
         self._lib.ResetControl.argtypes = [ctypes.c_bool, ctypes.c_char_p]
         self._lib.ResetControl.restype = None
+
+        # gripper control (level-hold, mutually exclusive)
+        self._lib.GripperClampOnControl.argtypes = [ctypes.c_bool, ctypes.c_char_p]
+        self._lib.GripperClampOnControl.restype = None
+        self._lib.GripperClampOffControl.argtypes = [ctypes.c_bool, ctypes.c_char_p]
+        self._lib.GripperClampOffControl.restype = None
+
+        # gripper status
+        self._lib.GetGripperOnStatus.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        self._lib.GetGripperOnStatus.restype = ctypes.c_int
+        self._lib.GetGripperOffStatus.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        self._lib.GetGripperOffStatus.restype = ctypes.c_int
 
         print(f'[PLC] Loaded {lib_path}')
 
@@ -475,6 +545,48 @@ class RealPLC(PLCInterface):
     def reset(self) -> None:
         self._lib.ResetControl(ctypes.c_bool(True), self._ip_ptr())
         print('[PLC] ResetControl()')
+
+    # -- gripper control (follows demo.cpp field-tested wrappers) ---------
+
+    def gripper_clamp(self) -> None:
+        """Close gripper — 电平保持, 互斥。
+
+        demo.cpp GripperClamp::
+            GripperClampOnControl(false, ip);   // 释放位清 0 (互斥)
+            GripperClampOffControl(true, ip);   // 夹紧位置 1 并保持
+        """
+        self._lib.GripperClampOnControl(ctypes.c_bool(False), self._ip_ptr())
+        self._lib.GripperClampOffControl(ctypes.c_bool(True), self._ip_ptr())
+        self.last_gripper = 'clamped'
+        print('[PLC] GripperClamp (电平保持 — 夹紧位=1, 释放位=0)')
+
+    def gripper_release(self) -> None:
+        """Open gripper — 电平保持, 互斥。
+
+        demo.cpp GripperRelease::
+            GripperClampOffControl(false, ip);  // 夹紧位清 0 (互斥)
+            GripperClampOnControl(true, ip);    // 释放位置 1 并保持
+        """
+        self._lib.GripperClampOffControl(ctypes.c_bool(False), self._ip_ptr())
+        self._lib.GripperClampOnControl(ctypes.c_bool(True), self._ip_ptr())
+        self.last_gripper = 'released'
+        print('[PLC] GripperRelease (电平保持 — 释放位=1, 夹紧位=0)')
+
+    def get_gripper_clamped(self) -> bool | None:
+        """读取夹紧到位状态 (GetGripperOnStatus → demo.cpp 映射为 "夹紧到位")。"""
+        status = ctypes.c_int(0)
+        ret = self._lib.GetGripperOnStatus(ctypes.byref(status))
+        if ret != 0:
+            return None  # read failed
+        return bool(status.value)
+
+    def get_gripper_released(self) -> bool | None:
+        """读取释放到位状态 (GetGripperOffStatus → demo.cpp 映射为 "释放到位")。"""
+        status = ctypes.c_int(0)
+        ret = self._lib.GetGripperOffStatus(ctypes.byref(status))
+        if ret != 0:
+            return None  # read failed
+        return bool(status.value)
 
 
 # ---------------------------------------------------------------------------
