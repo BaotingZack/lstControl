@@ -2,6 +2,7 @@
 Operation Scheduler — 完整起重机作业流程编排
 
 根据"lst完整调度流程"文档实现两阶段作业:
+  Phase 0 (预检): 取货前确认抓钩已开启, 未开启则打开
   Phase 1 (取货): 初始位置 → 起始位置 → 夹取钢卷
   Phase 2 (运输): 起始位置 → 目标位置 → 释放钢卷
   Phase 3 (归位): Z 轴抬升到安全高度
@@ -12,8 +13,19 @@ Operation Scheduler — 完整起重机作业流程编排
   Z_SAFE_FINAL     = 1.6m — 作业完成后 Z 归位高度
 
 时序约定:
-  XY 到达后稳定等待 1.0s → Z 下降
-  抓钩动作确认后安全等待 0.5s
+  取货前 → 检查抓钩状态, 关闭 (夹紧) 则打开一次, 不做持续控制/盯守
+  XY 到达后 → 自适应判稳 (上限 stabilize_delay) → Z 下降
+  Z 下降到位后 → 自适应判稳 (上限 gripper_settle_max_wait) → 抓钩夹取/释放
+  抓钩动作确认后安全等待 0.5s (机械动作确认延时, 与摆动无关, 固定值)
+  释放完全确认后 → 停留 post_release_lift_delay (~2s) → 直接抬升到目标高度
+
+自适应判稳 (效率与安全兼顾, 替代"盲等固定时长"):
+  用实测位置反馈判断货物是否真正静止 (速度 + 滑动窗口位置峰峰值双重判据)。
+  已经静止 → 提前放行, 不必等满上限时长 (提升效率);
+  仍在摆动/回弹 → 持续等待直到真正平稳, 而不是等满固定时长后就不管
+  三七二十一继续抓钩动作 (这正是"货物未放稳/未释放完就抓钩"风险的根源)。
+  超时兜底: 与抓钩状态确认超时一致, 打印警告后继续执行 (软失败), 避免
+  传感器/反馈异常误伤正常作业。详见 OperationScheduler._wait_cargo_settled()。
 
 抓钩状态检查:
   优先通过 PLC 函数 GetGripperOnStatus/GetGripperOffStatus 读取
@@ -56,6 +68,11 @@ GRIPPER_SAFETY_DELAY = 0.5  # 抓钩动作确认后安全等待
 GRIPPER_CHECK_INTERVAL = 0.1  # 抓钩状态轮询间隔 [s]
 GRIPPER_CHECK_TIMEOUT = 5.0   # 抓钩状态确认超时 [s]
 
+# 判稳轮询周期上限 [s] — 仅用于仿真模式节流 (SimPositionSource 非阻塞,
+# 若不加此 sleep 会以 CPU 全速空转); PLC 模式下 RosPositionSource.get_position()
+# 本身以 ~10Hz 阻塞等待新数据, 已有天然节流, 不需要额外 sleep。
+HOOK_SETTLE_POLL_INTERVAL = 0.02
+
 
 # ---------------------------------------------------------------------------
 # 作业阶段
@@ -64,6 +81,7 @@ GRIPPER_CHECK_TIMEOUT = 5.0   # 抓钩状态确认超时 [s]
 class OperationPhase(Enum):
     """作业阶段枚举 — 对应 UI 显示的进度信息"""
     IDLE = auto()                    # 等待开始
+    ENSURE_GRIPPER_OPEN = auto()     # Phase 0: 取货前确认抓钩已开启
     APPROACH_XY = auto()             # Phase 1a: 三轴联动接近取货位置
     APPROACH_Z_DESCEND = auto()      # Phase 1b: Z 下降到取货高度
     GRIPPER_CLAMP = auto()           # Phase 1c: 夹取钢卷
@@ -71,7 +89,7 @@ class OperationPhase(Enum):
     TRANSPORT_XY = auto()            # Phase 2b: 三轴联动运输到目标
     TRANSPORT_Z_DESCEND = auto()     # Phase 2c: Z 下降到卸货高度
     GRIPPER_RELEASE = auto()         # Phase 2d: 释放钢卷
-    RETURN_Z = auto()                # Phase 3: Z 归位到 1.6m
+    RETURN_Z = auto()                # Phase 3: Z 归位到 1.6m (含柔性起升)
     DONE = auto()                    # 作业完成
     ERROR = auto()                   # 异常中止
     STOPPED = auto()                 # 操作员停止
@@ -80,6 +98,7 @@ class OperationPhase(Enum):
     def label(self) -> str:
         labels = {
             OperationPhase.IDLE:                    "等待开始",
+            OperationPhase.ENSURE_GRIPPER_OPEN:     "Phase 0: 确认抓钩已开启",
             OperationPhase.APPROACH_XY:             "Phase 1a: 接近取货位置 (Z→1.0m)",
             OperationPhase.APPROACH_Z_DESCEND:      "Phase 1b: Z 下降到取货高度",
             OperationPhase.GRIPPER_CLAMP:           "Phase 1c: 夹取钢卷",
@@ -283,6 +302,26 @@ class OperationScheduler:
 
         try:
             # ================================================================
+            # Phase 0: 取货前确认抓钩已开启 (释放状态)
+            # 保证接近取货位置前抓钩处于打开状态——避免上次作业异常结束
+            # (急停/故障) 后抓钩仍停留在夹紧状态, 这次直接靠上钢卷去"夹"
+            # 一个已经夹紧的抓钩, 或带着夹紧状态误碰货物。
+            # 只是一次性的状态判断 + 纠正: 关闭则打开一次即可, 不需要
+            # 像正式抓取动作那样持续控制/额外安全等待——后续还要走行到
+            # 取货位置, 本身就有足够的时间富余。
+            # ================================================================
+            _record_phase(OperationPhase.ENSURE_GRIPPER_OPEN)
+            if self.hooks.should_stop():
+                raise ControlStoppedError("操作员停止")
+
+            if not self._check_gripper_released():
+                print("[Scheduler] 取货前检测到抓钩未开启, 打开抓钩...")
+                self._plc.gripper_release()
+                self._wait_gripper_released()
+            else:
+                print("[Scheduler] 取货前确认抓钩已开启")
+
+            # ================================================================
             # Phase 1a: 三轴联动 → 取货位置 (sx, sy, self._config.approach_safe_z)
             # Z 先到安全高度 1.0m 则等待, XY 到 sx,sy 后继续
             # ================================================================
@@ -298,8 +337,8 @@ class OperationScheduler:
             )
             all_history.extend(hist)
 
-            # XYZ 都到位 (Z=safe_approach, XY=sx,sy) → 稳定等待
-            self._safety_sleep(self._config.stabilize_delay, "XY 到取货位置后稳定等待")
+            # XYZ 都到位 (Z=safe_approach, XY=sx,sy) → 自适应判稳后才下降 Z
+            self._wait_cargo_settled("XY 到取货位置后", self._config.stabilize_delay)
 
             # ================================================================
             # Phase 1b: Z 从安全高度下降到取货高度 sz
@@ -318,11 +357,16 @@ class OperationScheduler:
 
             # ================================================================
             # Phase 1c: 夹取钢卷
+            # Z 下降到位后, 先自适应判稳再夹取——避免货物仍在摆动/回弹时就
+            # 立即抓钩 (原流程中缺失的安全环节)。
             # ================================================================
             _record_phase(OperationPhase.GRIPPER_CLAMP)
             if self.hooks.should_stop():
                 raise ControlStoppedError("操作员停止")
 
+            self._wait_cargo_settled(
+                "Z 下降到取货高度后, 夹取前", self._config.gripper_settle_max_wait
+            )
             self._plc.gripper_clamp()
             self._wait_gripper_clamped()
             self._safety_sleep(self._config.gripper_safety_delay, "夹取确认后安全等待")
@@ -358,8 +402,8 @@ class OperationScheduler:
             )
             all_history.extend(hist)
 
-            # XYZ 都到位 (Z=1.5m, XY=tx,ty) → 稳定等待 1.0s
-            self._safety_sleep(self._config.stabilize_delay, "XY 到目标位置后稳定等待")
+            # XYZ 都到位 (Z=1.5m, XY=tx,ty) → 自适应判稳后才下降 Z
+            self._wait_cargo_settled("XY 到目标位置后", self._config.stabilize_delay)
 
             # ================================================================
             # Phase 2c: Z 从安全高度下降到卸货高度 tz
@@ -378,14 +422,24 @@ class OperationScheduler:
 
             # ================================================================
             # Phase 2d: 释放钢卷
+            # Z 下降到位后, 先自适应判稳再释放——这是最关键的风险点: 货物
+            # 未放稳/仍在摆动时就释放, 容易造成钢卷偏斜、滑落或磕碰。
             # ================================================================
             _record_phase(OperationPhase.GRIPPER_RELEASE)
             if self.hooks.should_stop():
                 raise ControlStoppedError("操作员停止")
 
+            self._wait_cargo_settled(
+                "Z 下降到卸货高度后, 释放前", self._config.gripper_settle_max_wait
+            )
             self._plc.gripper_release()
             self._wait_gripper_released()
-            self._safety_sleep(self._config.gripper_safety_delay, "释放确认后安全等待")
+            # 抓钩完全释放确认后, 停留约 2s (post_release_lift_delay) 再抬升,
+            # 给货物/抓钩一个短暂的脱离缓冲, 之后直接以正常速度抬升到目标
+            # 高度即可, 不需要额外的分段限速。
+            self._safety_sleep(
+                self._config.post_release_lift_delay, "释放确认后, 抬升前停留"
+            )
 
             # ================================================================
             # Phase 3: Z 归位到 1.6m
@@ -545,6 +599,89 @@ class OperationScheduler:
                 raise ControlStoppedError("操作员在等待期间停止")
             remaining = deadline - time.monotonic()
             time.sleep(min(0.1, max(0.01, remaining)))
+
+    def _wait_cargo_settled(self, reason: str, max_wait: float) -> None:
+        """自适应等待货物平稳 — 用实测位置反馈判断, 代替盲等固定时长。
+
+        设计目标: 效率与安全兼顾。
+          - 货物已经静止 → 满足判稳窗口后立即放行, 可能远小于 max_wait (提速)
+          - 货物仍在摆动/回弹 → 持续检测直到真正平稳, 不满足就不会放行
+            (这正是"Z 到位后立即抓钩/释放, 货物未放稳"这一风险点的根本对策)
+
+        判稳条件 (基于滑动窗口 hook_settle_window 内的整段位置轨迹, 而非
+        单帧瞬时读数——单帧瞬时速度并不可靠: 单摆负载在摆动幅值最大处
+        瞬时速度恰好为 0, 只判一帧极易在摆动最高点被误判为"已静止"):
+          1. 窗口内位置峰峰值 (max-min) < hook_settle_pos_tol —— 直接衡量
+             这段时间内摆动/回弹的实际幅度, 天然规避"零速瞬间"假阳性
+          2. 窗口首尾的平均漂移速度 < hook_settle_vel_tol —— 排除峰峰值
+             恰好很小但仍在持续漂移 (如钢丝绳蠕变、缓慢下沉) 的情况
+
+        窗口需要真正"填满" (覆盖 hook_settle_window 秒) 才参与判定, 避免
+        刚开始等待、样本还不够时就被单帧巧合通过。
+
+        超时行为: 与现有抓钩状态确认超时一致 (软失败) —— 打印警告后继续
+        执行, 不中止整个作业, 避免传感器/定位反馈异常误伤正常作业。
+        """
+        cfg = self._config
+        window = cfg.hook_settle_window
+        vel_tol = cfg.hook_settle_vel_tol
+        pos_tol = cfg.hook_settle_pos_tol
+
+        print(f"[Scheduler] {reason} — 等待货物平稳 (自适应判稳, 上限 {max_wait:.1f}s)...")
+        t_start = time.monotonic()
+        deadline = t_start + max_wait
+        samples: list[tuple[float, float, float, float]] = []  # (t, x, y, z)
+
+        while True:
+            if self.hooks.should_stop():
+                raise ControlStoppedError("操作员在等待货物平稳期间停止")
+
+            pos = self._source.get_position()
+            if pos is None:
+                raise PositionFeedbackTimeout("等待货物平稳期间定位反馈超时")
+
+            now = time.monotonic()
+            x, y, z = pos['x'], pos['y'], pos['z']
+
+            samples.append((now, x, y, z))
+            while len(samples) > 1 and now - samples[0][0] > window:
+                samples.pop(0)
+
+            # 注意: 用"距等待起点的绝对耗时"判断窗口是否填满, 不能用
+            # samples[0] 的年龄——上面的滑动裁剪会把队首年龄压到略小于
+            # window (裁剪粒度取决于轮询间隔), 若拿裁剪后的年龄去比较
+            # window 本身, 会永远差一点点凑不满, 陷入"永远判不稳"的死锁。
+            window_full = (now - t_start) >= window
+            if window_full:
+                t0, x0, y0, z0 = samples[0]
+                span = max(now - t0, 1e-3)
+                xs = [s[1] for s in samples]
+                ys = [s[2] for s in samples]
+                zs = [s[3] for s in samples]
+
+                range_ok = (
+                    (max(xs) - min(xs)) < pos_tol
+                    and (max(ys) - min(ys)) < pos_tol
+                    and (max(zs) - min(zs)) < pos_tol
+                )
+                drift_ok = (
+                    abs(x - x0) / span < vel_tol
+                    and abs(y - y0) / span < vel_tol
+                    and abs(z - z0) / span < vel_tol
+                )
+                if range_ok and drift_ok:
+                    print(f"[Scheduler] {reason} — 货物已平稳 (用时 {now - t_start:.2f}s)")
+                    return
+
+            if now >= deadline:
+                print(
+                    f"[Scheduler] 警告: {reason} — 判稳超时 ({max_wait:.1f}s), "
+                    f"继续执行 (可能仍有轻微摆动)"
+                )
+                return
+
+            if self._is_simulation:
+                time.sleep(HOOK_SETTLE_POLL_INTERVAL)
 
     def _wait_gripper_clamped(self) -> None:
         """轮询抓钩状态直到确认夹紧完成 (或超时)。

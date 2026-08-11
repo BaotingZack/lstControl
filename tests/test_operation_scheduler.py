@@ -6,9 +6,18 @@ Runs in simulation mode with a MockPLC so no real hardware is needed.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
-from crane_model import CraneConfig, CranePlant, CraneState, SimPositionSource, PlantActuator
+from crane_model import (
+    ControlStoppedError,
+    CraneConfig,
+    CranePlant,
+    CraneState,
+    SimPositionSource,
+    PlantActuator,
+)
 from plc_interface import MockPLC
 from operation_scheduler import (
     OperationScheduler,
@@ -100,6 +109,7 @@ class TestOperationPhase:
         """Ensure all expected phases exist."""
         expected = {
             OperationPhase.IDLE,
+            OperationPhase.ENSURE_GRIPPER_OPEN,
             OperationPhase.APPROACH_XY,
             OperationPhase.APPROACH_Z_DESCEND,
             OperationPhase.GRIPPER_CLAMP,
@@ -303,6 +313,261 @@ class TestOperationSchedulerSimulation:
 
         assert result.success is True
         assert result.phase == OperationPhase.DONE
+
+
+class _FixedPositionSource:
+    """位置源桩件: 返回固定 (可能带噪声的) 位置, 用于判稳单测。"""
+
+    def __init__(self, x=0.0, y=0.0, z=0.0):
+        self.x, self.y, self.z = x, y, z
+
+    def get_position(self):
+        return {
+            'x': self.x, 'y': self.y, 'z': self.z,
+            'vx': None, 'vy': None, 'vz': None,
+            'dt': 0.02, 't': 0.0, 'stamp': 0,
+        }
+
+    def reset(self):
+        pass
+
+
+class _DriftingPositionSource:
+    """位置源桩件: 位置持续单向漂移 (模拟货物仍在摆动/未平稳)。"""
+
+    def __init__(self, rate=0.05):
+        self._rate = rate
+        self._t0 = time.monotonic()
+
+    def get_position(self):
+        elapsed = time.monotonic() - self._t0
+        return {
+            'x': self._rate * elapsed, 'y': 0.0, 'z': 0.0,
+            'vx': None, 'vy': None, 'vz': None,
+            'dt': 0.02, 't': elapsed, 'stamp': 0,
+        }
+
+    def reset(self):
+        pass
+
+
+class _StopAfterNCallsSource:
+    """位置源桩件: 若干次调用后触发外部停止信号。"""
+
+    def __init__(self, hooks, n_calls_before_stop=3):
+        self._hooks = hooks
+        self._remaining = n_calls_before_stop
+
+    def get_position(self):
+        if self._remaining <= 0:
+            self._hooks.stop()
+        else:
+            self._remaining -= 1
+        return {
+            'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'vx': None, 'vy': None, 'vz': None,
+            'dt': 0.02, 't': 0.0, 'stamp': 0,
+        }
+
+    def reset(self):
+        pass
+
+
+class TestCargoSettleDetection:
+    """针对 OperationScheduler._wait_cargo_settled() 的自适应判稳单测。
+
+    验证: 已平稳时提前放行 (效率), 仍在漂移/摆动时持续等待直到超时上限
+    (安全), 且可被操作员停止信号中断。
+    """
+
+    def _make_scheduler(self, config):
+        initial_state = CraneState(x0=0.0, y0=0.0, z0=1.0)
+        plant = CranePlant(config)
+        source = SimPositionSource(plant, initial_state, config)
+        actuator = _make_noop_actuator(plant, initial_state, config)
+        mock_plc = MockPLC(verbose=False)
+        mock_plc._connected = True
+        mock_plc._heartbeat_healthy = True
+        return OperationScheduler(
+            plc=mock_plc, source=source, actuator=actuator,
+            config=config, is_simulation=True,
+        )
+
+    def test_settled_cargo_exits_before_max_wait(self):
+        """货物已静止 (固定位置) 时, 应在远小于 max_wait 的时间内放行。"""
+        config = CraneConfig(hook_settle_window=0.2, hook_settle_pos_tol=0.02,
+                              hook_settle_vel_tol=0.02)
+        scheduler = self._make_scheduler(config)
+        scheduler._source = _FixedPositionSource(x=1.0, y=2.0, z=0.5)
+
+        max_wait = 5.0
+        start = time.monotonic()
+        scheduler._wait_cargo_settled("测试: 已平稳", max_wait)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < max_wait * 0.5, (
+            f"已平稳的货物应提前放行, 实际用时 {elapsed:.2f}s (上限 {max_wait:.1f}s)"
+        )
+
+    def test_drifting_cargo_waits_until_timeout(self):
+        """货物持续漂移/摆动时, 应等到 max_wait 上限才放行 (软失败, 不抛异常)。"""
+        config = CraneConfig(hook_settle_window=0.3, hook_settle_pos_tol=0.01,
+                              hook_settle_vel_tol=0.01)
+        scheduler = self._make_scheduler(config)
+        scheduler._source = _DriftingPositionSource(rate=0.5)  # 远超阈值, 永不判稳
+
+        max_wait = 0.6
+        start = time.monotonic()
+        scheduler._wait_cargo_settled("测试: 持续漂移", max_wait)
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= max_wait * 0.9, (
+            f"持续漂移应等到超时上限附近才放行, 实际用时 {elapsed:.2f}s"
+        )
+
+    def test_stop_signal_interrupts_settle_wait(self):
+        """操作员停止信号应能中断判稳等待, 抛出 ControlStoppedError。"""
+        config = CraneConfig(hook_settle_window=0.2)
+        scheduler = self._make_scheduler(config)
+        scheduler._source = _StopAfterNCallsSource(scheduler.hooks, n_calls_before_stop=2)
+
+        with pytest.raises(ControlStoppedError):
+            scheduler._wait_cargo_settled("测试: 停止中断", max_wait=5.0)
+
+
+class TestEnsureGripperOpenBeforePickup:
+    """验证取货前会确认抓钩已开启, 未开启时主动释放 (Phase 0)。"""
+
+    def _make_scheduler(self, config, initial_state):
+        plant = CranePlant(config)
+        source = SimPositionSource(plant, initial_state, config)
+        actuator = _make_noop_actuator(plant, initial_state, config)
+        mock_plc = MockPLC(verbose=False)
+        mock_plc._connected = True
+        mock_plc._heartbeat_healthy = True
+        scheduler = OperationScheduler(
+            plc=mock_plc, source=source, actuator=actuator,
+            config=config, is_simulation=True,
+        )
+        return scheduler, mock_plc
+
+    def test_auto_releases_when_gripper_starts_clamped(self):
+        """抓钩初始处于夹紧状态时, 取货前应主动释放一次 (额外的 Phase 0)。"""
+        config = CraneConfig(max_velocity_xy=0.3, max_velocity_z=0.3, dt=0.01)
+        initial_state = CraneState(x0=2.0, y0=1.0, z0=5.0)
+        scheduler, mock_plc = self._make_scheduler(config, initial_state)
+
+        # 模拟上次作业异常结束, 抓钩仍停留在夹紧状态。
+        mock_plc.gripper_clamp()
+        release_calls = []
+        original_release = mock_plc.gripper_release
+
+        def _tracking_release():
+            release_calls.append(time.monotonic())
+            original_release()
+
+        mock_plc.gripper_release = _tracking_release
+
+        result = scheduler.execute(start_pos=(4.0, 2.0, 0.5), target_pos=(6.0, 4.0, 0.5))
+
+        assert result.success is True
+        # 一次是 Phase 0 的主动释放, 一次是 Phase 2d 正常释放钢卷。
+        assert len(release_calls) == 2, (
+            f"预期抓钩已夹紧时触发一次额外的 Phase 0 主动释放, "
+            f"实际释放调用次数={len(release_calls)}"
+        )
+        phases_seen = {p for _, p in result.phase_history}
+        assert OperationPhase.ENSURE_GRIPPER_OPEN in phases_seen
+
+    def test_no_extra_release_when_already_open(self):
+        """抓钩已经开启时, 不应触发额外的 Phase 0 主动释放。"""
+        config = CraneConfig(max_velocity_xy=0.3, max_velocity_z=0.3, dt=0.01)
+        initial_state = CraneState(x0=2.0, y0=1.0, z0=5.0)
+        scheduler, mock_plc = self._make_scheduler(config, initial_state)
+
+        # 抓钩已经是开启状态 (如刚上电/复位)。
+        mock_plc.gripper_release()
+        release_calls = []
+        original_release = mock_plc.gripper_release
+
+        def _tracking_release():
+            release_calls.append(time.monotonic())
+            original_release()
+
+        mock_plc.gripper_release = _tracking_release
+
+        result = scheduler.execute(start_pos=(4.0, 2.0, 0.5), target_pos=(6.0, 4.0, 0.5))
+
+        assert result.success is True
+        # 只有 Phase 2d 正常释放钢卷这一次, 没有额外的 Phase 0 主动释放。
+        assert len(release_calls) == 1, (
+            f"预期抓钩已开启时不触发额外释放, 实际释放调用次数={len(release_calls)}"
+        )
+
+
+class TestPostReleaseLift:
+    """验证释放后的简化流程: 完全释放确认后停留 ~1s, 再直接以正常速度
+    抬升到目标高度 (不做分段限速)。"""
+
+    @pytest.fixture
+    def config(self):
+        return CraneConfig(
+            max_velocity_xy=0.3, max_velocity_z=0.3, dt=0.01,
+            post_release_lift_delay=1.0,
+        )
+
+    @pytest.fixture
+    def initial_state(self):
+        return CraneState(x0=2.0, y0=1.0, z0=5.0)
+
+    def _make_scheduler(self, config, initial_state):
+        plant = CranePlant(config)
+        source = SimPositionSource(plant, initial_state, config)
+        actuator = _make_noop_actuator(plant, initial_state, config)
+        mock_plc = MockPLC(verbose=False)
+        mock_plc._connected = True
+        mock_plc._heartbeat_healthy = True
+        scheduler = OperationScheduler(
+            plc=mock_plc, source=source, actuator=actuator,
+            config=config, is_simulation=True,
+        )
+        return scheduler, plant, source
+
+    def test_pause_between_release_and_return_z(self, config, initial_state):
+        """GRIPPER_RELEASE 阶段和 RETURN_Z 阶段的记录时间差应至少覆盖
+        post_release_lift_delay (释放确认后到开始抬升前的停留)。"""
+        scheduler, plant, source = self._make_scheduler(config, initial_state)
+
+        result = scheduler.execute(start_pos=(4.0, 2.0, 0.5), target_pos=(6.0, 4.0, 0.5))
+
+        assert result.success is True
+        phase_times = {phase: t for t, phase in result.phase_history}
+        release_t = phase_times[OperationPhase.GRIPPER_RELEASE]
+        return_t = phase_times[OperationPhase.RETURN_Z]
+        assert return_t - release_t >= config.post_release_lift_delay - 0.05, (
+            f"释放到开始抬升的间隔应至少覆盖 post_release_lift_delay, "
+            f"实际间隔={return_t - release_t:.2f}s"
+        )
+
+    def test_return_z_lifts_directly_without_speed_staging(self, config, initial_state):
+        """RETURN_Z 阶段不再做分段限速, PD 应能按正常 max_velocity_z 抬升。"""
+        scheduler, plant, source = self._make_scheduler(config, initial_state)
+
+        current_state = CraneState(x0=6.0, y0=4.0, z0=0.5)
+        hist, _ = scheduler._run_pd(
+            target=(6.0, 4.0, config.return_safe_z),
+            initial_state=current_state,
+            phase_label="RETURN_Z",
+        )
+
+        assert len(hist) > 0
+        # 起步阶段应能看到接近 max_velocity_z 的速度指令 (未被人为限速)。
+        early_steps = hist[: max(1, len(hist) // 10)]
+        max_early_vz_cmd = max(abs(h['vz_cmd']) for h in early_steps)
+        assert max_early_vz_cmd > config.max_velocity_z * 0.5, (
+            f"起步阶段速度指令应能接近正常上限, 实际最大值={max_early_vz_cmd:.3f}"
+        )
+        assert abs(hist[-1]['z'] - config.return_safe_z) < 0.05
 
 
 class TestMockPLCGripper:

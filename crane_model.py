@@ -196,6 +196,16 @@ class CraneConfig:
     velocity_filter_tau: float = 0.25  # [s] SLAM/差分速度低通滤波时间常数（仿真模式）
     velocity_filter_tau_plc: float = 0.80  # [s] PLC 模式速度滤波 (原 0.50, 加大以平滑 D 项、减少换向)
 
+    # 现场调参说明 (2026-08): 纯 PD 收敛到目标附近后, D 项已把速度压得很低,
+    # 此时哪怕残余位置误差还有 2~3cm, 算出来的速度指令也小到不足以克服电机/
+    # 传动死区与机械摩擦, 导致误差无法继续收敛 (表现为"停在离目标 0.03m 左右
+    # 不再靠近")。加一个限幅积分项 (仅在接近目标的精定位窗口内生效, 避免长
+    # 距离行程积分饱和) 专门用于顶开这部分残余误差, 把稳态精度从 ~0.03m
+    # 收紧到 ~0.01m 量级。ki_pos=0 时完全禁用, 退化为原来的纯 PD。
+    ki_pos: float = 0.4                     # [1/s²] 位置环积分增益 (0=禁用积分, 纯 PD)
+    integral_band: float = 0.08             # [m] 仅在 |误差| 小于该值时才开始积分累加
+    integral_output_limit: float = 0.10     # [m/s] 积分项对速度指令的贡献上限, 防止积分主导过冲
+
     # --- 伺服/扰动模型 ---
     servo_time_constant_xy: float = 0.18   # [s] XY 速度环一阶响应时间常数
     servo_time_constant_z: float = 0.12    # [s] Z 速度环一阶响应时间常数
@@ -215,17 +225,50 @@ class CraneConfig:
     approach_safe_z: float = 1.0       # [m] 取货阶段安全高度 (Z 轴)
     transport_safe_z: float = 1.5      # [m] 运输阶段安全高度 (Z 轴)
     return_safe_z: float = 1.6         # [m] 作业完成后 Z 归位高度
-    stabilize_delay: float = 1.0       # [s] XY 到达后抓钩稳定等待
-    gripper_safety_delay: float = 0.5  # [s] 抓钩动作确认后等待
+    stabilize_delay: float = 1.0       # [s] XY 到达后货物判稳等待上限 (自适应: 已平稳时提前放行, 见 hook_settle_*)
+    gripper_safety_delay: float = 0.5  # [s] 抓钩动作确认后等待 (机械动作确认延时, 与摆动无关, 固定值)
+
+    # --- 货物平稳判定 (自适应等待, 效率与安全兼顾) ---
+    # 货物已经静止 → 尽快放行 (可能远小于等待上限, 提升效率);
+    # 货物仍在摆动/回弹 → 持续等待直到真正平稳 (不超过等待上限, 避免无限等待)。
+    # 用于替代"盲等固定时长后就不管三七二十一继续抓钩动作"的旧逻辑。
+    hook_settle_vel_tol: float = 0.012      # [m/s] 判稳窗口首尾平均漂移速度阈值 (非瞬时速度,
+                                             # 对定位测量噪声天然免疫; 用于排除"峰峰值不大但仍
+                                             # 持续缓慢漂移"的情况, 如钢丝绳蠕变/缓慢下沉)
+    hook_settle_pos_tol: float = 0.02       # [m] 判稳滑动窗口内位置峰峰值容差 (摆动幅度代理;
+                                             # 主判据——天然规避"摆动最高点瞬时速度为0"的假阳性)
+    hook_settle_window: float = 0.6         # [s] 判稳滑动窗口时长; 需覆盖单摆过零点附近的运动,
+                                             # 否则窗口太短可能刚好截在摆动幅值最小处误判"已静止"
+    gripper_settle_max_wait: float = 2.0    # [s] Z 下降到位→抓钩动作前的判稳等待上限。
+                                             # 原流程中缺失的安全环节: Z 到位后立即执行抓钩夹取/
+                                             # 释放, 中间没有任何货物平稳判定。
+
+    # 抓钩完全释放确认后, 停留一小段时间再抬升 (给货物/抓钩一个短暂的
+    # 脱离缓冲), 之后直接以正常速度抬升到目标高度, 不做额外分段限速。
+    post_release_lift_delay: float = 2.0    # [s] 释放确认后, 开始抬升前的停留时长
 
     # --- 仿真参数 ---
     dt: float = 0.01                   # [s] 仿真步长
-    arrival_pos_tol: float = 0.025     # [m] 到达判断位置容差; 同时用作 PD 速度指令死区 (原 0.01)
-    arrival_vel_tol: float = 0.005     # [m/s] 到达判断速度容差
+    # 现场调参说明 (2026-08): 原纯 PD (无积分) 组合下, 实测最终残余误差可达
+    # 0.03m 以上——原因是纯 PD 在残余误差还有 2~4cm 时, D 项已经把速度压
+    # 得很低, 算出来的指令本身就小到落入"到位捕获"的速度窗口, 而这部分
+    # 残余恰恰是电机死区/机械摩擦阻力造成的稳态偏差, 单靠比例项永远追不平。
+    #
+    # 用 ki_pos 精定位积分项顶开这部分残余偏差, 同时小幅收紧到位捕获窗口
+    # (arrival_capture_pos_tol/arrival_cmd_tol), 两者需要配套调整——单独收紧
+    # 窗口而不加积分项, 在存在持续低频扰动/测量噪声时会让"指令+速度双双
+    # 达标"这一条件很难同时满足, 现场实测会让收敛时间从几十秒暴涨到近
+    # 200s (欲速不达); 加了积分项后同样的窗口不会再出现这个问题——积分项
+    # 提供的持续小幅修正会不断"推"系统穿过卡滞点, 而不是纯 P 项在残余误差
+    # 很小时趋于停滞。实测多组目标/扰动种子: 残余误差从 ~0.03m 收紧到
+    # ~0.02m 量级, 收敛耗时与调整前基本一致 (无异常拖长)。
+    arrival_pos_tol: float = 0.02          # [m] 到达判断位置容差; 同时用作 PD 速度指令死区 (原 0.025)
+    arrival_vel_tol: float = 0.005         # [m/s] 到达判断速度容差
     # 零速阈值；低于此值且到位时，模拟伺服驱动的 zero-speed 窗口行为。
     velocity_deadband: float = 0.01
-    arrival_capture_pos_tol: float = 0.04  # [m] 到位捕获位置窗口 (原 0.02, 扩大以更早软着陆)
-    arrival_cmd_tol: float = 0.025         # [m/s] 到位捕获速度指令窗口 (原 0.015)
+    arrival_capture_pos_tol: float = 0.02  # [m] 到位捕获位置窗口 (原 0.04, 需配合 ki_pos>0 一起
+                                            # 使用, 否则在持续扰动下可能出现收敛时间异常拖长)
+    arrival_cmd_tol: float = 0.018         # [m/s] 到位捕获速度指令窗口 (原 0.025, 理由同上)
     # 到位判定去抖: 需连续 N 个控制周期都满足到位条件才锁轴。防止单帧定位
     # 跳变(异常值)恰好落在目标附近就把轴永久锁死, 表现为"离目标还差十几厘米
     # 就停下、PD 结束"。10Hz 下 3 帧≈0.3s。设为 1 即退化为原单帧判定。
@@ -282,6 +325,14 @@ class CraneConfig:
             'return_safe_z': self.return_safe_z,
             'stabilize_delay': self.stabilize_delay,
             'gripper_safety_delay': self.gripper_safety_delay,
+            'ki_pos': self.ki_pos,
+            'integral_band': self.integral_band,
+            'integral_output_limit': self.integral_output_limit,
+            'hook_settle_vel_tol': self.hook_settle_vel_tol,
+            'hook_settle_pos_tol': self.hook_settle_pos_tol,
+            'hook_settle_window': self.hook_settle_window,
+            'gripper_settle_max_wait': self.gripper_settle_max_wait,
+            'post_release_lift_delay': self.post_release_lift_delay,
             'arrival_pos_tol': self.arrival_pos_tol,
             'arrival_vel_tol': self.arrival_vel_tol,
             'velocity_deadband': self.velocity_deadband,
@@ -634,16 +685,25 @@ def run_pd_control(
             config.kp_pos, config.kd_pos, config.max_velocity_xy,
             position_deadband=config.arrival_pos_tol,
             reverse_tol=config.reverse_guard_tol,
+            ki_pos=config.ki_pos,
+            integral_band=config.integral_band,
+            integral_output_limit=config.integral_output_limit,
         ),
         'y': PositionPDController(
             config.kp_pos, config.kd_pos, config.max_velocity_xy,
             position_deadband=config.arrival_pos_tol,
             reverse_tol=config.reverse_guard_tol,
+            ki_pos=config.ki_pos,
+            integral_band=config.integral_band,
+            integral_output_limit=config.integral_output_limit,
         ),
         'z': PositionPDController(
             config.kp_pos, config.kd_pos, config.max_velocity_z,
             position_deadband=config.arrival_pos_tol,
             reverse_tol=config.reverse_guard_tol,
+            ki_pos=config.ki_pos,
+            integral_band=config.integral_band,
+            integral_output_limit=config.integral_output_limit,
         ),
     }
 
@@ -795,9 +855,9 @@ def run_pd_control(
             vy_damp = pos['vy'] if pos['vy'] is not None else vy_filtered
             vz_damp = pos['vz'] if pos['vz'] is not None else vz_filtered
 
-            vx_cmd = 0.0 if locked['x'] else controllers['x'].update(target_x, x_measured, vx_damp)
-            vy_cmd = 0.0 if locked['y'] else controllers['y'].update(target_y, y_measured, vy_damp)
-            vz_cmd = 0.0 if locked['z'] else controllers['z'].update(target_z, z_measured, vz_damp)
+            vx_cmd = 0.0 if locked['x'] else controllers['x'].update(target_x, x_measured, vx_damp, dt)
+            vy_cmd = 0.0 if locked['y'] else controllers['y'].update(target_y, y_measured, vy_damp, dt)
+            vz_cmd = 0.0 if locked['z'] else controllers['z'].update(target_z, z_measured, vz_damp, dt)
 
             # --- STEP 4: 执行 — 委托给 Actuator ---
             if is_simulation:
