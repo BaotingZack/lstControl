@@ -43,7 +43,7 @@ class _LiftHeightSanitizer:
     或判定为真实故障), 避免无限期相信一个已经过期的缓存值。
     """
 
-    _ZERO_SENTINEL_EPS = 0.05    # [m] 判定"近零"为异常兜底值的门限 (低于安全下限 0.5m 很多)
+    _ZERO_SENTINEL_EPS = 0.05    # [m] 判定"近零"为异常兜底值的门限 (低于安全下限 0.35m 很多)
     _MAX_RATE = 1.0              # [m/s] 认为物理上合理的最大高度变化速率 (含较大余量)
     _JUMP_MARGIN = 0.10          # [m] 跳变判定的固定余量, 补偿调用间隔抖动
     STALE_TIMEOUT = 2.0          # [s] 缓存值信任窗口, 与定位反馈超时保持一致量级
@@ -634,12 +634,12 @@ class PlcActuator:
       取反"是镜像, 旋转无法表达, 必须用这里的逐轴符号翻转。
 
     安全高度下限 (min_lift_height):
-      下发给 liftctrl 的绝对高度会被钳到 >= min_lift_height (默认 0.5m),
+      下发给 liftctrl 的绝对高度会被钳到 >= min_lift_height (默认 0.35m),
       保证抓钩离地不小于该高度; 无论 PD 输出或目标怎么设, 都不会命令
       抓钩降到该安全高度以下。
     """
 
-    _MIN_LIFT_HEIGHT_DEFAULT = 0.5  # [m] 抓钩离地最小安全高度
+    _MIN_LIFT_HEIGHT_DEFAULT = 0.35  # [m] 抓钩离地最小安全高度
 
     def __init__(
         self,

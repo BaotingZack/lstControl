@@ -119,9 +119,9 @@ def _build_arg_parser():
     parser.add_argument('--invert-lift', action='store_true',
                         help='flip hoist (Z) command sign when the drive positive '
                              'direction is opposite to the localization Z axis')
-    parser.add_argument('--min-lift-height', type=float, default=0.5,
+    parser.add_argument('--min-lift-height', type=float, default=0.35,
                         help='minimum hoist height (m) sent to liftctrl; keeps the '
-                             'gripper at least this far above ground (default 0.5)')
+                             'gripper at least this far above ground (default 0.35)')
     for axis in ('x', 'y', 'z'):
         parser.add_argument(f'--workspace-{axis}-min', type=float, default=None,
                             help=f'minimum allowed {axis.upper()} target in PLC workspace')

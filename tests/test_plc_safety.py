@@ -99,7 +99,7 @@ def test_plc_actuator_resends_velocity_every_cycle_while_constant():
     """Velocity servo needs continuous refresh; a constant command must still be
     re-sent each cycle, otherwise the PLC watchdog stops the axis (stutter)."""
     plc = RecordingPLC()
-    actuator = PlcActuator(plc, initial_z=1.0)  # above the 0.5m safety floor
+    actuator = PlcActuator(plc, initial_z=1.0)  # above the 0.35m safety floor
 
     for _ in range(4):
         actuator.apply(0.2, 0.2, 0.0, 0.1)
@@ -134,7 +134,7 @@ def test_plc_actuator_z_setpoint_marches_all_the_way_to_target():
     """liftctrl 是绝对位置伺服: 设 Z 目标后, 高度设定值必须一路走到目标并停住,
     而不是每周期只领先一步 (旧逻辑会因 update_state 重锚导致设定值几乎不动)。"""
     plc = RecordingPLC()
-    actuator = PlcActuator(plc, initial_z=5.0)  # target 2.0 > floor 0.5
+    actuator = PlcActuator(plc, initial_z=5.0)  # target 2.0 > floor 0.35
     actuator.set_z_target(2.0)
 
     for _ in range(300):
@@ -164,19 +164,19 @@ def test_plc_actuator_z_setpoint_does_not_overshoot_ascending_target():
 
 
 def test_plc_actuator_enforces_minimum_lift_height_floor():
-    """The hoist command must never be driven below the safety floor (0.5m),
-    keeping the gripper at least 0.5m above ground regardless of PD/target."""
+    """The hoist command must never be driven below the safety floor (0.35m),
+    keeping the gripper at least 0.35m above ground regardless of PD/target."""
     plc = RecordingPLC()
-    actuator = PlcActuator(plc, initial_z=0.6)  # default floor = 0.5m
+    actuator = PlcActuator(plc, initial_z=0.42)  # default floor = 0.35m
 
-    # Descend 0.2 m/s: 0.6 -> 0.58 -> ... would pass below 0.5 without the floor.
+    # Descend 0.2 m/s: 0.42 -> 0.40 -> ... would pass below 0.35 without the floor.
     for _ in range(7):
         actuator.apply(0.0, 0.0, -0.2, 0.1)
 
-    assert min(plc.lift_commands) == pytest.approx(0.5)
-    assert all(h >= 0.5 - 1e-9 for h in plc.lift_commands)
+    assert min(plc.lift_commands) == pytest.approx(0.35)
+    assert all(h >= 0.35 - 1e-9 for h in plc.lift_commands)
     # Later cycles are pinned to the floor instead of going negative.
-    assert plc.lift_commands[-1] == pytest.approx(0.5)
+    assert plc.lift_commands[-1] == pytest.approx(0.35)
 
 
 def test_plc_actuator_min_lift_height_is_configurable():
