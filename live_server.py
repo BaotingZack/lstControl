@@ -771,8 +771,16 @@ def build_live_payload(
     config,
     update_hz: float = 10.0,
     speed: float = 1.0,
+    pick_pos: tuple[float, float, float] | None = None,
+    segment_indices: list[int] | None = None,
 ) -> dict[str, Any]:
-    """Build JSON-serializable data consumed by the browser live view."""
+    """Build JSON-serializable data consumed by the browser live view.
+
+    Args:
+        pick_pos: Optional pick/loading position for two-segment display.
+        segment_indices: Optional [seg1_end, seg2_end] indices into history
+                         marking segment boundaries for color-coded rendering.
+    """
     if update_hz <= 0:
         raise ValueError('update_hz must be positive')
     if speed <= 0:
@@ -781,6 +789,22 @@ def build_live_payload(
         raise ValueError('history must not be empty')
 
     frame_indices = CraneVisualizer(config).live_frame_indices(history, update_hz)
+
+    # Map segment boundary history indices to frame (display) indices
+    display_segment_indices: list[int] | None = None
+    if segment_indices and len(segment_indices) >= 2:
+        display_segment_indices = []
+        for seg_idx in segment_indices[:2]:
+            # Find the closest frame_indices entry that covers this history index
+            mapped = 0
+            for fi_idx, hi in enumerate(frame_indices):
+                if hi >= seg_idx:
+                    mapped = fi_idx
+                    break
+            else:
+                mapped = len(frame_indices) - 1
+            display_segment_indices.append(mapped)
+
     frames = []
     for idx in frame_indices:
         item = history[idx]
@@ -805,12 +829,17 @@ def build_live_payload(
     xs = [item['x'] for item in history] + [target_pos[0], initial_pos[0]]
     ys = [item['y'] for item in history] + [target_pos[1], initial_pos[1]]
     zs = [item['z'] for item in history] + [target_pos[2], initial_pos[2]]
+    if pick_pos is not None:
+        xs.extend([pick_pos[0]])
+        ys.extend([pick_pos[1]])
+        zs.extend([pick_pos[2]])
 
-    return {
+    result = {
         'updateHz': float(update_hz),
         'speed': float(speed),
         'framePeriodMs': 1000.0 / float(update_hz) / float(speed),
-        'target': _point_tuple(target_pos),
+        'target': _point_tuple(target_pos),   # deprecated alias for place
+        'place': _point_tuple(target_pos),    # place/unload position
         'initial': _point_tuple(initial_pos),
         'bounds': {
             'xMin': min(xs),
@@ -830,6 +859,11 @@ def build_live_payload(
         ],
         'frames': frames,
     }
+    if pick_pos is not None:
+        result['pick'] = _point_tuple(pick_pos)
+    if display_segment_indices is not None:
+        result['segmentIndices'] = display_segment_indices
+    return result
 
 
 # ============================================================================
@@ -1636,13 +1670,17 @@ def render_live_html(plc_mode: bool = False) -> str:
     function ranges() {
       const b = payload.bounds;
       const pad = 0.9;
+      var zExtras = [payload.initial.z];
+      if (payload.target) zExtras.push(payload.target.z);
+      if (payload.pick) zExtras.push(payload.pick.z);
+      if (payload.place) zExtras.push(payload.place.z);
       return {
         xMin: b.xMin - pad,
         xMax: b.xMax + pad,
         yMin: b.yMin - pad,
         yMax: b.yMax + pad,
-        zMin: Math.min(b.zMin, payload.target.z) - 0.35,
-        zMax: Math.max(b.zMax, payload.initial.z, payload.target.z) + 0.35,
+        zMin: Math.min(b.zMin, Math.min.apply(null, zExtras)) - 0.35,
+        zMax: Math.max(b.zMax, Math.max.apply(null, zExtras)) + 0.35,
       };
     }
 
@@ -1677,6 +1715,21 @@ def render_live_html(plc_mode: bool = False) -> str:
       ctx.fillStyle = color;
       ctx.fill();
       ctx.lineWidth = 2;
+      ctx.strokeStyle = '#ffffff';
+      ctx.stroke();
+    }
+
+    function diamond(p, color, size) {
+      size = size || 7;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y - size);
+      ctx.lineTo(p.x + size, p.y);
+      ctx.lineTo(p.x, p.y + size);
+      ctx.lineTo(p.x - size, p.y);
+      ctx.closePath();
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.lineWidth = 1.5;
       ctx.strokeStyle = '#ffffff';
       ctx.stroke();
     }
@@ -1795,10 +1848,49 @@ def render_live_html(plc_mode: bool = False) -> str:
       ctx.beginPath(); ctx.moveTo(box.x + 18, railTop); ctx.lineTo(box.x + box.w - 18, railTop); ctx.stroke();
       ctx.beginPath(); ctx.moveTo(box.x + 18, railBottom); ctx.lineTo(box.x + box.w - 18, railBottom); ctx.stroke();
 
-      const path = payload.frames.map(f => mapPlan(f, box, r));
-      const traveled = payload.frames.slice(0, frame + 1).map(f => mapPlan(f, box, r));
-      polyline(path, '#53697a', 2);
-      polyline(traveled, '#5ebd72', 4);
+      // Two-segment trajectory rendering (pick + place)
+      var segIndices = payload.segmentIndices;
+      var hasSegments = segIndices && segIndices.length >= 2;
+      if (hasSegments) {
+        var seg1End = Math.min(segIndices[0], payload.frames.length - 1);
+        var seg2End = Math.min(segIndices[1], payload.frames.length - 1);
+        if (seg1End > 0 && seg2End > seg1End) {
+          // Segment 1: approach to pick
+          var seg1Path = payload.frames.slice(0, seg1End + 1).map(function(f) { return mapPlan(f, box, r); });
+          // Segment 2: transport to place
+          var seg2Path = payload.frames.slice(seg1End, seg2End + 1).map(function(f) { return mapPlan(f, box, r); });
+
+          // Full paths (dim background lines)
+          polyline(seg1Path, '#3a6b8c', 2.5);  // muted blue
+          polyline(seg2Path, '#8c6b3a', 2.5);  // muted amber
+
+          // Traveled portions (bright)
+          if (frame <= seg1End) {
+            var seg1Traveled = payload.frames.slice(0, frame + 1).map(function(f) { return mapPlan(f, box, r); });
+            polyline(seg1Traveled, '#4da6d9', 4);
+          } else if (frame <= seg2End) {
+            polyline(seg1Path, '#4da6d9', 4);   // full seg1 bright
+            var seg2Traveled = payload.frames.slice(seg1End, frame + 1).map(function(f) { return mapPlan(f, box, r); });
+            polyline(seg2Traveled, '#d98c2e', 4);
+          } else {
+            // Done — show both segments full bright
+            polyline(seg1Path, '#4da6d9', 4);
+            polyline(seg2Path, '#d98c2e', 4);
+          }
+        } else {
+          // Fallback: segment indices are invalid
+          var path = payload.frames.map(function(f) { return mapPlan(f, box, r); });
+          var traveled = payload.frames.slice(0, frame + 1).map(function(f) { return mapPlan(f, box, r); });
+          polyline(path, '#53697a', 2);
+          polyline(traveled, '#5ebd72', 4);
+        }
+      } else {
+        // Backward compat: single-segment rendering
+        var path = payload.frames.map(function(f) { return mapPlan(f, box, r); });
+        var traveled = payload.frames.slice(0, frame + 1).map(function(f) { return mapPlan(f, box, r); });
+        polyline(path, '#53697a', 2);
+        polyline(traveled, '#5ebd72', 4);
+      }
 
       const xTop = mapPlan({x: current.x, y: r.yMax}, box, r);
       const xBottom = mapPlan({x: current.x, y: r.yMin}, box, r);
@@ -1806,12 +1898,33 @@ def render_live_html(plc_mode: bool = False) -> str:
       drawBridgeBeam(xTop, xBottom, current);
       drawTrolley(now, current);
 
+      // Position markers
       const initial = mapPlan(payload.initial, box, r);
-      const target = mapPlan(payload.target, box, r);
-      dot(initial, '#7c8790', 6); label('Initial', initial.x + 10, initial.y - 8, '#aab5bd');
-      dot(target, '#f0a83b', 8); label('Target', target.x + 10, target.y - 8, '#ffc263');
-      label(`X bridge ${current.x.toFixed(2)} m`, box.x + 16, box.y + 28, '#9fc9ed');
-      label(`Y trolley ${current.y.toFixed(2)} m`, box.x + 16, box.y + 48, '#ffe0a8');
+      dot(initial, '#7c8790', 6);
+      label('Start', initial.x + 10, initial.y - 8, '#aab5bd');
+
+      // Pick marker (loading position)
+      var pickPos = payload.pick;
+      if (pickPos) {
+        var pickPt = mapPlan(pickPos, box, r);
+        diamond(pickPt, '#4caf50', 7);
+        label('Pick', pickPt.x + 12, pickPt.y - 6, '#66bb6a');
+      }
+
+      // Place marker (unloading position)
+      var placePos = payload.place || payload.target;
+      if (placePos) {
+        var placePt = mapPlan(placePos, box, r);
+        ctx.fillStyle = '#ef5350';
+        ctx.fillRect(placePt.x - 5, placePt.y - 5, 10, 10);
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(placePt.x - 5, placePt.y - 5, 10, 10);
+        label('Place', placePt.x + 10, placePt.y - 8, '#ef6c60');
+      }
+
+      label('X bridge ' + current.x.toFixed(2) + ' m', box.x + 16, box.y + 28, '#9fc9ed');
+      label('Y trolley ' + current.y.toFixed(2) + ' m', box.x + 16, box.y + 48, '#ffe0a8');
     }
 
     function drawTrolleyCloseup(box, r, current) {
@@ -1821,7 +1934,8 @@ def render_live_html(plc_mode: bool = False) -> str:
       const railBottom = box.y + box.h - 28;
       const yToScreen = y => railBottom - ((y - r.yMin) / (r.yMax - r.yMin)) * (railBottom - railTop);
       const cartY = yToScreen(current.y);
-      const targetY = yToScreen(payload.target.y);
+      const placePos = payload.place || payload.target;
+      const targetY = placePos ? yToScreen(placePos.y) : cartY;
 
       ctx.strokeStyle = '#596b7a';
       ctx.lineWidth = 14;
@@ -1849,18 +1963,53 @@ def render_live_html(plc_mode: bool = False) -> str:
 
     function drawHoistProfile(box, r, current) {
       drawPanel(box, 'Hoist Height');
-      const zPath = payload.frames.map(f => mapZ(f, box, r));
-      const zTravel = payload.frames.slice(0, frame + 1).map(f => mapZ(f, box, r));
-      polyline(zPath, '#6f5835', 2);
-      polyline(zTravel, '#f0a83b', 4);
-      const targetY = mapZ({t: 0, z: payload.target.z}, box, r).y;
+      var segIndices = payload.segmentIndices;
+      var hasSegments = segIndices && segIndices.length >= 2;
+      if (hasSegments) {
+        var seg1End = Math.min(segIndices[0], payload.frames.length - 1);
+        var seg2End = Math.min(segIndices[1], payload.frames.length - 1);
+        if (seg1End > 0 && seg2End > seg1End) {
+          // Segment 1 Z profile
+          var seg1Z = payload.frames.slice(0, seg1End + 1).map(function(f) { return mapZ(f, box, r); });
+          var seg2Z = payload.frames.slice(seg1End, seg2End + 1).map(function(f) { return mapZ(f, box, r); });
+          polyline(seg1Z, '#4d6b3a', 2);   // muted green-blue
+          polyline(seg2Z, '#6b553a', 2);   // muted amber
+
+          // Traveled portions
+          if (frame <= seg1End) {
+            var t1 = payload.frames.slice(0, frame + 1).map(function(f) { return mapZ(f, box, r); });
+            polyline(t1, '#6dd5ed', 3);
+          } else if (frame <= seg2End) {
+            polyline(seg1Z, '#6dd5ed', 3);
+            var t2 = payload.frames.slice(seg1End, frame + 1).map(function(f) { return mapZ(f, box, r); });
+            polyline(t2, '#f0a83b', 3);
+          } else {
+            polyline(seg1Z, '#6dd5ed', 3);
+            polyline(seg2Z, '#f0a83b', 3);
+          }
+        } else {
+          var zPathAll = payload.frames.map(function(f) { return mapZ(f, box, r); });
+          var zTravelAll = payload.frames.slice(0, frame + 1).map(function(f) { return mapZ(f, box, r); });
+          polyline(zPathAll, '#6f5835', 2);
+          polyline(zTravelAll, '#f0a83b', 4);
+        }
+      } else {
+        var zPathAll = payload.frames.map(function(f) { return mapZ(f, box, r); });
+        var zTravelAll = payload.frames.slice(0, frame + 1).map(function(f) { return mapZ(f, box, r); });
+        polyline(zPathAll, '#6f5835', 2);
+        polyline(zTravelAll, '#f0a83b', 4);
+      }
+      const placePos = payload.place || payload.target;
+      const targetY = placePos ? mapZ({t: 0, z: placePos.z}, box, r).y : null;
       const now = mapZ(current, box, r);
-      ctx.setLineDash([5, 5]);
-      ctx.beginPath(); ctx.moveTo(box.x, targetY); ctx.lineTo(box.x + box.w, targetY);
-      ctx.strokeStyle = '#5ebd72'; ctx.lineWidth = 1.5; ctx.stroke();
-      ctx.setLineDash([]);
+      if (targetY !== null) {
+        ctx.setLineDash([5, 5]);
+        ctx.beginPath(); ctx.moveTo(box.x, targetY); ctx.lineTo(box.x + box.w, targetY);
+        ctx.strokeStyle = '#5ebd72'; ctx.lineWidth = 1.5; ctx.stroke();
+        ctx.setLineDash([]);
+      }
       dot(now, '#e05a47', 6);
-      label(`Z ${current.z.toFixed(2)} m`, box.x + 12, box.y + 28, '#ffc263');
+      label('Z ' + current.z.toFixed(2) + ' m', box.x + 12, box.y + 28, '#ffc263');
     }
 
     function layout(rect) {
@@ -2216,31 +2365,55 @@ def render_live_html(plc_mode: bool = False) -> str:
           if (s.step_count <= _lastStepCount) return;
           _lastStepCount = s.step_count;
 
-          // On first step, set Start marker + reset trajectory with auto-fit bounds
+          // On first step, set Start/Pick/Place markers + reset trajectory
           if (!_controlActive) {
             payload.initial = s.start_pos
               ? {x: s.start_pos.x, y: s.start_pos.y, z: s.start_pos.z}
               : {x: d.x, y: d.y, z: d.z};
-            payload.target = {x: d.p_ref_x, y: d.p_ref_y, z: d.p_ref_z};
+            // Set pick position (loading point) for two-segment display
+            if (s.pick_pos) {
+              payload.pick = {x: s.pick_pos.x, y: s.pick_pos.y, z: s.pick_pos.z};
+            }
+            // Set place position (unloading point) — prefer place_pos, fallback to target
+            if (s.place_pos) {
+              payload.place = {x: s.place_pos.x, y: s.place_pos.y, z: s.place_pos.z};
+              payload.target = payload.place;  // backward compat
+            } else if (s.target_pos) {
+              payload.target = {x: s.target_pos.x, y: s.target_pos.y, z: s.target_pos.z};
+              payload.place = payload.target;
+            }
+            // Reset segment indices
+            payload.segmentIndices = [];
             // Keep existing frames for continuous trajectory, mark PD start
             payload.frames.push({t: d.t, x: d.x, y: d.y, z: d.z,
                                  vx: 0, vy: 0, vz: 0, vxCmd: 0, vyCmd: 0, vzCmd: 0,
                                  phaseLabel: 'PD START'});
-            // Fit bounds around initial→target with 20% padding
+            // Fit bounds around initial→pick→place with 20% padding
             var ix = payload.initial.x, iy = payload.initial.y, iz = payload.initial.z;
-            var tx = d.p_ref_x, ty = d.p_ref_y, tz = d.p_ref_z;
-            var padX = Math.max(1.0, Math.abs(tx - ix) * 0.2);
-            var padY = Math.max(1.0, Math.abs(ty - iy) * 0.2);
-            var padZ = Math.max(1.0, Math.abs(tz - iz) * 0.2);
+            var tx = (payload.place || payload.target).x;
+            var ty = (payload.place || payload.target).y;
+            var tz = (payload.place || payload.target).z;
+            var allX = [ix, tx], allY = [iy, ty], allZ = [iz, tz];
+            if (payload.pick) {
+              allX.push(payload.pick.x); allY.push(payload.pick.y); allZ.push(payload.pick.z);
+            }
+            var padX = Math.max(1.0, (Math.max.apply(null, allX) - Math.min.apply(null, allX)) * 0.2);
+            var padY = Math.max(1.0, (Math.max.apply(null, allY) - Math.min.apply(null, allY)) * 0.2);
+            var padZ = Math.max(1.0, (Math.max.apply(null, allZ) - Math.min.apply(null, allZ)) * 0.2);
             payload.bounds = {
-              xMin: Math.min(ix, tx) - padX, xMax: Math.max(ix, tx) + padX,
-              yMin: Math.min(iy, ty) - padY, yMax: Math.max(iy, ty) + padY,
-              zMin: Math.min(iz, tz) - padZ, zMax: Math.max(iz, tz) + padZ,
+              xMin: Math.min.apply(null, allX) - padX, xMax: Math.max.apply(null, allX) + padX,
+              yMin: Math.min.apply(null, allY) - padY, yMax: Math.max.apply(null, allY) + padY,
+              zMin: Math.min.apply(null, allZ) - padZ, zMax: Math.max.apply(null, allZ) + padZ,
             };
-            els.ctrlMsg.textContent = 'Start(' + ix.toFixed(1) + ',' + iy.toFixed(1) + ') Target(' + tx.toFixed(1) + ',' + ty.toFixed(1) + ')';
+            var pickLabel = payload.pick ? (' Pick(' + payload.pick.x.toFixed(1) + ',' + payload.pick.y.toFixed(1) + ')') : '';
+            els.ctrlMsg.textContent = 'Start(' + ix.toFixed(1) + ',' + iy.toFixed(1) + ')' + pickLabel + ' Place(' + tx.toFixed(1) + ',' + ty.toFixed(1) + ')';
             els.ctrlMsg.style.color = '#5ebd72';
           }
           _controlActive = true;
+          // Update segment boundaries from scheduler (live)
+          if (s.segment_boundaries && s.segment_boundaries.length > 0) {
+            payload.segmentIndices = s.segment_boundaries.slice();
+          }
           // Expand bounds if position moves outside (trajectory auto-follow)
           var b = payload.bounds;
           if (d.x < b.xMin + 0.5) b.xMin = d.x - 2;
@@ -2855,8 +3028,10 @@ class ControlState:
         self.latest: dict | None = None   # most recent step_data
         self.running: bool = False
         self.start_pos: dict | None = None  # {'x','y','z'} at Apply Target time
-        self.target_pos: dict | None = None  # {'x','y','z'} target
+        self.target_pos: dict | None = None  # {'x','y','z'} target (place position)
         self.pick_pos: dict | None = None  # {'x','y','z'} pick position (start of operation)
+        self.place_pos: dict | None = None  # {'x','y','z'} place/unload position (alias for target_pos)
+        self.segment_boundaries: list = []  # frame indices marking segment transitions
         self.scheduler_phase: str | None = None
         self.scheduler_phase_label: str | None = None
         self.step_count: int = 0
@@ -2870,6 +3045,7 @@ class ControlState:
         with self.lock:
             self.start_pos = dict(pos)
             self.target_pos = dict(target)
+            self.place_pos = dict(target)  # semantic alias for place/unload position
             self.running = True
             self.done = False
             self.error = None
@@ -2877,6 +3053,7 @@ class ControlState:
             self.stop_reason = None
             self.step_count = 0
             self.arrivals = []
+            self.segment_boundaries = []
             self.scheduler_phase = None
             self.scheduler_phase_label = None
 
@@ -2929,6 +3106,8 @@ class ControlState:
                 'start_pos': self.start_pos,
                 'target_pos': self.target_pos,
                 'pick_pos': pick_pos,
+                'place_pos': self.place_pos,
+                'segment_boundaries': list(self.segment_boundaries),
                 'scheduler_phase': phase_name,
                 'scheduler_phase_label': phase_label,
                 'arrivals': list(self.arrivals),

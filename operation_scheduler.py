@@ -129,6 +129,7 @@ class OperationResult:
     total_time: float = 0.0
     history: list[dict] | None = None
     phase_history: list[tuple[float, OperationPhase]] | None = None
+    segment_indices: list[int] | None = None  # [seg1_end, seg2_end] indices into history
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +292,7 @@ class OperationScheduler:
         t_start = time.monotonic()
         phase_history: list[tuple[float, OperationPhase]] = []
         all_history: list[dict] = []
+        segment_boundaries: list[int] = []  # frame indices at segment transitions
 
         # 保存 control_state 引用供 _run_pd 使用
         self._control_state = control_state
@@ -357,6 +359,12 @@ class OperationScheduler:
             )
             all_history.extend(hist)
 
+            # 记录 Segment 1 (初始→取货) 结束索引
+            _seg1_end = len(all_history)
+            segment_boundaries.append(_seg1_end)
+            if control_state is not None:
+                self._update_control_state_segment(control_state, _seg1_end)
+
             # ================================================================
             # Phase 1c: 夹取钢卷
             # Z 下降到位后, 先自适应判稳再夹取——避免货物仍在摆动/回弹时就
@@ -422,6 +430,12 @@ class OperationScheduler:
             )
             all_history.extend(hist)
 
+            # 记录 Segment 2 (取货→卸货) 结束索引
+            _seg2_end = len(all_history)
+            segment_boundaries.append(_seg2_end)
+            if control_state is not None:
+                self._update_control_state_segment(control_state, _seg2_end)
+
             # ================================================================
             # Phase 2d: 释放钢卷
             # Z 下降到位后, 先自适应判稳再释放——这是最关键的风险点: 货物
@@ -477,6 +491,7 @@ class OperationScheduler:
                 total_time=total_time,
                 history=all_history,
                 phase_history=phase_history,
+                segment_indices=segment_boundaries,
             )
 
         except ControlStoppedError as exc:
@@ -782,6 +797,16 @@ class OperationScheduler:
             with control_state.lock:
                 control_state.scheduler_phase = phase
                 control_state.scheduler_phase_label = phase.label
+        except Exception:
+            pass
+
+    def _update_control_state_segment(self, control_state, frame_index: int) -> None:
+        """记录 segment 边界索引到 ControlState (供前端分段渲染)。"""
+        try:
+            with control_state.lock:
+                if not hasattr(control_state, 'segment_boundaries'):
+                    control_state.segment_boundaries = []
+                control_state.segment_boundaries.append(frame_index)
         except Exception:
             pass
 
