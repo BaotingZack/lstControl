@@ -1527,6 +1527,7 @@ def render_live_html(plc_mode: bool = False) -> str:
     // PD 结束后冻结轨迹: 保留起点→目标点的完整轨迹在画面上, 阻止实时定位
     // 直播用其 30 帧滑动窗口覆盖/裁掉这条轨迹, 方便展示成果。
     let _trajectoryFrozen = false;
+    let _segBoundariesRecorded = 0;  // number of segment boundaries already captured (0/1/2)
 
     const els = {
       rate: document.getElementById('rate'),
@@ -2384,6 +2385,7 @@ def render_live_html(plc_mode: bool = False) -> str:
             }
             // Reset segment indices
             payload.segmentIndices = [];
+            _segBoundariesRecorded = 0;
             // Keep existing frames for continuous trajectory, mark PD start
             payload.frames.push({t: d.t, x: d.x, y: d.y, z: d.z,
                                  vx: 0, vy: 0, vz: 0, vxCmd: 0, vyCmd: 0, vzCmd: 0,
@@ -2410,14 +2412,20 @@ def render_live_html(plc_mode: bool = False) -> str:
             els.ctrlMsg.style.color = '#5ebd72';
           }
           _controlActive = true;
-          // Update segment boundaries from scheduler (live).
-          // Backend records PD step counts (~10 Hz); frontend decimates to ~2 Hz.
-          // Convert step-space indices to frame-space indices using current ratio.
-          if (s.segment_boundaries && s.segment_boundaries.length > 0 && s.step_count > 0) {
-            var ratio = payload.frames.length / s.step_count;
-            payload.segmentIndices = s.segment_boundaries.map(function(n) {
-              return Math.round(n * ratio);
-            });
+          // Track segment boundaries by detecting scheduler phase transitions.
+          // Between movement phases there are gripper actions + settle delays
+          // (~1-2 s), so the frontend reliably captures the boundary before
+          // the next segment starts pushing frames.  This avoids the index-
+          // space mismatch between backend PD step counts (~10 Hz) and
+          // frontend display frames (~2 Hz decimated).
+          if (s.scheduler_phase === 'GRIPPER_CLAMP' && _segBoundariesRecorded === 0) {
+            payload.segmentIndices[0] = Math.max(0, payload.frames.length - 1);
+            _segBoundariesRecorded = 1;
+          }
+          if ((s.scheduler_phase === 'GRIPPER_RELEASE' || s.scheduler_phase === 'RETURN_Z' || s.scheduler_phase === 'DONE')
+              && _segBoundariesRecorded === 1) {
+            payload.segmentIndices[1] = Math.max(0, payload.frames.length - 1);
+            _segBoundariesRecorded = 2;
           }
           // Expand bounds if position moves outside (trajectory auto-follow)
           var b = payload.bounds;
