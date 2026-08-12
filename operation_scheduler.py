@@ -8,7 +8,8 @@ Operation Scheduler — 完整起重机作业流程编排
   Phase 3 (归位): Z 轴抬升到安全高度
 
 安全高度约定 (绝对高度, 相对于地面):
-  self._config.approach_safe_z = 1.0m  — 取货阶段安全高度
+  self._config.approach_safe_z = 1.0m  — 接近取货点时的 Z 安全高度
+  self._config.lift_cargo_safe_z = 1.2m — 夹取后带货上升的安全高度
   self._config.transport_safe_z = 1.5m — 运输阶段安全高度
   Z_SAFE_FINAL     = 1.6m — 作业完成后 Z 归位高度
 
@@ -58,7 +59,8 @@ from plc_interface import PLCInterface
 # 安全高度常量 [m] (绝对高度, 相对于地面) — 默认值, 由 CraneConfig 覆盖
 # ---------------------------------------------------------------------------
 
-Z_SAFE_APPROACH = 1.0   # 取货阶段安全高度 (默认, 可被 CraneConfig.approach_safe_z 覆盖)
+Z_SAFE_APPROACH = 1.0   # 接近取货点安全高度 (默认, 可被 CraneConfig.approach_safe_z 覆盖)
+Z_SAFE_LIFT_CARGO = 1.2 # 夹取后带货上升安全高度 (默认, 可被 CraneConfig.lift_cargo_safe_z 覆盖)
 Z_SAFE_TRANSPORT = 1.5  # 运输阶段安全高度 (默认, 可被 CraneConfig.transport_safe_z 覆盖)
 Z_SAFE_FINAL = 1.6      # 作业完成后归位高度 (默认, 可被 CraneConfig.return_safe_z 覆盖)
 
@@ -102,7 +104,7 @@ class OperationPhase(Enum):
             OperationPhase.APPROACH_XY:             "Phase 1a: 接近取货位置 (Z→1.0m)",
             OperationPhase.APPROACH_Z_DESCEND:      "Phase 1b: Z 下降到取货高度",
             OperationPhase.GRIPPER_CLAMP:           "Phase 1c: 夹取钢卷",
-            OperationPhase.LIFT_CARGO:              "Phase 2a: 带货上升到安全高度",
+            OperationPhase.LIFT_CARGO:              "Phase 2a: 带货上升到安全高度 (Z→1.2m)",
             OperationPhase.TRANSPORT_XY:            "Phase 2b: 运输到目标位置 (Z→1.5m)",
             OperationPhase.TRANSPORT_Z_DESCEND:     "Phase 2c: Z 下降到卸货高度",
             OperationPhase.GRIPPER_RELEASE:         "Phase 2d: 释放钢卷",
@@ -372,7 +374,7 @@ class OperationScheduler:
             self._safety_sleep(self._config.gripper_safety_delay, "夹取确认后安全等待")
 
             # ================================================================
-            # Phase 2a: 带货上升到 1.0m (初始离地安全高度)
+            # Phase 2a: 带货上升到 lift_cargo_safe_z (夹取后安全高度)
             # ================================================================
             _record_phase(OperationPhase.LIFT_CARGO)
             if self.hooks.should_stop():
@@ -380,7 +382,7 @@ class OperationScheduler:
 
             current_state = self._get_current_state()
             hist, _ = self._run_pd(
-                target=(sx, sy, self._config.approach_safe_z),
+                target=(sx, sy, self._config.lift_cargo_safe_z),
                 initial_state=current_state,
                 phase_label="LIFT_CARGO",
             )

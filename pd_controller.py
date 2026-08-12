@@ -27,9 +27,14 @@ class PositionPDController:
     因为对 10Hz 量化定位做差分会引入较大噪声，直接进入 D 项会让
     速度指令在目标附近来回抖动、频繁换向。
 
-    另外提供两项防抖动保护 (默认关闭, 保持纯 PD 语义):
+    另外提供三项防抖动保护 (默认关闭, 保持纯 PD 语义):
       - position_deadband: 位置误差进入到位窗口后指令直接归零，
         消除锁定前的微幅蠕动与换向脉冲。
+      - position_deadband_release: 死区滞环 (Schmitt 触发)。进入死区后
+        需要误差超过这个更大的阈值才重新给指令。没有滞环时，量化/滞后的
+        位置反馈会在容差边界上抖进抖出，每出去一次就给一个方向不定的速度
+        脉冲——对 Z 这种"速度指令被积分成绝对高度设定值"的轴，每个脉冲都
+        变成一段真实行程，表现为抓钩在目标附近来回换向。
       - reverse_tol:       防反向抽动。速度伺服型行车"刹车"应是指令
         归零而非反向脉冲；除非确实越过目标 (|误差| >= reverse_tol)，
         否则禁止朝远离目标方向给速度，避免机械冲击与来回蠕动。
@@ -54,6 +59,7 @@ class PositionPDController:
         ki_pos: float = 0.0,
         integral_band: float = 0.0,
         integral_output_limit: float = 0.0,
+        position_deadband_release: float = 0.0,
     ):
         if v_max <= 0:
             raise ValueError('v_max must be positive')
@@ -63,6 +69,8 @@ class PositionPDController:
             raise ValueError('kd_pos must be non-negative')
         if position_deadband < 0:
             raise ValueError('position_deadband must be non-negative')
+        if position_deadband_release < 0:
+            raise ValueError('position_deadband_release must be non-negative')
         if reverse_tol < 0:
             raise ValueError('reverse_tol must be non-negative')
         if ki_pos < 0:
@@ -75,16 +83,20 @@ class PositionPDController:
         self.kd_pos = kd_pos
         self.v_max = v_max
         self.position_deadband = position_deadband
+        # 滞环退出阈值不得小于进入阈值; 0 表示不用滞环 (进出同一个阈值)。
+        self.position_deadband_release = max(position_deadband_release, position_deadband)
         self.reverse_tol = reverse_tol
+        self._in_deadband = False
         self.ki_pos = ki_pos
         self.integral_band = integral_band
         self.integral_output_limit = integral_output_limit
         self._integral = 0.0
 
     def reset(self):
-        """重置积分状态 (每次 run_pd_control 调用都会新建控制器实例,
+        """重置积分与死区滞环状态 (每次 run_pd_control 调用都会新建控制器实例,
         这里主要用于同一控制器实例被跨阶段复用的场景)。"""
         self._integral = 0.0
+        self._in_deadband = False
 
     def update(
         self,
@@ -107,10 +119,18 @@ class PositionPDController:
         """
         position_error = target_position - measured_position
 
-        # 位置死区: 已进入到位窗口则不再输出速度，消除锁定前的抖动/换向脉冲。
-        if self.position_deadband > 0.0 and abs(position_error) < self.position_deadband:
-            self._integral = 0.0
-            return 0.0
+        # 位置死区 (带滞环): 已进入到位窗口则不再输出速度，消除锁定前的抖动/
+        # 换向脉冲; 进入后需要误差超过 position_deadband_release 才重新给指令，
+        # 避免反馈噪声在容差边界上抖进抖出、反复触发速度脉冲。
+        if self.position_deadband > 0.0:
+            threshold = (
+                self.position_deadband_release if self._in_deadband else self.position_deadband
+            )
+            if abs(position_error) < threshold:
+                self._in_deadband = True
+                self._integral = 0.0
+                return 0.0
+            self._in_deadband = False
 
         integral_term = 0.0
         if self.ki_pos > 0.0 and dt is not None and dt > 0.0:

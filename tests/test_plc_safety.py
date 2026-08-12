@@ -134,7 +134,9 @@ def test_plc_actuator_z_setpoint_marches_all_the_way_to_target():
     """liftctrl 是绝对位置伺服: 设 Z 目标后, 高度设定值必须一路走到目标并停住,
     而不是每周期只领先一步 (旧逻辑会因 update_state 重锚导致设定值几乎不动)。"""
     plc = RecordingPLC()
-    actuator = PlcActuator(plc, initial_z=5.0)  # target 2.0 > floor 0.35
+    # z_hold_band=0: 只考察"设定值一路走到目标"这件事, 到达后的有界微调
+    # 权限由 test_plc_actuator_z_hold_band_allows_bounded_trim 单独覆盖。
+    actuator = PlcActuator(plc, initial_z=5.0, z_hold_band=0.0)  # target 2.0 > floor 0.35
     actuator.set_z_target(2.0)
 
     for _ in range(300):
@@ -153,7 +155,7 @@ def test_plc_actuator_z_setpoint_marches_all_the_way_to_target():
 
 def test_plc_actuator_z_setpoint_does_not_overshoot_ascending_target():
     plc = RecordingPLC()
-    actuator = PlcActuator(plc, initial_z=1.0)
+    actuator = PlcActuator(plc, initial_z=1.0, z_hold_band=0.0)
     actuator.set_z_target(3.0)
 
     for _ in range(300):
@@ -161,6 +163,59 @@ def test_plc_actuator_z_setpoint_does_not_overshoot_ascending_target():
 
     assert plc.lift_commands[-1] == pytest.approx(3.0)
     assert max(plc.lift_commands) <= 3.0 + 1e-9  # 不越过目标
+
+
+def test_plc_actuator_confines_z_setpoint_once_inside_hold_band():
+    """设定值一旦进入目标 ±z_hold_band 就永久被限死在带内。
+
+    现场故障: Z 在目标附近反复上下升降、收不住。旧逻辑只按逼近方向做单侧钳位,
+    另一侧不受限; 而 PD 往往在设定值到达目标之前就进入位置死区、设定值停在目标
+    外侧几厘米, 于是反向指令 (来自反馈滞后/量化噪声) 能把它一路推回去。
+    """
+    plc = RecordingPLC()
+    band = PlcActuator._Z_HOLD_BAND_DEFAULT
+    target = 1.21
+    actuator = PlcActuator(plc, initial_z=1.60)
+    actuator.set_z_target(target)
+
+    for _ in range(30):                       # 下放到目标附近
+        actuator.apply(0.0, 0.0, -0.2, 0.1)
+    for i in range(60):                       # 之后持续换向的速度指令
+        actuator.apply(0.0, 0.0, 0.2 if i % 2 else -0.2, 0.1)
+
+    tail = plc.lift_commands[30:]
+    assert max(tail) <= target + band + 1e-9
+    assert min(tail) >= target - band - 1e-9
+
+
+def test_plc_actuator_z_setpoint_stops_one_hold_band_past_target():
+    """逼近阶段最多走到带的远侧边界 (给受载绳伸长/标定偏差的有界修正权限)。"""
+    plc = RecordingPLC()
+    actuator = PlcActuator(plc, initial_z=1.0, z_hold_band=0.05)
+    actuator.set_z_target(1.1)
+
+    for _ in range(30):
+        actuator.apply(0.0, 0.0, 0.2, 0.1)   # 持续上推
+
+    assert max(plc.lift_commands) == pytest.approx(1.15)
+    assert all(h <= 1.15 + 1e-9 for h in plc.lift_commands)
+
+
+def test_plc_actuator_redirects_after_new_z_target():
+    """棘轮方向只在本阶段内有效; 注入新目标后按新的高低关系重新定向。"""
+    plc = RecordingPLC()
+    actuator = PlcActuator(plc, initial_z=1.0, z_hold_band=0.0)
+    actuator.set_z_target(1.1)
+    for _ in range(10):
+        actuator.apply(0.0, 0.0, 0.2, 0.1)
+    assert plc.lift_commands[-1] == pytest.approx(1.1)
+
+    actuator.set_z_target(0.6)
+    for _ in range(40):
+        actuator.apply(0.0, 0.0, -0.2, 0.1)
+
+    assert plc.lift_commands[-1] == pytest.approx(0.6)
+    assert min(plc.lift_commands) >= 0.6 - 1e-9
 
 
 def test_plc_actuator_enforces_minimum_lift_height_floor():
@@ -211,6 +266,199 @@ def test_plc_actuator_rejects_motion_when_connection_or_heartbeat_is_unhealthy()
         disconnected.apply(0.1, 0.0, 0.0, 0.1)
     with pytest.raises(RuntimeError, match="heartbeat"):
         heartbeat_lost.apply(0.1, 0.0, 0.0, 0.1)
+
+
+class HoistServoPLC(RecordingPLC):
+    """把 liftctrl 当作真实的绝对位置伺服来模拟。
+
+    真实 Z 链路的关键特征 (与 X/Y 完全不同, 也是纯仿真里看不到的部分):
+      - liftctrl(h) 收的是绝对目标高度, PLC 内部位置环带惯量/滞后地跟随;
+      - 高度反馈 GetActualLiftHeight() 分辨率粗 (默认 1cm) 且只有 10Hz;
+      - 没有原生 Z 速度, 速度只能由高度差分估计;
+      - feedback_delay: 反馈纯延迟。S7 轮询 + PLC 扫描, 且连接抖动期间
+        _LiftHeightSanitizer 会沿用上一次可信读数 (最长 2s), 等效于纯延迟;
+      - report_bias: 实测高度与指令参考系的偏差 (受载钢丝绳伸长/标定偏差)。
+    """
+
+    def __init__(self, initial_height: float, *, max_rate: float = 0.2,
+                 quantum: float = 0.01, loop_gain: float = 2.0, lag: float = 0.5,
+                 report_bias: float = 0.0, feedback_delay: int = 0):
+        super().__init__()
+        self.height = initial_height
+        self.setpoint = initial_height
+        self.velocity = 0.0
+        self.max_rate = max_rate
+        self.quantum = quantum
+        self.loop_gain = loop_gain
+        self.lag = lag
+        self.report_bias = report_bias
+        self._flicker = False
+        self._delay_buffer = [initial_height + report_bias] * feedback_delay
+
+    def lift_ctrl(self, height):
+        super().lift_ctrl(height)
+        self.setpoint = height
+
+    def step(self, dt: float) -> None:
+        want = self.loop_gain * (self.setpoint - self.height)
+        want = max(-self.max_rate, min(self.max_rate, want))
+        if self.lag > 0.0:
+            self.velocity += (want - self.velocity) * min(1.0, dt / self.lag)
+        else:
+            self.velocity = want
+        self.height += self.velocity * dt
+
+    def measured_height(self) -> float:
+        """量化到 quantum, 并在相邻两个刻度之间抖动 —— 现场读数的典型表现。
+
+        一次 1cm 抖动对应 0.1m/s 的瞬时差分速度, 经 τ=0.8s 低通后仍有
+        0.01m/s 量级, 正是 Z 到位判定被噪声反复清零的来源。
+        """
+        counts = (self.height + self.report_bias) / self.quantum
+        self._flicker = not self._flicker
+        value = (math.ceil(counts) if self._flicker else math.floor(counts)) * self.quantum
+        if not self._delay_buffer:
+            return value
+        self._delay_buffer.append(value)
+        return self._delay_buffer.pop(0)
+
+
+class HoistZSource:
+    """10Hz 位置源: X/Y 固定 (已在目标), Z 取抓钩量化高度, 无原生 Z 速度。"""
+
+    def __init__(self, plc, xy, dt: float = 0.1):
+        self._plc = plc
+        self._xy = xy
+        self._dt = dt
+        self._t = 0.0
+        self._stamp = 0
+
+    def reset(self):
+        pass
+
+    def get_position(self):
+        self._plc.step(self._dt)
+        self._t += self._dt
+        self._stamp += 1
+        return {
+            "x": self._xy[0],
+            "y": self._xy[1],
+            "z": self._plc.measured_height(),
+            "vx": 0.0,
+            "vy": 0.0,
+            "vz": None,          # 抓钩高度没有原生速度, 只能差分估计
+            "dt": self._dt,
+            "t": self._t,
+            "stamp": self._stamp,
+        }
+
+
+def test_z_converges_without_hunting_on_quantized_hoist_feedback():
+    """Z 必须在目标处收住并锁轴, 高度指令不得出现上下往复。
+
+    现场故障: Z 有时收不到目标位置, 在目标附近反复上下移动。三处根因:
+      1. Z 的 vz 指令被执行器积分成高度设定值 (liftctrl 是位置伺服), 位置环
+         本身已含积分环节; 再叠加 ki_pos 就是双重积分 → 目标附近极限环。
+      2. 设定值走到目标后仍可被换向指令推着穿越目标 → 被指挥着上下升降。
+      3. Z 速度由 1cm/10Hz 高度差分估计, 噪声地板高于 arrival_vel_tol(0.005)
+         与 velocity_deadband(0.01) → 到位去抖计数被噪声一帧帧清零, 永远锁不上轴。
+    """
+    # 2cm 分辨率: 一次刻度跳变的差分速度经低通后仍有 0.02m/s 量级, 正好压过
+    # X/Y 用的 arrival_vel_tol(0.005)/velocity_deadband(0.01) —— 用这组容差时,
+    # 抓钩明明停在目标 ±1cm 内, Z 也永远锁不上轴, 只能等 PD 超时。
+    plc = HoistServoPLC(initial_height=1.60, quantum=0.02)
+    actuator = PlcActuator(plc, initial_z=1.60)
+    source = HoistZSource(plc, xy=(2.0, 3.0))
+    target = (2.0, 3.0, 1.21)
+
+    history, arrivals = run_pd_control(
+        source=source,
+        actuator=actuator,
+        config=CraneConfig(),
+        target_pos=target,
+        initial_state=CraneState(2.0, 3.0, 1.60),
+        max_time=120.0,
+        verbose=False,
+        is_simulation=False,
+    )
+
+    assert {axis for _, axis in arrivals} == {"x", "y", "z"}
+    assert abs(plc.height - target[2]) < 0.03
+
+    # 高度指令全程单调下行 (到目标后保持), 没有一次方向反转 = 没有上下往复。
+    steps = [
+        b - a
+        for a, b in zip(plc.lift_commands, plc.lift_commands[1:])
+        if abs(b - a) > 1e-9
+    ]
+    assert steps, "expected the hoist setpoint to actually move"
+    assert all(step < 0.0 for step in steps)
+
+
+def count_swings(series, min_amplitude):
+    """统计序列里幅度超过 min_amplitude 的往复段数 (方向反转且走出该幅度)。
+
+    只数"反转次数"会把 1mm 以下、现场根本看不出来的抖动也算进去; 操作员看到的
+    "上下移动"是有幅度的往复, 所以按幅度过滤。
+    """
+    swings = 0
+    direction = 0
+    extreme = series[0] if series else 0.0
+    for previous, current in zip(series, series[1:]):
+        step_direction = (current > previous) - (current < previous)
+        if step_direction == 0:
+            continue
+        if direction and step_direction != direction:
+            if abs(current - extreme) > min_amplitude:
+                swings += 1
+                extreme = current
+        else:
+            extreme = current
+        direction = step_direction
+    return swings
+
+
+def test_z_does_not_hunt_when_height_feedback_lags_behind():
+    """反馈纯延迟 (S7 轮询/PLC 扫描, 抖动期间还会沿用旧读数) 是 Z 在目标附近
+    上下往复的放大器: 环路里已有"速度指令→高度设定值"这一个积分, 再叠加积分项
+    就是双重积分, 加上纯延迟必然自激; 而设定值一旦越过目标就不再受单调钳位
+    约束, 于是能被推得很远, 抓钩跟着大幅上下跑。
+
+    同场景修复前: PD 跑到 120s 超时都收不住, 高度设定值被推离目标 4~15cm 并反复
+    换向 (抓钩肉眼可见地上下跑)。修复后要求: 正常收敛、设定值越过目标不超过微调带、
+    进入目标附近后不再出现有幅度的往复。
+    """
+    target_z = 1.21
+    plc = HoistServoPLC(
+        initial_height=1.60,
+        report_bias=-0.03,   # 受载绳伸长: 实测比指令参考系低 3cm
+        feedback_delay=15,   # 1.5s 反馈纯延迟
+    )
+    actuator = PlcActuator(plc, initial_z=1.60)
+    source = HoistZSource(plc, xy=(2.0, 3.0))
+
+    _, arrivals = run_pd_control(
+        source=source,
+        actuator=actuator,
+        config=CraneConfig(),
+        target_pos=(2.0, 3.0, target_z),
+        initial_state=CraneState(2.0, 3.0, 1.60),
+        max_time=120.0,
+        verbose=False,
+        is_simulation=False,
+    )
+
+    assert {axis for _, axis in arrivals} == {"x", "y", "z"}
+
+    commands = plc.lift_commands
+    band = PlcActuator._Z_HOLD_BAND_DEFAULT
+    assert min(commands) >= target_z - band - 1e-9   # 下降方向不会越过目标跑远
+
+    # 进入目标 ±0.10m 之后, 高度指令不得再出现幅度超过 2mm 的往复。
+    near_start = next(
+        i for i, height in enumerate(commands) if abs(height - target_z) < 0.10
+    )
+    assert count_swings(commands[near_start:], 0.002) == 0
 
 
 def test_timeout_always_emergency_stops_and_cleans_up():

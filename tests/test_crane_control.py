@@ -42,6 +42,37 @@ def test_position_controller_uses_filtered_velocity_for_damping():
     assert reverse == pytest.approx(-0.6)
 
 
+def test_position_deadband_hysteresis_keeps_command_zero_until_release():
+    """死区滞环: 进入到位窗口后, 误差需超过更大的退出阈值才重新给速度指令。
+
+    没有滞环时, 量化/带滞后的位置反馈会在同一个容差边界上抖进抖出, 每次出去都
+    给一个方向不定的速度脉冲; 对 Z (速度指令被积分成绝对高度设定值) 而言每个
+    脉冲都是一段真实升降, 表现为抓钩在目标附近来回换向。
+    """
+    controller = PositionPDController(
+        kp_pos=0.4, kd_pos=0.0, v_max=0.2,
+        position_deadband=0.02,
+        position_deadband_release=0.04,
+    )
+
+    assert controller.update(1.0, 0.90) == pytest.approx(0.04)   # 窗口外: 正常输出
+    assert controller.update(1.0, 0.99) == 0.0                   # 进入窗口: 归零
+    assert controller.update(1.0, 0.975) == 0.0                  # 误差 2.5cm: 仍锁在窗口内
+    assert controller.update(1.0, 1.03) == 0.0                   # 另一侧 3cm: 仍锁住
+    assert controller.update(1.0, 0.95) == pytest.approx(0.02)   # 超过退出阈值: 重新输出
+    assert controller.update(1.0, 0.975) == pytest.approx(0.01)  # 退出后按进入阈值判定
+
+
+def test_position_deadband_without_release_keeps_original_behavior():
+    """未配置滞环时进出同一个阈值 (X/Y 保持原有语义)。"""
+    controller = PositionPDController(
+        kp_pos=0.4, kd_pos=0.0, v_max=0.2, position_deadband=0.02,
+    )
+
+    assert controller.update(1.0, 0.99) == 0.0
+    assert controller.update(1.0, 0.975) == pytest.approx(0.01)
+
+
 def test_dispatch_target_is_reached_by_position_to_velocity_control(default_config):
     target_pos = (8.0, 6.0, 1.5)
     history, events = run_simulation(

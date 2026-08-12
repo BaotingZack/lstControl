@@ -250,7 +250,7 @@ int main()
             break;
 
         case 5:
-            liftctrl(0.6, ip.c_str());
+            liftctrl(0.4, ip.c_str());
             std::cout << "send hoist 0.6m" << std::endl;
             break;
 

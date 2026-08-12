@@ -25,6 +25,7 @@ from operation_scheduler import (
     OperationResult,
     SchedulerHooks,
     Z_SAFE_APPROACH,
+    Z_SAFE_LIFT_CARGO,
     Z_SAFE_TRANSPORT,
     Z_SAFE_FINAL,
     STABILIZE_DELAY,
@@ -129,13 +130,15 @@ class TestSafetyConstants:
     """Verify safety height constants match the specification document."""
 
     def test_safety_heights_are_reasonable(self):
-        assert Z_SAFE_APPROACH == 1.0   # 取货阶段安全高度
+        assert Z_SAFE_APPROACH == 1.0   # 接近取货点安全高度
+        assert Z_SAFE_LIFT_CARGO == 1.2 # 夹取后带货上升安全高度
         assert Z_SAFE_TRANSPORT == 1.5  # 运输阶段安全高度
         assert Z_SAFE_FINAL == 1.6      # 最终归位高度
 
     def test_safety_heights_are_monotonic(self):
-        """Transport height should be >= approach height for safety."""
-        assert Z_SAFE_APPROACH <= Z_SAFE_TRANSPORT
+        """Transport height should be >= approach/lift heights for safety."""
+        assert Z_SAFE_APPROACH <= Z_SAFE_LIFT_CARGO
+        assert Z_SAFE_LIFT_CARGO <= Z_SAFE_TRANSPORT
         assert Z_SAFE_TRANSPORT <= Z_SAFE_FINAL
 
     def test_delay_constants_are_reasonable(self):

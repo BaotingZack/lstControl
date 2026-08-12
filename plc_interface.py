@@ -637,9 +637,29 @@ class PlcActuator:
       下发给 liftctrl 的绝对高度会被钳到 >= min_lift_height (默认 0.35m),
       保证抓钩离地不小于该高度; 无论 PD 输出或目标怎么设, 都不会命令
       抓钩降到该安全高度以下。
+
+    Z 设定值进入目标附近后的有界锁定 (z_hold_band):
+      设定值单调逼近目标; 一旦进入目标 ±z_hold_band, 就永久被限制在这个带内
+      (直到下一次 set_z_target)。
+
+      为什么需要它: 抓钩高度反馈是 10Hz 粗分辨率读数, 还要经 S7 轮询/PLC 扫描
+      (连接抖动期间 _LiftHeightSanitizer 会沿用旧读数) 带上滞后。位置误差因此
+      会在目标附近变号, 而"速度指令→高度设定值"这一步是积分环节, 每次变号都被
+      积分成一段真实行程 → 抓钩在目标附近上下跑。旧逻辑只按"设目标时刻"的方向
+      做单侧钳位, 另一侧没有任何限制: 而且 PD 常常在设定值到达目标之前就进入
+      位置死区、设定值停在目标外侧几厘米, 此时连"已到达"都不算, 于是反向指令
+      可以把它一路推回去 —— 这正是加了单侧钳位后现场仍然会看到换向的原因。
+      改成"进入带内即锁定"后, 设定值的活动范围在结构上被限死在 ±z_hold_band。
+
+      为什么保留双向微调而不是彻底冻结: 受载钢丝绳伸长/高度标定偏差会让实测
+      高度与指令参考系差几厘米, 需要的修正方向可能与本段行程相反; 完全冻结会
+      让实测始终差在到位容差之外, 作业卡到 PD 超时。带内往哪边修正都允许, 幅度
+      上限固定; 真正抑制来回换向的是 PD 位置死区的滞环 (见 CraneConfig
+      .arrival_pos_tol_z), 带内修正因此也只会发生在确认性偏差 (>4cm) 上。
     """
 
     _MIN_LIFT_HEIGHT_DEFAULT = 0.35  # [m] 抓钩离地最小安全高度
+    _Z_HOLD_BAND_DEFAULT = 0.03      # [m] 进入目标附近后设定值的活动半宽
 
     def __init__(
         self,
@@ -650,15 +670,18 @@ class PlcActuator:
         small_car_sign: float = 1.0,
         lift_sign: float = 1.0,
         min_lift_height: float = _MIN_LIFT_HEIGHT_DEFAULT,
+        z_hold_band: float = _Z_HOLD_BAND_DEFAULT,
     ):
         self._plc = plc
         self._command_lock = threading.RLock()
         self._min_lift_height = float(min_lift_height)   # [m] 抓钩离地安全下限
+        self._z_hold_band = abs(float(z_hold_band))      # [m] 目标附近的活动半宽
         self._z_height = initial_z          # Z 轴绝对高度设定值 (下发给 liftctrl)
         # Z 目标高度 (由 PD 控制循环通过 set_z_target 注入)。liftctrl 是绝对位置
         # 伺服, 故 Z 设定值需一路逼近目标, 而非每周期只领先实测一步。
         self._z_target: float | None = None
-        self._z_target_descending = False   # 相对设目标时刻的运动方向 (防越过)
+        self._z_target_descending = False   # 逼近方向 (相对设目标时刻)
+        self._z_in_hold_band = False        # 是否已进入目标 ±z_hold_band (进入后锁定)
         self._last_vx: float | None = None
         self._last_vy: float | None = None
         self._last_z_height: float | None = None
@@ -710,14 +733,28 @@ class PlcActuator:
             # 给 liftctrl 的设定值会一路走到目标, PLC 内部位置环随即跟随; 而不是
             # 每周期把设定值重锚到实测、只领先一步 vz*dt——后者遇到伺服/驱动死区
             # 几乎不动, 表现为"Z 不受 PD 控制"。速度仍由 PD 决定 (含限速/阻尼)。
+            # 走到目标后设定值就地锁定 (见 z_hold_band), 不再被噪声推着往复。
             self._z_height += vz_out * dt
             if self._z_target is not None:
-                # 防越过目标: 按"设目标时刻"的方向把设定值钳在目标一侧,
-                # 不受单帧速度噪声换向影响。
-                if self._z_target_descending:
-                    self._z_height = max(self._z_height, self._z_target)
-                else:
-                    self._z_height = min(self._z_height, self._z_target)
+                if not self._z_in_hold_band:
+                    # 逼近阶段: 按"设目标时刻"的方向单调走, 最多到带的近侧边界。
+                    if self._z_target_descending:
+                        self._z_height = max(
+                            self._z_height, self._z_target - self._z_hold_band
+                        )
+                    else:
+                        self._z_height = min(
+                            self._z_height, self._z_target + self._z_hold_band
+                        )
+                    if abs(self._z_height - self._z_target) <= self._z_hold_band:
+                        self._z_in_hold_band = True
+                if self._z_in_hold_band:
+                    # 已进入目标附近: 活动范围永久限死在 ±z_hold_band 内, 反馈
+                    # 滞后/噪声再怎么让误差变号, 也不可能被推着往复跑远。
+                    self._z_height = min(
+                        max(self._z_height, self._z_target - self._z_hold_band),
+                        self._z_target + self._z_hold_band,
+                    )
             # 下发前钳到安全下限, 保证抓钩离地不小于 min_lift_height。
             self._z_height = self._clamp_lift_height(self._z_height)
             self._plc.last_vz = vz_out
@@ -736,17 +773,24 @@ class PlcActuator:
         with self._command_lock:
             self._z_height = float(height)
             self._last_z_height = None
+            if self._z_target is not None:
+                # 重锚设定值后按新的高低关系重新定向 (阶段起点变了)。
+                self._z_target_descending = self._z_target < self._z_height
+                self._z_in_hold_band = (
+                    abs(self._z_height - self._z_target) <= self._z_hold_band
+                )
 
     def set_z_target(self, target_height: float) -> None:
         """注入 Z 目标高度 (抓钩高度参考系), 供绝对高度设定值单调逼近。
 
-        目标同样钳到安全下限; 运动方向按当前设定值与目标的高低关系确定,
+        目标同样钳到安全下限; 逼近方向按当前设定值与目标的高低关系确定,
         避免下降/上升过程中因单帧速度换向而把设定值提前吸附到目标。
         """
         with self._command_lock:
             target = self._clamp_lift_height(float(target_height))
             self._z_target = target
             self._z_target_descending = target < self._z_height
+            self._z_in_hold_band = abs(self._z_height - target) <= self._z_hold_band
 
     def update_state(self, state: CraneState, position: dict) -> None:
         """从 /localization_pose 数据更新 CraneState。

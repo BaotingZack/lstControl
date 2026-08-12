@@ -206,6 +206,19 @@ class CraneConfig:
     integral_band: float = 0.08             # [m] 仅在 |误差| 小于该值时才开始积分累加
     integral_output_limit: float = 0.10     # [m/s] 积分项对速度指令的贡献上限, 防止积分主导过冲
 
+    # PLC 模式下 Z 轴单独的积分增益, 默认 0 (纯 PD)。原因是 Z 与 X/Y 的执行链路
+    # 结构不同: X/Y 是速度伺服 (指令速度→车走), 而 Z 的 liftctrl 是绝对位置伺服——
+    # PlcActuator 把 PD 输出的 vz 积分成高度设定值再下发, 也就是说"速度指令到
+    # 高度"这一步本身已经是一个积分环节, 位置环因此天生具备积分作用 (稳态误差
+    # 靠设定值累积消除, 不需要额外积分项)。此时再叠加 ki_pos 就变成双重积分,
+    # 低频相位滞后接近 180°; 叠加抓钩高度反馈的纯延迟 (S7 轮询/PLC 扫描, 连接
+    # 抖动期间 _LiftHeightSanitizer 还会沿用旧读数) 后必然自激, 正是现场看到的
+    # "Z 在目标附近反复上下切换、收不住"。实测复现: 反馈延迟 1.0~2.0s 时旧参数把
+    # 高度设定值推离目标 4~15cm 并反复换向, PD 只能超时收场; ki_pos_z=0 后同场景
+    # 6~12s 正常收敛。
+    # 仿真模式不受影响: PlantActuator 是速度伺服, 环路里没有这层积分, 仍用 ki_pos。
+    ki_pos_z: float = 0.0                   # [1/s²] Z 位置环积分增益 (PLC 模式; 0=禁用)
+
     # --- 伺服/扰动模型 ---
     servo_time_constant_xy: float = 0.18   # [s] XY 速度环一阶响应时间常数
     servo_time_constant_z: float = 0.12    # [s] Z 速度环一阶响应时间常数
@@ -222,7 +235,8 @@ class CraneConfig:
     release_delay: float = 0.5         # [s] 释放延时
 
     # --- 作业调度安全高度 (绝对高度, 相对于地面) ---
-    approach_safe_z: float = 1.0       # [m] 取货阶段安全高度 (Z 轴)
+    approach_safe_z: float = 1.0       # [m] 接近取货点 XY 联动时的 Z 安全高度
+    lift_cargo_safe_z: float = 1.2     # [m] 夹取后带货上升的安全高度 (Z 轴)
     transport_safe_z: float = 1.5      # [m] 运输阶段安全高度 (Z 轴)
     return_safe_z: float = 1.6         # [m] 作业完成后 Z 归位高度
     stabilize_delay: float = 1.0       # [s] XY 到达后货物判稳等待上限 (自适应: 已平稳时提前放行, 见 hook_settle_*)
@@ -266,6 +280,28 @@ class CraneConfig:
     arrival_vel_tol: float = 0.005         # [m/s] 到达判断速度容差
     # 零速阈值；低于此值且到位时，模拟伺服驱动的 zero-speed 窗口行为。
     velocity_deadband: float = 0.01
+
+    # Z 轴 (PLC 模式) 单独的速度类容差。PLC 模式下 Z 位置来自抓钩高度
+    # GetActualLiftHeight(), 10Hz 且分辨率较粗, 没有原生速度可用, Z 速度只能
+    # 由高度差分+低通估计: 高度只要跳一个最小分辨率单位, 差分速度瞬时值就是
+    # 0.1m/s 量级, 经 τ=0.8s 低通后仍会留下 0.01m/s 量级的尖峰。这个噪声地板
+    # 高于 X/Y 用的 arrival_vel_tol(0.005)/velocity_deadband(0.01), 结果是 Z
+    # 明明已经停在目标附近, 到位去抖计数却被噪声一帧帧清零而永远锁不上轴,
+    # 控制循环继续给指令 → 表现为"Z 在目标附近反复上下微动、不结束"。
+    # 这里给 Z 一组与该噪声地板匹配的容差 (仅 PLC 模式生效, 仿真沿用原值),
+    # 配合 arrival_pos_tol(0.02m) 与 3 帧去抖, 锁轴时的真实残余位移
+    # 约 0.02m/s × 0.3s ≈ 6mm, 精度上完全可接受。
+    arrival_vel_tol_z: float = 0.02         # [m/s] Z 到达判断速度容差 (PLC 模式)
+    velocity_deadband_z: float = 0.025      # [m/s] Z 到位捕获零速阈值 (PLC 模式)
+
+    # Z 位置死区的滞环退出阈值 / 到达判断位置容差 (PLC 模式)。进入死区仍用
+    # arrival_pos_tol (0.02m, 仍然按 2cm 精度去瞄), 但要重新给速度指令必须误差
+    # 超过这个更大的阈值。没有滞环时, 粗分辨率 + 带滞后的高度读数会在 2cm 容差
+    # 边界上抖进抖出, 每出去一次就给一次方向不定的速度脉冲, 而 Z 的速度指令会被
+    # 积分成绝对高度设定值, 每个脉冲都变成一段真实行程 → 抓钩在目标附近来回换向。
+    # 到达判定用同一个阈值: 抓钩高度的可达精度本来就受读数分辨率与受载绳伸长
+    # 限制, 判定窗口比死区滞环还严就会出现"停在原地却永远不锁轴", 只能等 PD 超时。
+    arrival_pos_tol_z: float = 0.04          # [m] Z 死区滞环退出阈值 / 到达位置容差 (PLC 模式)
     arrival_capture_pos_tol: float = 0.02  # [m] 到位捕获位置窗口 (原 0.04, 需配合 ki_pos>0 一起
                                             # 使用, 否则在持续扰动下可能出现收敛时间异常拖长)
     arrival_cmd_tol: float = 0.018         # [m/s] 到位捕获速度指令窗口 (原 0.025, 理由同上)
@@ -321,11 +357,13 @@ class CraneConfig:
             'grab_delay': self.grab_delay,
             'release_delay': self.release_delay,
             'approach_safe_z': self.approach_safe_z,
+            'lift_cargo_safe_z': self.lift_cargo_safe_z,
             'transport_safe_z': self.transport_safe_z,
             'return_safe_z': self.return_safe_z,
             'stabilize_delay': self.stabilize_delay,
             'gripper_safety_delay': self.gripper_safety_delay,
             'ki_pos': self.ki_pos,
+            'ki_pos_z': self.ki_pos_z,
             'integral_band': self.integral_band,
             'integral_output_limit': self.integral_output_limit,
             'hook_settle_vel_tol': self.hook_settle_vel_tol,
@@ -336,6 +374,9 @@ class CraneConfig:
             'arrival_pos_tol': self.arrival_pos_tol,
             'arrival_vel_tol': self.arrival_vel_tol,
             'velocity_deadband': self.velocity_deadband,
+            'arrival_vel_tol_z': self.arrival_vel_tol_z,
+            'velocity_deadband_z': self.velocity_deadband_z,
+            'arrival_pos_tol_z': self.arrival_pos_tol_z,
             'arrival_capture_pos_tol': self.arrival_capture_pos_tol,
             'arrival_cmd_tol': self.arrival_cmd_tol,
             'reverse_guard_tol': self.reverse_guard_tol,
@@ -617,10 +658,25 @@ def _validate_position_feedback(position: dict, config: CraneConfig) -> dict:
         raise PositionFeedbackError(f'invalid position feedback: {exc}') from exc
 
 
-def _axis_arrived(axis, target: float, config: CraneConfig) -> bool:
-    """判断单轴是否已到达目标 (位置 + 速度双重判定)。"""
-    pos_ok = abs(axis.position - target) < config.arrival_pos_tol
-    vel_ok = abs(axis.velocity) < config.arrival_vel_tol
+def _axis_arrived(
+    axis,
+    target: float,
+    config: CraneConfig,
+    vel_tol: float | None = None,
+    pos_tol: float | None = None,
+) -> bool:
+    """判断单轴是否已到达目标 (位置 + 速度双重判定)。
+
+    pos_tol / vel_tol 缺省时使用 config.arrival_pos_tol / arrival_vel_tol;
+    传入时用于逐轴容差 (PLC 模式的 Z 用抓钩高度读数, 分辨率粗、带滞后、
+    速度只能差分估计, 位置与速度容差都需要单独放宽)。
+    """
+    pos_ok = abs(axis.position - target) < (
+        config.arrival_pos_tol if pos_tol is None else pos_tol
+    )
+    vel_ok = abs(axis.velocity) < (
+        config.arrival_vel_tol if vel_tol is None else vel_tol
+    )
     return pos_ok and vel_ok
 
 
@@ -697,13 +753,53 @@ def run_pd_control(
             integral_band=config.integral_band,
             integral_output_limit=config.integral_output_limit,
         ),
+        # Z 的积分增益按执行链路区分 (与 velocity_filter_tau 同理):
+        # 仿真的 PlantActuator 是速度伺服, 积分项正常有效;
+        # PLC 的 Z 是"PD 速度指令 → 积分成绝对高度设定值 → liftctrl 位置伺服",
+        # 这条链路本身已含一个积分环节, 再叠加积分项就是双重积分, 在目标附近
+        # 会产生上下往复的极限环 → 用 ki_pos_z (默认 0, 纯 PD)。详见 ki_pos_z 注释。
         'z': PositionPDController(
             config.kp_pos, config.kd_pos, config.max_velocity_z,
             position_deadband=config.arrival_pos_tol,
             reverse_tol=config.reverse_guard_tol,
-            ki_pos=config.ki_pos,
+            ki_pos=config.ki_pos if is_simulation else config.ki_pos_z,
             integral_band=config.integral_band,
             integral_output_limit=config.integral_output_limit,
+            # 死区滞环只给 PLC 模式的 Z: 它的高度读数分辨率粗且带滞后, 没有滞环
+            # 会在容差边界上抖进抖出, 每次都被积分成一段真实的升降行程。
+            position_deadband_release=(
+                0.0 if is_simulation else config.arrival_pos_tol_z
+            ),
+        ),
+    }
+
+    # 到位判定的速度类容差 (逐轴)。PLC 模式的 Z 用抓钩高度差分估速, 噪声地板
+    # 远高于 X/Y 的原生速度, 必须放宽, 否则 Z 会因噪声一直锁不上轴而在目标
+    # 附近持续微动。仿真模式 Z 反馈来自对象模型 (分辨率细), 沿用统一容差。
+    arrival_vel_tol = {
+        'x': config.arrival_vel_tol,
+        'y': config.arrival_vel_tol,
+        'z': config.arrival_vel_tol if is_simulation else config.arrival_vel_tol_z,
+    }
+    velocity_deadband = {
+        'x': config.velocity_deadband,
+        'y': config.velocity_deadband,
+        'z': config.velocity_deadband if is_simulation else config.velocity_deadband_z,
+    }
+    # Z 的到位位置容差必须与死区滞环退出阈值一致, 否则会出现"死区滞环让抓钩
+    # 停住了, 到位窗口却比它还严"→ 原地不动却永远不锁轴, 只能等 PD 超时。
+    arrival_pos_tol = {
+        'x': config.arrival_pos_tol,
+        'y': config.arrival_pos_tol,
+        'z': config.arrival_pos_tol if is_simulation else config.arrival_pos_tol_z,
+    }
+    capture_pos_tol = {
+        'x': config.arrival_capture_pos_tol,
+        'y': config.arrival_capture_pos_tol,
+        'z': (
+            config.arrival_capture_pos_tol
+            if is_simulation
+            else max(config.arrival_capture_pos_tol, config.arrival_pos_tol_z)
         ),
     }
 
@@ -859,6 +955,19 @@ def run_pd_control(
             vy_cmd = 0.0 if locked['y'] else controllers['y'].update(target_y, y_measured, vy_damp, dt)
             vz_cmd = 0.0 if locked['z'] else controllers['z'].update(target_z, z_measured, vz_damp, dt)
 
+            # Z 目标附近的微调门控 (仅 PLC 模式)。抓钩高度反馈带滞后 (S7 轮询/PLC
+            # 扫描, 抖动期间还会沿用旧读数), 在最后几厘米里若继续按"仍在变化的读数"
+            # 去修高度设定值, 等于追一个过时的误差: 误差符号来回翻, 设定值跟着来回
+            # 走, 而 liftctrl 是绝对位置伺服, 每次都被忠实执行成一小段升降——这就是
+            # 现场看到的"Z 在目标附近来回切换方向"。所以进入目标附近后, 只有当高度
+            # 读数确实静止 (滞后已经过去) 时才允许再修设定值; 否则交给 PLC 自己的
+            # 位置环把这一步走完。
+            if not is_simulation and not locked['z']:
+                near_target_z = abs(target_z - z_measured) < config.arrival_pos_tol_z
+                z_feedback_moving = abs(vz_damp) >= config.arrival_vel_tol_z
+                if near_target_z and z_feedback_moving:
+                    vz_cmd = 0.0
+
             # --- STEP 4: 执行 — 委托给 Actuator ---
             if is_simulation:
                 # 仿真模式: plant.update_axis() 更新 state
@@ -907,11 +1016,13 @@ def run_pd_control(
             for name, axis, target, cmd in axis_data:
                 if locked[name]:
                     continue
-                in_capture_window = abs(axis.position - target) < config.arrival_capture_pos_tol
+                in_capture_window = abs(axis.position - target) < capture_pos_tol[name]
                 command_settled = abs(cmd) < config.arrival_cmd_tol
-                velocity_settled = abs(axis.velocity) < config.velocity_deadband
+                velocity_settled = abs(axis.velocity) < velocity_deadband[name]
                 arrived_now = (
-                    _axis_arrived(axis, target, config)
+                    _axis_arrived(
+                        axis, target, config, arrival_vel_tol[name], arrival_pos_tol[name]
+                    )
                     or (in_capture_window and command_settled and velocity_settled)
                 )
                 # 去抖: 连续满足才累加, 一旦有一帧不满足立即清零。
