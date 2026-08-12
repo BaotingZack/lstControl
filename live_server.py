@@ -763,6 +763,27 @@ def _point_tuple(point: tuple[float, float, float]) -> dict[str, float]:
     return {'x': point[0], 'y': point[1], 'z': point[2]}
 
 
+def _build_planned_route(
+    initial: tuple[float, float, float],
+    pick: tuple[float, float, float],
+    place: tuple[float, float, float],
+    config,
+) -> dict[str, list[dict[str, float]]]:
+    """Ideal scheduler waypoints for UI overlay (Start→Pick, Pick→Place)."""
+    return {
+        'seg1': [
+            _point_tuple(initial),
+            {'x': pick[0], 'y': pick[1], 'z': config.approach_safe_z},
+            _point_tuple(pick),
+        ],
+        'seg2': [
+            {'x': pick[0], 'y': pick[1], 'z': config.lift_cargo_safe_z},
+            {'x': place[0], 'y': place[1], 'z': config.transport_safe_z},
+            _point_tuple(place),
+        ],
+    }
+
+
 def build_live_payload(
     history: list[dict],
     phase_boundaries: list[tuple[float, str]],
@@ -861,6 +882,9 @@ def build_live_payload(
     }
     if pick_pos is not None:
         result['pick'] = _point_tuple(pick_pos)
+        result['plannedRoute'] = _build_planned_route(
+            initial_pos, pick_pos, target_pos, config,
+        )
     if display_segment_indices is not None:
         result['segmentIndices'] = display_segment_indices
     return result
@@ -1758,6 +1782,133 @@ def render_live_html(plc_mode: bool = False) -> str:
       ctx.stroke();
     }
 
+    function dashedPolyline(points, color, width, dash) {
+      if (points.length < 2) return;
+      ctx.save();
+      ctx.setLineDash(dash || [10, 7]);
+      polyline(points, color, width);
+      ctx.restore();
+    }
+
+    // 去掉 XY 上几乎不动的点 (垂直升降在俯视图里会叠成一团)
+    function simplifyWorldXY(frames, minDist) {
+      if (!frames || frames.length < 2) return frames || [];
+      var out = [frames[0]];
+      for (var i = 1; i < frames.length; i++) {
+        var prev = out[out.length - 1];
+        var dx = frames[i].x - prev.x;
+        var dy = frames[i].y - prev.y;
+        if (Math.hypot(dx, dy) >= minDist) out.push(frames[i]);
+      }
+      var last = frames[frames.length - 1];
+      if (out[out.length - 1] !== last) out.push(last);
+      return out;
+    }
+
+    function framesToScreenPath(frames, box, r) {
+      return frames.map(function(f) { return mapPlan(f, box, r); });
+    }
+
+    // 运输段: 优先取 TRANSPORT_XY 相位帧, 否则退化为整段 XY 简化
+    function transportXYFrames(frames, seg1End, seg2End) {
+      var sub = frames.slice(seg1End, seg2End + 1);
+      var transport = sub.filter(function(f) {
+        return f.schedulerPhase === 'TRANSPORT_XY';
+      });
+      if (transport.length >= 2) return transport;
+      return simplifyWorldXY(sub, 0.06);
+    }
+
+    function drawPlannedRoute(box, r) {
+      var route = payload.plannedRoute;
+      if (route) {
+        if (route.seg1 && route.seg1.length >= 2) {
+          dashedPolyline(
+            framesToScreenPath(route.seg1, box, r),
+            'rgba(77, 166, 217, 0.55)', 2, [10, 7],
+          );
+        }
+        if (route.seg2 && route.seg2.length >= 2) {
+          dashedPolyline(
+            framesToScreenPath(route.seg2, box, r),
+            'rgba(217, 140, 46, 0.55)', 2, [10, 7],
+          );
+        }
+        return;
+      }
+      // 无完整规划数据时, 至少画 pick→place 参考线
+      if (payload.pick && (payload.place || payload.target)) {
+        dashedPolyline(
+          framesToScreenPath([payload.pick, payload.place || payload.target], box, r),
+          'rgba(217, 140, 46, 0.45)', 2, [10, 7],
+        );
+      }
+    }
+
+    function drawSegmentPath(frames, box, r, colorDim, colorBright, traveledEnd) {
+      if (!frames || frames.length < 2) return;
+      var path = framesToScreenPath(frames, box, r);
+      polyline(path, colorDim, 2.5);
+      if (traveledEnd < 0) return;
+      if (traveledEnd >= frames.length - 1) {
+        polyline(path, colorBright, 4);
+      } else if (traveledEnd > 0) {
+        polyline(framesToScreenPath(frames.slice(0, traveledEnd + 1), box, r), colorBright, 4);
+      }
+    }
+
+    function resolveSegmentEnds(segIndices, frameIdx, frameCount) {
+      var seg1End = -1;
+      // seg2 未锁定时用当前帧作尾: 运输段可实时增长
+      var seg2End = Math.max(0, Math.min(frameIdx, frameCount - 1));
+      if (segIndices && segIndices.length >= 1 && segIndices[0] >= 0) {
+        seg1End = Math.min(segIndices[0], frameCount - 1);
+      }
+      if (segIndices && segIndices.length >= 2 && segIndices[1] >= 0) {
+        seg2End = Math.min(segIndices[1], frameCount - 1);
+      }
+      return {seg1End: seg1End, seg2End: seg2End};
+    }
+
+    function drawActualTrajectories(box, r) {
+      if (!payload.frames || payload.frames.length < 2) return;
+      var ends = resolveSegmentEnds(payload.segmentIndices, frame, payload.frames.length);
+      var seg1End = ends.seg1End;
+      var seg2End = ends.seg2End;
+
+      if (seg1End > 0) {
+        var seg1Frames = simplifyWorldXY(payload.frames.slice(0, seg1End + 1), 0.05);
+        var seg1Traveled = simplifyWorldXY(
+          payload.frames.slice(0, Math.min(frame, seg1End) + 1), 0.05,
+        );
+        drawSegmentPath(
+          seg1Frames, box, r, '#3a6b8c', '#4da6d9', seg1Traveled.length - 1,
+        );
+
+        if (seg2End > seg1End) {
+          var seg2Frames = transportXYFrames(payload.frames, seg1End, seg2End);
+          if (frame > seg1End && seg2Frames.length >= 2) {
+            var seg2Traveled = transportXYFrames(
+              payload.frames, seg1End, Math.min(frame, seg2End),
+            );
+            drawSegmentPath(
+              seg2Frames, box, r, '#8c6b3a', '#d98c2e', seg2Traveled.length - 1,
+            );
+          } else if (seg2Frames.length >= 2) {
+            drawSegmentPath(seg2Frames, box, r, '#8c6b3a', '#d98c2e', -1);
+          }
+        }
+      } else if (payload.pick) {
+        var approachFrames = simplifyWorldXY(payload.frames.slice(0, frame + 1), 0.05);
+        drawSegmentPath(
+          approachFrames, box, r, '#3a6b8c', '#4da6d9', approachFrames.length - 1,
+        );
+      } else {
+        var pathFrames = simplifyWorldXY(payload.frames.slice(0, frame + 1), 0.05);
+        drawSegmentPath(pathFrames, box, r, '#53697a', '#5ebd72', pathFrames.length - 1);
+      }
+    }
+
     function drawPanel(box, title) {
       ctx.fillStyle = '#121c25';
       ctx.fillRect(box.x, box.y, box.w, box.h);
@@ -1849,49 +2000,9 @@ def render_live_html(plc_mode: bool = False) -> str:
       ctx.beginPath(); ctx.moveTo(box.x + 18, railTop); ctx.lineTo(box.x + box.w - 18, railTop); ctx.stroke();
       ctx.beginPath(); ctx.moveTo(box.x + 18, railBottom); ctx.lineTo(box.x + box.w - 18, railBottom); ctx.stroke();
 
-      // Two-segment trajectory rendering (pick + place)
-      var segIndices = payload.segmentIndices;
-      var hasSegments = segIndices && segIndices.length >= 2;
-      if (hasSegments) {
-        var seg1End = Math.min(segIndices[0], payload.frames.length - 1);
-        var seg2End = Math.min(segIndices[1], payload.frames.length - 1);
-        if (seg1End > 0 && seg2End > seg1End) {
-          // Segment 1: approach to pick
-          var seg1Path = payload.frames.slice(0, seg1End + 1).map(function(f) { return mapPlan(f, box, r); });
-          // Segment 2: transport to place
-          var seg2Path = payload.frames.slice(seg1End, seg2End + 1).map(function(f) { return mapPlan(f, box, r); });
-
-          // Full paths (dim background lines)
-          polyline(seg1Path, '#3a6b8c', 2.5);  // muted blue
-          polyline(seg2Path, '#8c6b3a', 2.5);  // muted amber
-
-          // Traveled portions (bright)
-          if (frame <= seg1End) {
-            var seg1Traveled = payload.frames.slice(0, frame + 1).map(function(f) { return mapPlan(f, box, r); });
-            polyline(seg1Traveled, '#4da6d9', 4);
-          } else if (frame <= seg2End) {
-            polyline(seg1Path, '#4da6d9', 4);   // full seg1 bright
-            var seg2Traveled = payload.frames.slice(seg1End, frame + 1).map(function(f) { return mapPlan(f, box, r); });
-            polyline(seg2Traveled, '#d98c2e', 4);
-          } else {
-            // Done — show both segments full bright
-            polyline(seg1Path, '#4da6d9', 4);
-            polyline(seg2Path, '#d98c2e', 4);
-          }
-        } else {
-          // Fallback: segment indices are invalid
-          var path = payload.frames.map(function(f) { return mapPlan(f, box, r); });
-          var traveled = payload.frames.slice(0, frame + 1).map(function(f) { return mapPlan(f, box, r); });
-          polyline(path, '#53697a', 2);
-          polyline(traveled, '#5ebd72', 4);
-        }
-      } else {
-        // Backward compat: single-segment rendering
-        var path = payload.frames.map(function(f) { return mapPlan(f, box, r); });
-        var traveled = payload.frames.slice(0, frame + 1).map(function(f) { return mapPlan(f, box, r); });
-        polyline(path, '#53697a', 2);
-        polyline(traveled, '#5ebd72', 4);
-      }
+      // 规划路径 (虚线) + 实际轨迹 (实线, 运输段实时增长)
+      drawPlannedRoute(box, r);
+      drawActualTrajectories(box, r);
 
       const xTop = mapPlan({x: current.x, y: r.yMax}, box, r);
       const xBottom = mapPlan({x: current.x, y: r.yMin}, box, r);
@@ -1964,35 +2075,42 @@ def render_live_html(plc_mode: bool = False) -> str:
 
     function drawHoistProfile(box, r, current) {
       drawPanel(box, 'Hoist Height');
-      var segIndices = payload.segmentIndices;
-      var hasSegments = segIndices && segIndices.length >= 2;
-      if (hasSegments) {
-        var seg1End = Math.min(segIndices[0], payload.frames.length - 1);
-        var seg2End = Math.min(segIndices[1], payload.frames.length - 1);
-        if (seg1End > 0 && seg2End > seg1End) {
-          // Segment 1 Z profile
-          var seg1Z = payload.frames.slice(0, seg1End + 1).map(function(f) { return mapZ(f, box, r); });
-          var seg2Z = payload.frames.slice(seg1End, seg2End + 1).map(function(f) { return mapZ(f, box, r); });
-          polyline(seg1Z, '#4d6b3a', 2);   // muted green-blue
-          polyline(seg2Z, '#6b553a', 2);   // muted amber
+      // 规划 Z 剖面 (虚线)
+      if (payload.plannedRoute) {
+        if (payload.plannedRoute.seg1 && payload.plannedRoute.seg1.length >= 2) {
+          var zPlan1 = payload.plannedRoute.seg1.map(function(p, i) {
+            return {x: box.x + (i / (payload.plannedRoute.seg1.length - 1)) * box.w * 0.45,
+                    y: box.y + box.h - ((p.z - r.zMin) / (r.zMax - r.zMin)) * box.h};
+          });
+          dashedPolyline(zPlan1, 'rgba(109, 213, 237, 0.45)', 1.5, [6, 5]);
+        }
+        if (payload.plannedRoute.seg2 && payload.plannedRoute.seg2.length >= 2) {
+          var zPlan2 = payload.plannedRoute.seg2.map(function(p, i) {
+            return {x: box.x + box.w * 0.55 + (i / (payload.plannedRoute.seg2.length - 1)) * box.w * 0.4,
+                    y: box.y + box.h - ((p.z - r.zMin) / (r.zMax - r.zMin)) * box.h};
+          });
+          dashedPolyline(zPlan2, 'rgba(240, 168, 59, 0.45)', 1.5, [6, 5]);
+        }
+      }
+      var ends = resolveSegmentEnds(payload.segmentIndices, frame, payload.frames.length);
+      var seg1End = ends.seg1End;
+      var seg2End = ends.seg2End;
+      if (seg1End > 0 && seg2End > seg1End) {
+        var seg1Z = payload.frames.slice(0, seg1End + 1).map(function(f) { return mapZ(f, box, r); });
+        var seg2Z = payload.frames.slice(seg1End, seg2End + 1).map(function(f) { return mapZ(f, box, r); });
+        polyline(seg1Z, '#4d6b3a', 2);
+        polyline(seg2Z, '#6b553a', 2);
 
-          // Traveled portions
-          if (frame <= seg1End) {
-            var t1 = payload.frames.slice(0, frame + 1).map(function(f) { return mapZ(f, box, r); });
-            polyline(t1, '#6dd5ed', 3);
-          } else if (frame <= seg2End) {
-            polyline(seg1Z, '#6dd5ed', 3);
-            var t2 = payload.frames.slice(seg1End, frame + 1).map(function(f) { return mapZ(f, box, r); });
-            polyline(t2, '#f0a83b', 3);
-          } else {
-            polyline(seg1Z, '#6dd5ed', 3);
-            polyline(seg2Z, '#f0a83b', 3);
-          }
+        if (frame <= seg1End) {
+          var t1 = payload.frames.slice(0, frame + 1).map(function(f) { return mapZ(f, box, r); });
+          polyline(t1, '#6dd5ed', 3);
+        } else if (frame <= seg2End) {
+          polyline(seg1Z, '#6dd5ed', 3);
+          var t2 = payload.frames.slice(seg1End, frame + 1).map(function(f) { return mapZ(f, box, r); });
+          polyline(t2, '#f0a83b', 3);
         } else {
-          var zPathAll = payload.frames.map(function(f) { return mapZ(f, box, r); });
-          var zTravelAll = payload.frames.slice(0, frame + 1).map(function(f) { return mapZ(f, box, r); });
-          polyline(zPathAll, '#6f5835', 2);
-          polyline(zTravelAll, '#f0a83b', 4);
+          polyline(seg1Z, '#6dd5ed', 3);
+          polyline(seg2Z, '#f0a83b', 3);
         }
       } else {
         var zPathAll = payload.frames.map(function(f) { return mapZ(f, box, r); });
@@ -2131,7 +2249,43 @@ def render_live_html(plc_mode: bool = False) -> str:
               // 新一轮控制: 解冻并清空上一次的轨迹, 重新开始记录。
               _trajectoryFrozen = false;
               _lastTrailTime = -1;
-              if (payload && payload.frames) payload.frames.length = 0;
+              _segBoundariesRecorded = 0;
+              if (!payload) {
+                payload = {
+                  updateHz: 10, speed: 1, framePeriodMs: 100,
+                  bounds: {xMin: -2, xMax: 10, yMin: -2, yMax: 8, zMin: 0, zMax: 7},
+                  velocityLimits: {xy: 0.2, z: 0.2},
+                  phaseBoundaries: [],
+                  frames: [],
+                };
+              }
+              payload.frames.length = 0;
+              payload.segmentIndices = [];
+              if (data.planned_route) payload.plannedRoute = data.planned_route;
+              if (data.start_pos) payload.initial = data.start_pos;
+              if (data.pick_pos) payload.pick = data.pick_pos;
+              if (data.place_pos) {
+                payload.place = data.place_pos;
+                payload.target = data.place_pos;
+              }
+              // 作业一开始就显示 pick/place 标记与规划虚线
+              if (payload.pick && payload.place) {
+                var ix = payload.initial ? payload.initial.x : payload.pick.x;
+                var iy = payload.initial ? payload.initial.y : payload.pick.y;
+                var iz = payload.initial ? payload.initial.z : payload.pick.z;
+                var tx = payload.place.x, ty = payload.place.y, tz = payload.place.z;
+                var px = payload.pick.x, py = payload.pick.y, pz = payload.pick.z;
+                var allX = [ix, tx, px], allY = [iy, ty, py], allZ = [iz, tz, pz];
+                var padX = Math.max(1.0, (Math.max.apply(null, allX) - Math.min.apply(null, allX)) * 0.2);
+                var padY = Math.max(1.0, (Math.max.apply(null, allY) - Math.min.apply(null, allY)) * 0.2);
+                var padZ = Math.max(1.0, (Math.max.apply(null, allZ) - Math.min.apply(null, allZ)) * 0.2);
+                payload.bounds = {
+                  xMin: Math.min.apply(null, allX) - padX, xMax: Math.max.apply(null, allX) + padX,
+                  yMin: Math.min.apply(null, allY) - padY, yMax: Math.max.apply(null, allY) + padY,
+                  zMin: Math.min.apply(null, allZ) - padZ, zMax: Math.max.apply(null, allZ) + padZ,
+                };
+              }
+              draw();
             } else {
               els.ctrlMsg.textContent = 'Error: ' + (data.error || 'unknown');
               els.ctrlMsg.style.color = '#e05a47';
@@ -2383,6 +2537,7 @@ def render_live_html(plc_mode: bool = False) -> str:
               payload.target = {x: s.target_pos.x, y: s.target_pos.y, z: s.target_pos.z};
               payload.place = payload.target;
             }
+            if (s.planned_route) payload.plannedRoute = s.planned_route;
             // Reset segment indices
             payload.segmentIndices = [];
             _segBoundariesRecorded = 0;
@@ -2422,8 +2577,11 @@ def render_live_html(plc_mode: bool = False) -> str:
             payload.segmentIndices[0] = Math.max(0, payload.frames.length - 1);
             _segBoundariesRecorded = 1;
           }
-          if ((s.scheduler_phase === 'GRIPPER_RELEASE' || s.scheduler_phase === 'RETURN_Z' || s.scheduler_phase === 'DONE')
-              && _segBoundariesRecorded === 1) {
+          if (s.scheduler_phase === 'GRIPPER_RELEASE' && _segBoundariesRecorded === 1) {
+            payload.segmentIndices[1] = Math.max(0, payload.frames.length - 1);
+            _segBoundariesRecorded = 2;
+          } else if (s.scheduler_phase === 'DONE' && _segBoundariesRecorded === 1) {
+            // 兜底: 若释放阶段未被轮询捕获, 在 DONE 时用最后一帧
             payload.segmentIndices[1] = Math.max(0, payload.frames.length - 1);
             _segBoundariesRecorded = 2;
           }
@@ -2475,14 +2633,12 @@ def render_live_html(plc_mode: bool = False) -> str:
             t: d.t, x: d.x, y: d.y, z: d.z,
             vx: d.vx, vy: d.vy, vz: d.vz,
             vxCmd: d.vx_cmd, vyCmd: d.vy_cmd, vzCmd: d.vz_cmd,
+            schedulerPhase: s.scheduler_phase || null,
             phaseLabel: 'PD Control',
           };
-          // 2 Hz trail sampling: 3000 frames = 25 min @ 2 Hz
-          if (_lastTrailTime < 0 || d.t - _lastTrailTime >= 0.45) {
-            payload.frames.push(f);
-            if (payload.frames.length > 3000) payload.frames.shift();
-            _lastTrailTime = d.t;
-          }
+          // 每个 PD 步都记录一帧, 保证 pick→place 运输段实时延伸
+          payload.frames.push(f);
+          if (payload.frames.length > 6000) payload.frames.shift();
           frame = Math.max(0, payload.frames.length - 1);
           draw();
         })
@@ -2885,6 +3041,12 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         cs.pick_pos = {
             'x': map_start_x, 'y': map_start_y, 'z': map_start_z,
         }
+        cs.planned_route = _build_planned_route(
+            (map_pose['x'], map_pose['y'], map_pose['z']),
+            (map_start_x, map_start_y, map_start_z),
+            (map_target_x, map_target_y, map_target_z),
+            server.config,
+        )
         cs.scheduler_phase = None
         cs.scheduler_phase_label = OperationPhase.IDLE.label
         server.control_state = cs
@@ -2965,6 +3127,10 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                         'message': 'Operation started',
                         'phase': OperationPhase.APPROACH_XY.name,
                         'phase_label': OperationPhase.APPROACH_XY.label,
+                        'start_pos': cs.start_pos,
+                        'pick_pos': cs.pick_pos,
+                        'place_pos': cs.place_pos,
+                        'planned_route': cs.planned_route,
                     }).encode('utf-8'))
 
     def _handle_stop(self):
@@ -3044,6 +3210,7 @@ class ControlState:
         self.target_pos: dict | None = None  # {'x','y','z'} target (place position)
         self.pick_pos: dict | None = None  # {'x','y','z'} pick position (start of operation)
         self.place_pos: dict | None = None  # {'x','y','z'} place/unload position (alias for target_pos)
+        self.planned_route: dict | None = None  # ideal waypoints for UI overlay
         self.segment_boundaries: list = []  # frame indices marking segment transitions
         self.scheduler_phase: str | None = None
         self.scheduler_phase_label: str | None = None
@@ -3120,6 +3287,7 @@ class ControlState:
                 'target_pos': self.target_pos,
                 'pick_pos': pick_pos,
                 'place_pos': self.place_pos,
+                'planned_route': self.planned_route,
                 'segment_boundaries': list(self.segment_boundaries),
                 'scheduler_phase': phase_name,
                 'scheduler_phase_label': phase_label,

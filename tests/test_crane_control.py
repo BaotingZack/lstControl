@@ -1,7 +1,7 @@
 import pytest
 
 from crane_model import CraneConfig, CraneState
-from live_server import build_live_payload, render_live_html
+from live_server import build_live_payload, render_live_html, _build_planned_route
 from main import run_simulation
 from pd_controller import PositionPDController
 from visualizer import CraneVisualizer
@@ -190,6 +190,48 @@ def test_browser_live_html_contains_canvas_bootstrap():
     assert "drawTrolleyCloseup" in html
     assert "Trolley Movement" in html
     assert "!s.error && !s.stopped" in html
+    assert "drawPlannedRoute" in html
+    assert "drawActualTrajectories" in html
+    assert "resolveSegmentEnds" in html
+    assert "transportXYFrames" in html
+
+
+def test_build_planned_route_matches_scheduler_waypoints(default_config):
+    initial = (0.0, 0.0, 2.0)
+    pick = (3.0, 4.0, 0.8)
+    place = (8.0, 6.0, 1.2)
+    route = _build_planned_route(initial, pick, place, default_config)
+
+    assert route["seg1"][0] == {"x": 0.0, "y": 0.0, "z": 2.0}
+    assert route["seg1"][1]["z"] == default_config.approach_safe_z
+    assert route["seg1"][2] == {"x": 3.0, "y": 4.0, "z": 0.8}
+    assert route["seg2"][0]["z"] == default_config.lift_cargo_safe_z
+    assert route["seg2"][1]["z"] == default_config.transport_safe_z
+    assert route["seg2"][2] == {"x": 8.0, "y": 6.0, "z": 1.2}
+
+
+def test_live_payload_includes_planned_route_for_pick_place(default_config):
+    initial_pos = (0.0, 0.0, 5.0)
+    pick_pos = (3.0, 4.0, 0.8)
+    target_pos = (8.0, 6.0, 1.5)
+    history, events = run_simulation(
+        target_pos=pick_pos,
+        initial_state=CraneState(*initial_pos),
+        config=default_config,
+        verbose=False,
+        max_time=220.0,
+    )
+    payload = build_live_payload(
+        history=history,
+        phase_boundaries=events,
+        target_pos=target_pos,
+        initial_pos=initial_pos,
+        config=default_config,
+        pick_pos=pick_pos,
+        segment_indices=[len(history) // 2, len(history) - 1],
+    )
+    assert "plannedRoute" in payload
+    assert payload["plannedRoute"]["seg2"][2]["x"] == target_pos[0]
 
 
 def test_simulation_has_timeout_guard(default_config):
