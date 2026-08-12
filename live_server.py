@@ -2410,9 +2410,14 @@ def render_live_html(plc_mode: bool = False) -> str:
             els.ctrlMsg.style.color = '#5ebd72';
           }
           _controlActive = true;
-          // Update segment boundaries from scheduler (live)
-          if (s.segment_boundaries && s.segment_boundaries.length > 0) {
-            payload.segmentIndices = s.segment_boundaries.slice();
+          // Update segment boundaries from scheduler (live).
+          // Backend records PD step counts (~10 Hz); frontend decimates to ~2 Hz.
+          // Convert step-space indices to frame-space indices using current ratio.
+          if (s.segment_boundaries && s.segment_boundaries.length > 0 && s.step_count > 0) {
+            var ratio = payload.frames.length / s.step_count;
+            payload.segmentIndices = s.segment_boundaries.map(function(n) {
+              return Math.round(n * ratio);
+            });
           }
           // Expand bounds if position moves outside (trajectory auto-follow)
           var b = payload.bounds;
