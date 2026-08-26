@@ -1721,11 +1721,66 @@ def render_live_html(plc_mode: bool = False) -> str:
       };
     }
 
-    function mapZ(p, box, r) {
+    function mapZByIndex(frameIndex, z, box, r, totalFrames) {
+      var denom = Math.max(totalFrames - 1, 1);
       return {
-        x: box.x + (p.t / payload.frames[payload.frames.length - 1].t) * box.w,
-        y: box.y + box.h - ((p.z - r.zMin) / (r.zMax - r.zMin)) * box.h,
+        x: box.x + (frameIndex / denom) * box.w,
+        y: box.y + box.h - ((z - r.zMin) / (r.zMax - r.zMin)) * box.h,
       };
+    }
+
+    function zPathFromFrames(frames, startIdx, endIdx, box, r, totalFrames) {
+      var points = [];
+      var from = Math.max(0, startIdx);
+      var to = Math.min(endIdx, frames.length - 1);
+      for (var i = from; i <= to; i++) {
+        points.push(mapZByIndex(i, frames[i].z, box, r, totalFrames));
+      }
+      return points;
+    }
+
+    // 去掉 Z 上几乎不变的连续点, 减少量化噪声造成的锯齿
+    function zPathFromFramesSimplified(frames, startIdx, endIdx, box, r, totalFrames, minDz) {
+      minDz = minDz || 0.008;
+      var from = Math.max(0, startIdx);
+      var to = Math.min(endIdx, frames.length - 1);
+      var keep = [from];
+      for (var i = from + 1; i <= to; i++) {
+        if (Math.abs(frames[i].z - frames[keep[keep.length - 1]].z) >= minDz) {
+          keep.push(i);
+        }
+      }
+      if (keep[keep.length - 1] !== to) keep.push(to);
+      return keep.map(function(idx) {
+        return mapZByIndex(idx, frames[idx].z, box, r, totalFrames);
+      });
+    }
+
+    function drawZReferenceLines(box, r) {
+      var heights = [];
+      if (payload.plannedRoute) {
+        payload.plannedRoute.seg1.forEach(function(p) { heights.push(p.z); });
+        payload.plannedRoute.seg2.forEach(function(p) { heights.push(p.z); });
+      } else {
+        if (payload.pick) heights.push(payload.pick.z);
+        if (payload.place || payload.target) heights.push((payload.place || payload.target).z);
+      }
+      var seen = {};
+      heights.forEach(function(z) {
+        var key = z.toFixed(3);
+        if (seen[key]) return;
+        seen[key] = true;
+        var y = box.y + box.h - ((z - r.zMin) / (r.zMax - r.zMin)) * box.h;
+        ctx.save();
+        ctx.setLineDash([4, 6]);
+        ctx.strokeStyle = 'rgba(94, 189, 114, 0.35)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(box.x, y);
+        ctx.lineTo(box.x + box.w, y);
+        ctx.stroke();
+        ctx.restore();
+      });
     }
 
     function label(text, x, y, color) {
@@ -2075,60 +2130,40 @@ def render_live_html(plc_mode: bool = False) -> str:
 
     function drawHoistProfile(box, r, current) {
       drawPanel(box, 'Hoist Height');
-      // 规划 Z 剖面 (虚线)
-      if (payload.plannedRoute) {
-        if (payload.plannedRoute.seg1 && payload.plannedRoute.seg1.length >= 2) {
-          var zPlan1 = payload.plannedRoute.seg1.map(function(p, i) {
-            return {x: box.x + (i / (payload.plannedRoute.seg1.length - 1)) * box.w * 0.45,
-                    y: box.y + box.h - ((p.z - r.zMin) / (r.zMax - r.zMin)) * box.h};
-          });
-          dashedPolyline(zPlan1, 'rgba(109, 213, 237, 0.45)', 1.5, [6, 5]);
-        }
-        if (payload.plannedRoute.seg2 && payload.plannedRoute.seg2.length >= 2) {
-          var zPlan2 = payload.plannedRoute.seg2.map(function(p, i) {
-            return {x: box.x + box.w * 0.55 + (i / (payload.plannedRoute.seg2.length - 1)) * box.w * 0.4,
-                    y: box.y + box.h - ((p.z - r.zMin) / (r.zMax - r.zMin)) * box.h};
-          });
-          dashedPolyline(zPlan2, 'rgba(240, 168, 59, 0.45)', 1.5, [6, 5]);
-        }
-      }
-      var ends = resolveSegmentEnds(payload.segmentIndices, frame, payload.frames.length);
-      var seg1End = ends.seg1End;
-      var seg2End = ends.seg2End;
-      if (seg1End > 0 && seg2End > seg1End) {
-        var seg1Z = payload.frames.slice(0, seg1End + 1).map(function(f) { return mapZ(f, box, r); });
-        var seg2Z = payload.frames.slice(seg1End, seg2End + 1).map(function(f) { return mapZ(f, box, r); });
-        polyline(seg1Z, '#4d6b3a', 2);
-        polyline(seg2Z, '#6b553a', 2);
+      if (!payload.frames || payload.frames.length < 2) return;
 
-        if (frame <= seg1End) {
-          var t1 = payload.frames.slice(0, frame + 1).map(function(f) { return mapZ(f, box, r); });
-          polyline(t1, '#6dd5ed', 3);
-        } else if (frame <= seg2End) {
-          polyline(seg1Z, '#6dd5ed', 3);
-          var t2 = payload.frames.slice(seg1End, frame + 1).map(function(f) { return mapZ(f, box, r); });
-          polyline(t2, '#f0a83b', 3);
-        } else {
-          polyline(seg1Z, '#6dd5ed', 3);
-          polyline(seg2Z, '#f0a83b', 3);
-        }
-      } else {
-        var zPathAll = payload.frames.map(function(f) { return mapZ(f, box, r); });
-        var zTravelAll = payload.frames.slice(0, frame + 1).map(function(f) { return mapZ(f, box, r); });
-        polyline(zPathAll, '#6f5835', 2);
-        polyline(zTravelAll, '#f0a83b', 4);
+      var total = payload.frames.length;
+      var ends = resolveSegmentEnds(payload.segmentIndices, frame, total);
+      drawZReferenceLines(box, r);
+
+      // 用帧序号做横轴 (各 PD 阶段 t 会 reset, 用时间会导致后半段折线回跳乱线)
+      var traveled = zPathFromFramesSimplified(payload.frames, 0, frame, box, r, total);
+      polyline(traveled, '#f0a83b', 3);
+
+      if (frame < total - 1) {
+        var remaining = zPathFromFramesSimplified(payload.frames, frame, total - 1, box, r, total);
+        polyline(remaining, '#6f5835', 1.5);
       }
-      const placePos = payload.place || payload.target;
-      const targetY = placePos ? mapZ({t: 0, z: placePos.z}, box, r).y : null;
-      const now = mapZ(current, box, r);
-      if (targetY !== null) {
-        ctx.setLineDash([5, 5]);
-        ctx.beginPath(); ctx.moveTo(box.x, targetY); ctx.lineTo(box.x + box.w, targetY);
-        ctx.strokeStyle = '#5ebd72'; ctx.lineWidth = 1.5; ctx.stroke();
-        ctx.setLineDash([]);
+
+      if (ends.seg1End > 0 && ends.seg1End < total) {
+        var boundaryX = mapZByIndex(ends.seg1End, payload.frames[ends.seg1End].z, box, r, total).x;
+        ctx.save();
+        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = 'rgba(109, 213, 237, 0.45)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(boundaryX, box.y);
+        ctx.lineTo(boundaryX, box.y + box.h);
+        ctx.stroke();
+        ctx.restore();
       }
-      dot(now, '#e05a47', 6);
+
+      var placePos = payload.place || payload.target;
+      dot(mapZByIndex(frame, current.z, box, r, total), '#e05a47', 6);
       label('Z ' + current.z.toFixed(2) + ' m', box.x + 12, box.y + 28, '#ffc263');
+      if (placePos) {
+        label('Place Z ' + placePos.z.toFixed(2) + ' m', box.x + 12, box.y + 48, '#5ebd72');
+      }
     }
 
     function layout(rect) {

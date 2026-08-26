@@ -192,7 +192,8 @@ def test_browser_live_html_contains_canvas_bootstrap():
     assert "!s.error && !s.stopped" in html
     assert "drawPlannedRoute" in html
     assert "drawActualTrajectories" in html
-    assert "resolveSegmentEnds" in html
+    assert "mapZByIndex" in html
+    assert "drawZReferenceLines" in html
     assert "transportXYFrames" in html
 
 
