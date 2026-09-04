@@ -262,6 +262,16 @@ class OperationScheduler:
         # PD 控制钩子适配器 — 将每步 PD 状态写入 ControlState (供轮询)
         self._pd_hooks: _PdToSchedulerAdapter | None = None
 
+        # 闭环防摇: 由配置构建摆角闭环 PD 与摆动源 (仅 PLC 模式且启用时)。
+        # 摆动源读取 ros_bridge 的融合状态; 未启用/仿真时为 None → 防摇关闭。
+        self._anti_sway = None
+        self._sway_source = None
+        if not is_simulation and config.enable_anti_sway:
+            from ros_bridge import SwaySensorSource
+            from sway_controller import build_anti_sway
+            self._anti_sway = build_anti_sway(config)
+            self._sway_source = SwaySensorSource()
+
     # ------------------------------------------------------------------
     # 公开接口
     # ------------------------------------------------------------------
@@ -604,6 +614,8 @@ class OperationScheduler:
             max_time=self._PD_MAX_TIME,
             verbose=True,
             is_simulation=self._is_simulation,
+            sway_source=self._sway_source,
+            anti_sway=self._anti_sway,
         )
         return history, arrival_events
 

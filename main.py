@@ -42,7 +42,8 @@ from crane_model import (  # noqa: E402
 )
 from live_server import build_live_payload, serve_live_view  # noqa: E402
 from plc_interface import PlcActuator, create_plc  # noqa: E402
-from ros_bridge import RosPositionSource, get_latest_pose, start_ros_bridge  # noqa: E402
+from ros_bridge import RosPositionSource, SwaySensorSource, get_latest_pose, start_ros_bridge  # noqa: E402
+from sway_controller import build_anti_sway  # noqa: E402
 from visualizer import CraneVisualizer  # noqa: E402
 
 
@@ -96,6 +97,16 @@ def _build_arg_parser():
                         help='path to libsscarctrl.so')
     parser.add_argument('--allow-mock-plc', action='store_true',
                         help='explicitly allow MockPLC when the real PLC library cannot load')
+    parser.add_argument('--anti-sway', action='store_true',
+                        help='enable closed-loop anti-sway (fused inclinometer/IMU sway feedback)')
+    parser.add_argument('--anti-sway-kp', type=float, default=0.0,
+                        help='anti-sway proportional gain [m/s per rad]')
+    parser.add_argument('--anti-sway-kd', type=float, default=0.0,
+                        help='anti-sway sway-rate damping gain [m/s per rad/s]')
+    parser.add_argument('--anti-sway-angle-deg', action='store_true',
+                        help='inclinometer roll/pitch are reported in degrees')
+    parser.add_argument('--anti-sway-rate-deg', action='store_true',
+                        help='IMU gyro rates are reported in degrees/s')
     parser.add_argument('--map-to-crane-origin-x', type=float, default=0.0,
                         help='crane origin X coordinate in the SLAM map')
     parser.add_argument('--map-to-crane-origin-y', type=float, default=0.0,
@@ -144,10 +155,16 @@ def _workspace_bounds_from_args(args, axis: str) -> tuple[float, float] | None:
 
 
 def _config_from_args(args) -> CraneConfig:
+    deg = math.pi / 180.0
     return CraneConfig(
         max_velocity_xy=0.2,
         max_velocity_z=0.2,
         dt=0.01,
+        enable_anti_sway=args.anti_sway,
+        anti_sway_kp_s=args.anti_sway_kp,
+        anti_sway_kd_s=args.anti_sway_kd,
+        anti_sway_angle_scale=deg if args.anti_sway_angle_deg else 1.0,
+        anti_sway_rate_scale=deg if args.anti_sway_rate_deg else 1.0,
         workspace_x_bounds=_workspace_bounds_from_args(args, 'x'),
         workspace_y_bounds=_workspace_bounds_from_args(args, 'y'),
         workspace_z_bounds=_workspace_bounds_from_args(args, 'z'),
@@ -217,7 +234,12 @@ def main(argv=None):
     if args.plc_ip:
         plc = _connect_plc(args)
         try:
-            start_ros_bridge()
+            start_ros_bridge(
+                sway_alpha=config.anti_sway_alpha,
+                enable_sway=config.enable_anti_sway,
+                angle_scale=config.anti_sway_angle_scale,
+                rate_scale=config.anti_sway_rate_scale,
+            )
 
             # 等待首次定位数据 (超时 5s)
             print('Waiting for /localization_pose...')
@@ -311,6 +333,8 @@ def main(argv=None):
                     initial_state=crane0,
                     verbose=True,
                     is_simulation=False,
+                    sway_source=SwaySensorSource() if config.enable_anti_sway else None,
+                    anti_sway=build_anti_sway(config),
                 )
                 viz = CraneVisualizer(config)
                 viz.plot(history, arrival_events)

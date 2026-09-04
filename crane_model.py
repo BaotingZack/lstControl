@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 import math
 import random
 
@@ -229,6 +230,24 @@ class CraneConfig:
     measurement_noise_xy: float = 0.0005   # [m] XY 位置反馈测量噪声标准差
     measurement_noise_z: float = 0.0003    # [m] Z 位置反馈测量噪声标准差
 
+    # --- 防摇 (闭环摆角反馈, 融合倾角仪/IMU) ---
+    # 摆角闭环 PD 把摆角/摆速反馈成速度修正量叠加到现有 PD 指令上:
+    #   Δv = -kp_s(L)·θ - kd_s(L)·θ̇
+    # 默认关闭 (enable_anti_sway=False), 不改变现有行为; 硬件就绪后开启。
+    enable_anti_sway: bool = False          # 防摇主开关
+    anti_sway_alpha: float = 0.98           # 互补滤波系数 (0~1, 越接近1越信任陀螺)
+    anti_sway_kp_s: float = 0.0             # 摆角比例增益 [m/s per rad]
+    anti_sway_kd_s: float = 0.0             # 摆速阻尼增益 [m/s per rad/s]
+    anti_sway_max_correction: float = 0.05  # Δv 限幅 [m/s]
+    anti_sway_gain_schedule: tuple = ()     # ((L, kp_s, kd_s), ...) 按 L 升序; 空则用固定增益
+    # 绳长模型: L_eff = (sheave_height - Z) + grab_offset + cable_stretch (2:1 动滑轮)
+    rope_length_sheave_height: float = 8.0  # 出绳点固定高度 H_sheave [m]
+    rope_length_grab_offset: float = 1.5    # 抓钩挂点→钢卷质心偏移 h_com [m]
+    rope_length_cable_stretch: float = 0.0  # 钢缆载荷伸长 ΔL_stretch [m]
+    rope_length_min: float = 0.5            # L_eff 下限保护 [m]
+    anti_sway_angle_scale: float = 1.0      # 倾角仪原始值→rad 换算系数 (角度制填 pi/180)
+    anti_sway_rate_scale: float = 1.0       # 陀螺原始值→rad/s 换算系数
+
     # --- 作业参数 ---
     safe_height_offset: float = 1.0    # [m] 安全高度偏移量
     grab_delay: float = 0.5            # [s] 抓取延时
@@ -345,6 +364,8 @@ class CraneConfig:
             'servo_time_constant_z': self.servo_time_constant_z,
             'velocity_filter_tau': self.velocity_filter_tau,
             'velocity_filter_tau_plc': self.velocity_filter_tau_plc,
+            'rope_length_sheave_height': self.rope_length_sheave_height,
+            'rope_length_min': self.rope_length_min,
         }
         for name, value in positive_fields.items():
             if not math.isfinite(value) or value <= 0:
@@ -385,10 +406,20 @@ class CraneConfig:
             'disturbance_velocity_z': self.disturbance_velocity_z,
             'measurement_noise_xy': self.measurement_noise_xy,
             'measurement_noise_z': self.measurement_noise_z,
+            'anti_sway_kp_s': self.anti_sway_kp_s,
+            'anti_sway_kd_s': self.anti_sway_kd_s,
+            'anti_sway_max_correction': self.anti_sway_max_correction,
+            'rope_length_grab_offset': self.rope_length_grab_offset,
+            'rope_length_cable_stretch': self.rope_length_cable_stretch,
+            'anti_sway_angle_scale': self.anti_sway_angle_scale,
+            'anti_sway_rate_scale': self.anti_sway_rate_scale,
         }
         for name, value in non_negative_fields.items():
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f'{name} must be non-negative')
+
+        if not 0.0 <= self.anti_sway_alpha <= 1.0:
+            raise ValueError('anti_sway_alpha must be in [0, 1]')
 
         if int(self.arrival_debounce_cycles) != self.arrival_debounce_cycles \
                 or self.arrival_debounce_cycles < 1:
@@ -690,6 +721,8 @@ def run_pd_control(
     max_time: float | None = 180.0,
     verbose: bool = True,
     is_simulation: bool = True,
+    sway_source: Any = None,
+    anti_sway: Any = None,
 ) -> tuple[list[dict], list[tuple[float, str]]]:
     """统一 PD 位置控制循环 — 仿真和 PLC 模式共用。
 
@@ -709,6 +742,8 @@ def run_pd_control(
         max_time:       最大运行时间 [s]
         verbose:        是否打印日志
         is_simulation:  True=仿真模式 (虚拟时间), False=PLC 模式 (真实时间)
+        sway_source:    摆动状态源 (含 get_sway() → θ/θ̇ dict 或 None); None=关闭防摇
+        anti_sway:      摆角闭环 PD 控制器 (AntiSwayPDController); None=关闭防摇
 
     Returns:
         (history, arrival_events):
@@ -955,6 +990,34 @@ def run_pd_control(
             vy_cmd = 0.0 if locked['y'] else controllers['y'].update(target_y, y_measured, vy_damp, dt)
             vz_cmd = 0.0 if locked['z'] else controllers['z'].update(target_z, z_measured, vz_damp, dt)
 
+            # --- 闭环防摇: 叠加摆角反馈的速度修正量 (可选外环) ---
+            # 摆角闭环 PD 把融合后的 θ/θ̇ 反馈成速度修正量 Δv, 叠加到现有 PD 指令,
+            # 给摆系统增加等效阻尼。仅 X/Y (速度伺服) 参与, 起升轴不叠加 (Z 是
+            # 绝对位置伺服, 叠加会与"速度→高度"积分环节构成双重积分)。
+            antisway_dvx = antisway_dvy = 0.0
+            antisway_L = None
+            sway_state = None
+            if sway_source is not None and anti_sway is not None:
+                sway_state = sway_source.get_sway()
+                if sway_state is not None:
+                    antisway_dvx, antisway_dvy, antisway_L = anti_sway.compute(
+                        sway_state.get('theta_x', 0.0),
+                        sway_state.get('theta_y', 0.0),
+                        sway_state.get('omega_x', 0.0),
+                        sway_state.get('omega_y', 0.0),
+                        z_measured,
+                    )
+                    if not locked['x']:
+                        vx_cmd = max(
+                            -config.max_velocity_xy,
+                            min(config.max_velocity_xy, vx_cmd + antisway_dvx),
+                        )
+                    if not locked['y']:
+                        vy_cmd = max(
+                            -config.max_velocity_xy,
+                            min(config.max_velocity_xy, vy_cmd + antisway_dvy),
+                        )
+
             # Z 目标附近的微调门控 (仅 PLC 模式)。抓钩高度反馈带滞后 (S7 轮询/PLC
             # 扫描, 抖动期间还会沿用旧读数), 在最后几厘米里若继续按"仍在变化的读数"
             # 去修高度设定值, 等于追一个过时的误差: 误差符号来回翻, 设定值跟着来回
@@ -1047,6 +1110,12 @@ def run_pd_control(
                 'vx_raw': vx_raw, 'vy_raw': vy_raw, 'vz_raw': vz_raw,
                 'vx_filtered': vx_filtered, 'vy_filtered': vy_filtered, 'vz_filtered': vz_filtered,
                 'disturbance_x': disturbance_x, 'disturbance_y': disturbance_y, 'disturbance_z': disturbance_z,
+                'antisway_dvx': antisway_dvx, 'antisway_dvy': antisway_dvy,
+                'antisway_rope_length': antisway_L,
+                'theta_x': sway_state.get('theta_x') if sway_state else None,
+                'theta_y': sway_state.get('theta_y') if sway_state else None,
+                'omega_x': sway_state.get('omega_x') if sway_state else None,
+                'omega_y': sway_state.get('omega_y') if sway_state else None,
             }
             history.append(step_data)
 
