@@ -1,6 +1,6 @@
 import pytest
 
-from sway_controller import AntiSwayPDController, RopeLengthModel
+from sway_controller import AntiSwayController, RopeLengthModel
 
 
 def _rope():
@@ -22,39 +22,38 @@ def test_rope_length_stretch_and_min_clamp():
     assert rope_high.compute(5.0) == pytest.approx(0.5)
 
 
-def test_fixed_gain_compute():
-    ctrl = AntiSwayPDController(_rope(), kp_s=1.0, kd_s=2.0, max_correction=1.0)
-    dv_x, dv_y, L = ctrl.compute(theta_x=0.1, theta_y=0.0, omega_x=0.05, omega_y=0.0, z_grab=6.5)
+def test_fixed_gain_compute_positive_angle_feedback():
+    """速度模式阻尼: Δv = +K·θ (摆角正反馈 = 追载荷), 符号必须为正。"""
+    ctrl = AntiSwayController(_rope(), sway_gain=1.0, max_correction=1.0)
+    dv_x, dv_y, L = ctrl.compute(theta_x=0.1, theta_y=-0.2, z_grab=6.5)
     assert L == pytest.approx(3.0)
-    assert dv_x == pytest.approx(-(1.0 * 0.1 + 2.0 * 0.05))
-    assert dv_y == pytest.approx(0.0)
+    assert dv_x == pytest.approx(+1.0 * 0.1)
+    assert dv_y == pytest.approx(+1.0 * -0.2)
 
 
 def test_max_correction_clamp():
-    ctrl = AntiSwayPDController(_rope(), kp_s=1.0, kd_s=0.0, max_correction=0.05)
-    dv_x, _, _ = ctrl.compute(theta_x=1.0, theta_y=0.0, omega_x=0.0, omega_y=0.0, z_grab=6.5)
-    assert dv_x == pytest.approx(-0.05)  # -1.0 被限幅到 -0.05
+    ctrl = AntiSwayController(_rope(), sway_gain=1.0, max_correction=0.05)
+    dv_x, _, _ = ctrl.compute(theta_x=1.0, theta_y=0.0, z_grab=6.5)
+    assert dv_x == pytest.approx(0.05)  # +1.0 被限幅到 +0.05
 
 
 def test_gain_schedule_interpolation():
-    schedule = ((2.0, 0.5, 0.6), (4.0, 1.5, 1.6))
-    # max_correction 取大值, 避免限幅干扰增益插值本身的验证
-    ctrl = AntiSwayPDController(_rope(), kp_s=0.0, kd_s=0.0, gain_schedule=schedule, max_correction=10.0)
+    schedule = ((2.0, 0.5), (4.0, 1.5))
+    ctrl = AntiSwayController(_rope(), sway_gain=0.0, gain_schedule=schedule, max_correction=10.0)
 
-    def kp_at(L):
-        return -ctrl.compute(theta_x=1.0, theta_y=0.0, omega_x=0.0, omega_y=0.0,
-                             z_grab=9.5 - L)[0]
+    def gain_at(L):
+        # θx=1 → dv_x = +K(L), 直接读回增益
+        return ctrl.compute(theta_x=1.0, theta_y=0.0, z_grab=9.5 - L)[0]
 
-    # 端点
-    assert kp_at(2.0) == pytest.approx(0.5)
-    assert kp_at(4.0) == pytest.approx(1.5)
+    assert gain_at(2.0) == pytest.approx(0.5)
+    assert gain_at(4.0) == pytest.approx(1.5)
     # 线性插值中点
-    assert kp_at(3.0) == pytest.approx(1.0)
+    assert gain_at(3.0) == pytest.approx(1.0)
     # 越界钳位
-    assert kp_at(1.0) == pytest.approx(0.5)
-    assert kp_at(5.0) == pytest.approx(1.5)
+    assert gain_at(1.0) == pytest.approx(0.5)
+    assert gain_at(5.0) == pytest.approx(1.5)
 
 
 def test_gain_schedule_must_be_strictly_increasing():
     with pytest.raises(ValueError):
-        AntiSwayPDController(_rope(), gain_schedule=((2.0, 0.5, 0.6), (2.0, 0.5, 0.6)))
+        AntiSwayController(_rope(), gain_schedule=((2.0, 0.5), (2.0, 0.5)))

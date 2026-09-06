@@ -99,10 +99,8 @@ def _build_arg_parser():
                         help='explicitly allow MockPLC when the real PLC library cannot load')
     parser.add_argument('--anti-sway', action='store_true',
                         help='enable closed-loop anti-sway (fused inclinometer/IMU sway feedback)')
-    parser.add_argument('--anti-sway-kp', type=float, default=0.0,
-                        help='anti-sway proportional gain [m/s per rad]')
-    parser.add_argument('--anti-sway-kd', type=float, default=0.0,
-                        help='anti-sway sway-rate damping gain [m/s per rad/s]')
+    parser.add_argument('--anti-sway-gain', type=float, default=0.0,
+                        help='anti-sway sway damping gain K [m/s per rad] (Δv = +K·θ)')
     parser.add_argument('--anti-sway-angle-deg', action='store_true',
                         help='inclinometer roll/pitch are reported in degrees')
     parser.add_argument('--anti-sway-rate-deg', action='store_true',
@@ -161,8 +159,7 @@ def _config_from_args(args) -> CraneConfig:
         max_velocity_z=0.2,
         dt=0.01,
         enable_anti_sway=args.anti_sway,
-        anti_sway_kp_s=args.anti_sway_kp,
-        anti_sway_kd_s=args.anti_sway_kd,
+        anti_sway_sway_gain=args.anti_sway_gain,
         anti_sway_angle_scale=deg if args.anti_sway_angle_deg else 1.0,
         anti_sway_rate_scale=deg if args.anti_sway_rate_deg else 1.0,
         workspace_x_bounds=_workspace_bounds_from_args(args, 'x'),

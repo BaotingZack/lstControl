@@ -231,15 +231,13 @@ class CraneConfig:
     measurement_noise_z: float = 0.0003    # [m] Z 位置反馈测量噪声标准差
 
     # --- 防摇 (闭环摆角反馈, 融合倾角仪/IMU) ---
-    # 摆角闭环 PD 把摆角/摆速反馈成速度修正量叠加到现有 PD 指令上:
-    #   Δv = -kp_s(L)·θ - kd_s(L)·θ̇
+    # 速度模式摆角闭环: 把摆角 θ 反馈成速度修正量 Δv = +K(L)·θ (追载荷阻尼)。
     # 默认关闭 (enable_anti_sway=False), 不改变现有行为; 硬件就绪后开启。
     enable_anti_sway: bool = False          # 防摇主开关
     anti_sway_alpha: float = 0.98           # 互补滤波系数 (0~1, 越接近1越信任陀螺)
-    anti_sway_kp_s: float = 0.0             # 摆角比例增益 [m/s per rad]
-    anti_sway_kd_s: float = 0.0             # 摆速阻尼增益 [m/s per rad/s]
+    anti_sway_sway_gain: float = 0.0        # 摆角阻尼增益 K [m/s per rad] (Δv = +K·θ)
     anti_sway_max_correction: float = 0.05  # Δv 限幅 [m/s]
-    anti_sway_gain_schedule: tuple = ()     # ((L, kp_s, kd_s), ...) 按 L 升序; 空则用固定增益
+    anti_sway_gain_schedule: tuple = ()     # ((L, K), ...) 按 L 升序; 空则用固定增益
     # 绳长模型: L_eff = (sheave_height - Z) + grab_offset + cable_stretch (2:1 动滑轮)
     rope_length_sheave_height: float = 8.0  # 出绳点固定高度 H_sheave [m]
     rope_length_grab_offset: float = 1.5    # 抓钩挂点→钢卷质心偏移 h_com [m]
@@ -406,8 +404,7 @@ class CraneConfig:
             'disturbance_velocity_z': self.disturbance_velocity_z,
             'measurement_noise_xy': self.measurement_noise_xy,
             'measurement_noise_z': self.measurement_noise_z,
-            'anti_sway_kp_s': self.anti_sway_kp_s,
-            'anti_sway_kd_s': self.anti_sway_kd_s,
+            'anti_sway_sway_gain': self.anti_sway_sway_gain,
             'anti_sway_max_correction': self.anti_sway_max_correction,
             'rope_length_grab_offset': self.rope_length_grab_offset,
             'rope_length_cable_stretch': self.rope_length_cable_stretch,
@@ -743,7 +740,7 @@ def run_pd_control(
         verbose:        是否打印日志
         is_simulation:  True=仿真模式 (虚拟时间), False=PLC 模式 (真实时间)
         sway_source:    摆动状态源 (含 get_sway() → θ/θ̇ dict 或 None); None=关闭防摇
-        anti_sway:      摆角闭环 PD 控制器 (AntiSwayPDController); None=关闭防摇
+        anti_sway:      摆角闭环防摇控制器 (AntiSwayController); None=关闭防摇
 
     Returns:
         (history, arrival_events):
@@ -991,7 +988,7 @@ def run_pd_control(
             vz_cmd = 0.0 if locked['z'] else controllers['z'].update(target_z, z_measured, vz_damp, dt)
 
             # --- 闭环防摇: 叠加摆角反馈的速度修正量 (可选外环) ---
-            # 摆角闭环 PD 把融合后的 θ/θ̇ 反馈成速度修正量 Δv, 叠加到现有 PD 指令,
+            # 速度模式阻尼: Δv = +K(L)·θ (摆角正反馈 = 追载荷), 叠加到现有 PD 指令
             # 给摆系统增加等效阻尼。仅 X/Y (速度伺服) 参与, 起升轴不叠加 (Z 是
             # 绝对位置伺服, 叠加会与"速度→高度"积分环节构成双重积分)。
             antisway_dvx = antisway_dvy = 0.0
@@ -1003,8 +1000,6 @@ def run_pd_control(
                     antisway_dvx, antisway_dvy, antisway_L = anti_sway.compute(
                         sway_state.get('theta_x', 0.0),
                         sway_state.get('theta_y', 0.0),
-                        sway_state.get('omega_x', 0.0),
-                        sway_state.get('omega_y', 0.0),
                         z_measured,
                     )
                     if not locked['x']:
