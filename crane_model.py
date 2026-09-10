@@ -230,11 +230,10 @@ class CraneConfig:
     measurement_noise_xy: float = 0.0005   # [m] XY 位置反馈测量噪声标准差
     measurement_noise_z: float = 0.0003    # [m] Z 位置反馈测量噪声标准差
 
-    # --- 防摇 (闭环摆角反馈, 融合倾角仪/IMU) ---
+    # --- 防摇 (闭环摆角反馈, 倾角仪单方案) ---
     # 速度模式摆角闭环: 把摆角 θ 反馈成速度修正量 Δv = +K(L)·θ (追载荷阻尼)。
     # 默认关闭 (enable_anti_sway=False), 不改变现有行为; 硬件就绪后开启。
     enable_anti_sway: bool = False          # 防摇主开关
-    anti_sway_alpha: float = 0.98           # 互补滤波系数 (0~1, 越接近1越信任陀螺)
     anti_sway_sway_gain: float = 0.0        # 摆角阻尼增益 K [m/s per rad] (Δv = +K·θ)
     anti_sway_max_correction: float = 0.05  # Δv 限幅 [m/s]
     anti_sway_gain_schedule: tuple = ()     # ((L, K), ...) 按 L 升序; 空则用固定增益
@@ -244,7 +243,6 @@ class CraneConfig:
     rope_length_cable_stretch: float = 0.0  # 钢缆载荷伸长 ΔL_stretch [m]
     rope_length_min: float = 0.5            # L_eff 下限保护 [m]
     anti_sway_angle_scale: float = 1.0      # 倾角仪原始值→rad 换算系数 (角度制填 pi/180)
-    anti_sway_rate_scale: float = 1.0       # 陀螺原始值→rad/s 换算系数
 
     # --- 作业参数 ---
     safe_height_offset: float = 1.0    # [m] 安全高度偏移量
@@ -409,14 +407,10 @@ class CraneConfig:
             'rope_length_grab_offset': self.rope_length_grab_offset,
             'rope_length_cable_stretch': self.rope_length_cable_stretch,
             'anti_sway_angle_scale': self.anti_sway_angle_scale,
-            'anti_sway_rate_scale': self.anti_sway_rate_scale,
         }
         for name, value in non_negative_fields.items():
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f'{name} must be non-negative')
-
-        if not 0.0 <= self.anti_sway_alpha <= 1.0:
-            raise ValueError('anti_sway_alpha must be in [0, 1]')
 
         if int(self.arrival_debounce_cycles) != self.arrival_debounce_cycles \
                 or self.arrival_debounce_cycles < 1:
@@ -1109,8 +1103,6 @@ def run_pd_control(
                 'antisway_rope_length': antisway_L,
                 'theta_x': sway_state.get('theta_x') if sway_state else None,
                 'theta_y': sway_state.get('theta_y') if sway_state else None,
-                'omega_x': sway_state.get('omega_x') if sway_state else None,
-                'omega_y': sway_state.get('omega_y') if sway_state else None,
             }
             history.append(step_data)
 

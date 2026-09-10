@@ -103,8 +103,6 @@ def _build_arg_parser():
                         help='anti-sway sway damping gain K [m/s per rad] (Δv = +K·θ)')
     parser.add_argument('--anti-sway-angle-deg', action='store_true',
                         help='inclinometer roll/pitch are reported in degrees')
-    parser.add_argument('--anti-sway-rate-deg', action='store_true',
-                        help='IMU gyro rates are reported in degrees/s')
     parser.add_argument('--map-to-crane-origin-x', type=float, default=0.0,
                         help='crane origin X coordinate in the SLAM map')
     parser.add_argument('--map-to-crane-origin-y', type=float, default=0.0,
@@ -161,7 +159,6 @@ def _config_from_args(args) -> CraneConfig:
         enable_anti_sway=args.anti_sway,
         anti_sway_sway_gain=args.anti_sway_gain,
         anti_sway_angle_scale=deg if args.anti_sway_angle_deg else 1.0,
-        anti_sway_rate_scale=deg if args.anti_sway_rate_deg else 1.0,
         workspace_x_bounds=_workspace_bounds_from_args(args, 'x'),
         workspace_y_bounds=_workspace_bounds_from_args(args, 'y'),
         workspace_z_bounds=_workspace_bounds_from_args(args, 'z'),
@@ -231,12 +228,7 @@ def main(argv=None):
     if args.plc_ip:
         plc = _connect_plc(args)
         try:
-            start_ros_bridge(
-                sway_alpha=config.anti_sway_alpha,
-                enable_sway=config.enable_anti_sway,
-                angle_scale=config.anti_sway_angle_scale,
-                rate_scale=config.anti_sway_rate_scale,
-            )
+            start_ros_bridge(angle_scale=config.anti_sway_angle_scale)
 
             # 等待首次定位数据 (超时 5s)
             print('Waiting for /localization_pose...')
