@@ -37,6 +37,6 @@
   "anti_sway_locked_max_shift": 0.15,
   "anti_sway_settle_gain_scale": 1.5,
 
-  "stabilize_delay": 8.0,
-  "gripper_settle_max_wait": 10.0
+  "stabilize_delay": 4.0,
+  "gripper_settle_max_wait": 5.0
 }

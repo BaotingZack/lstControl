@@ -452,7 +452,11 @@ class RealPLC(PLCInterface):
         print('[PLC] disconnect_plc()')
 
     def check_connection(self) -> bool:
-        return bool(self._lib.CheckPlcConnection())
+        if bool(self._lib.CheckPlcConnection()):
+            return True
+        # S7 "Job pending" 等瞬时读失败时, 心跳仍正常则视为链路可用,
+        # 避免一次 DB 读抖动就整段作业异常中止。
+        return self._connected and self._heartbeat_healthy
 
     # -- motion control -----------------------------------------------------
 

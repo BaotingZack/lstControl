@@ -843,6 +843,7 @@ def run_pd_control(
     # 连续 actuator.apply() 失败计数 (PLC 连接/心跳瞬时抖动), 与上面计数器
     # 分开维护, 避免定位帧恢复正常就重置了执行器故障计数 (二者是不同故障源)。
     consecutive_actuator_errors = 0
+    consecutive_feedback_timeouts = 0
 
     # PD 输出
     vx_cmd = vy_cmd = vz_cmd = 0.0
@@ -889,9 +890,19 @@ def run_pd_control(
             # --- STEP 1: 获取位置反馈 ---
             pos = source.get_position()
             if pos is None:
+                consecutive_feedback_timeouts += 1
+                if consecutive_feedback_timeouts < 3:
+                    if verbose:
+                        print(
+                            f'[定位] 反馈短暂断流 '
+                            f'(连续第 {consecutive_feedback_timeouts} 次), 继续控制...'
+                        )
+                    continue
                 raise PositionFeedbackTimeout(
-                    f'{mode_label} position feedback timed out'
+                    f'{mode_label} position feedback timed out '
+                    f'({consecutive_feedback_timeouts} consecutive misses)'
                 )
+            consecutive_feedback_timeouts = 0
 
             # STOP 可能在阻塞等待定位数据期间到达；下发新指令前必须再次检查。
             if hooks is not None and hooks.should_stop():

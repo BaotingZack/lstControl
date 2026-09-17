@@ -708,7 +708,7 @@ def test_heartbeat_self_heals_after_transient_failure_burst():
 
 def test_position_timeout_is_an_error_instead_of_normal_completion():
     actuator = StubActuator()
-    source = SequenceSource([None])
+    source = SequenceSource([None, None, None])
 
     with pytest.raises(RuntimeError, match="position feedback timed out"):
         run_pd_control(

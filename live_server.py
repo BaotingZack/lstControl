@@ -1906,16 +1906,99 @@ def render_live_html(
         : null;
     }
 
+    function truncateText(text, maxW) {
+      if (ctx.measureText(text).width <= maxW) return text;
+      var ell = '…';
+      var lo = 0;
+      var hi = text.length;
+      while (lo < hi) {
+        var mid = Math.ceil((lo + hi) / 2);
+        if (ctx.measureText(text.slice(0, mid) + ell).width <= maxW) lo = mid;
+        else hi = mid - 1;
+      }
+      return text.slice(0, lo) + ell;
+    }
+
+    /** 圈刻度文字 — 深色底 + 描边; bounds 可选, 防止越界 */
+    function swayRingLabel(text, x, y, color, align, bounds) {
+      align = align || 'right';
+      ctx.font = '700 10px system-ui, sans-serif';
+      ctx.textAlign = align;
+      ctx.textBaseline = 'middle';
+      var w = ctx.measureText(text).width;
+      var padX = 4;
+      var boxW = w + padX * 2;
+      var boxH = 14;
+      var left = align === 'right' ? x - boxW : x;
+      var top = y - boxH / 2;
+      if (bounds) {
+        if (left < bounds.x) {
+          left = bounds.x;
+          x = left + boxW;
+          align = 'right';
+        }
+        if (left + boxW > bounds.x + bounds.w) {
+          left = bounds.x + bounds.w - boxW;
+          x = left + boxW - padX;
+          align = 'right';
+        }
+        if (top < bounds.y) top = bounds.y;
+        if (top + boxH > bounds.y + bounds.h) top = bounds.y + bounds.h - boxH;
+        y = top + boxH / 2;
+      }
+      ctx.fillStyle = 'rgba(6, 10, 14, 0.94)';
+      ctx.fillRect(left, top, boxW, boxH);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(left + 0.5, top + 0.5, boxW - 1, boxH - 1);
+      ctx.fillStyle = color;
+      ctx.textAlign = align;
+      ctx.fillText(text, align === 'right' ? x - padX : x + padX, y);
+    }
+
+    /** 刻度文字 — 轻量底衬, 用于轴旁 L 形标尺 */
+    function swayTickLabel(text, x, y, color, align, baseline) {
+      ctx.font = '700 9px system-ui, sans-serif';
+      ctx.textAlign = align || 'center';
+      ctx.textBaseline = baseline || 'middle';
+      var w = ctx.measureText(text).width;
+      var padX = 3;
+      var boxW = w + padX * 2;
+      var boxH = 12;
+      var left = align === 'right' ? x - boxW : (align === 'center' ? x - boxW / 2 : x);
+      var top = baseline === 'bottom' ? y : (baseline === 'top' ? y - boxH : y - boxH / 2);
+      ctx.fillStyle = 'rgba(6, 10, 14, 0.88)';
+      ctx.fillRect(left, top, boxW, boxH);
+      ctx.fillStyle = color;
+      ctx.fillText(text, align === 'right' ? x - padX : (align === 'center' ? x : x + padX),
+        baseline === 'bottom' ? y - 2 : (baseline === 'top' ? y + 10 : y));
+    }
+
     /** 十字靶标: 横轴=横滚角 θy (小车 Y), 纵轴=俯仰角 θx (大车 X)。
-     *  两轴合并到同一个坐标原点上, 一眼就能看出抓钩往哪个方向偏、偏多少。 */
+     *  同心圆只到 ±1.0°; 坐标轴穿出最外圈, 刻度沿左/下 L 形标尺排布。 */
     function drawSwayCross(area, thetaXDeg, thetaYDeg, tol) {
-      var cx = area.x + area.w / 2;
-      var cy = area.y + area.h / 2;
-      var span = Math.min(area.w, area.h) / 2 - 16;
-      var fullScaleDeg = Math.max(tol * 3, 0.6);
-      var pxPerDeg = span / fullScaleDeg;
+      var leftGutter = Math.min(40, Math.max(30, area.w * 0.14));
+      var topGutter = 16;
+      var rightGutter = 22;
+      var bottomGutter = Math.min(22, Math.max(16, area.h * 0.12));
+      var plotW = Math.max(40, area.w - leftGutter - rightGutter);
+      var plotH = Math.max(40, area.h - topGutter - bottomGutter);
+      var cx = area.x + leftGutter + plotW / 2;
+      var cy = area.y + topGutter + plotH / 2;
+      var ringSpan = Math.max(18, Math.min(plotW, plotH) / 2 - 8);
+      var axisOverhang = Math.min(12, Math.max(6, ringSpan * 0.14));
+      var axisSpan = ringSpan + axisOverhang;
+      var fullScaleDeg = 1.0;
+      var pxPerDeg = ringSpan / fullScaleDeg;
+      var bounds = { x: area.x + 2, y: area.y + 2, w: area.w - 4, h: area.h - 4 };
+      var ringDegs = [0.3, 0.6, 1.0];
+      var ringStyles = [
+        { stroke: '#5ebd72', label: '#8ef0a8' },
+        { stroke: '#f0a83b', label: '#ffd080' },
+        { stroke: '#e86850', label: '#ff9a82' },
+      ];
       var toPx = function(deg) {
-        return Math.max(-span, Math.min(span, deg * pxPerDeg));
+        return Math.max(-ringSpan, Math.min(ringSpan, deg * pxPerDeg));
       };
 
       ctx.fillStyle = '#0f161d';
@@ -1923,62 +2006,100 @@ def render_live_html(
       ctx.strokeStyle = '#2a3947';
       ctx.lineWidth = 1;
       ctx.strokeRect(area.x, area.y, area.w, area.h);
-
-      // 容差圈 (±tol) 与满量程圈
       ctx.save();
-      ctx.setLineDash([4, 4]);
-      ctx.strokeStyle = 'rgba(94, 189, 114, 0.6)';
-      ctx.beginPath(); ctx.arc(cx, cy, tol * pxPerDeg, 0, Math.PI * 2); ctx.stroke();
-      ctx.strokeStyle = 'rgba(240, 168, 59, 0.35)';
-      ctx.beginPath(); ctx.arc(cx, cy, Math.min(span, tol * 2 * pxPerDeg), 0, Math.PI * 2); ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.restore();
-
-      // 十字轴 + 刻度 (每 tol 一格)
-      ctx.strokeStyle = '#46596b';
-      ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(cx - span, cy); ctx.lineTo(cx + span, cy);
-      ctx.moveTo(cx, cy - span); ctx.lineTo(cx, cy + span);
+      ctx.rect(area.x, area.y, area.w, area.h);
+      ctx.clip();
+
+      // 固定刻度圈: 0.3° / 0.6° / 1.0°
+      for (var ri = 0; ri < ringDegs.length; ri++) {
+        var rd = ringDegs[ri];
+        var rp = rd * pxPerDeg;
+        if (rp > ringSpan + 1) continue;
+        ctx.strokeStyle = ringStyles[ri].stroke;
+        ctx.lineWidth = ri === 0 ? 1.75 : 1.35;
+        ctx.setLineDash(ri === 0 ? [] : [5, 4]);
+        ctx.beginPath();
+        ctx.arc(cx, cy, rp, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+      ctx.lineWidth = 1;
+
+      function drawAxisArrow(x1, y1, x2, y2, color) {
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+        var ang = Math.atan2(y2 - y1, x2 - x1);
+        var sz = 5;
+        ctx.beginPath();
+        ctx.moveTo(x2, y2);
+        ctx.lineTo(x2 - sz * Math.cos(ang - 0.45), y2 - sz * Math.sin(ang - 0.45));
+        ctx.lineTo(x2 - sz * Math.cos(ang + 0.45), y2 - sz * Math.sin(ang + 0.45));
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      // 坐标轴穿出 1.0° 外圈 — 更像标准直角坐标系
+      drawAxisArrow(cx - axisSpan, cy, cx + axisSpan, cy, '#f0a83b');
+      drawAxisArrow(cx, cy + axisSpan, cx, cy - axisSpan, '#59a7e8');
+
+      // 外圈边界参考 (1.0° 实线强调)
+      ctx.strokeStyle = ringStyles[2].stroke;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.arc(cx, cy, ringSpan, 0, Math.PI * 2);
       ctx.stroke();
-      ctx.strokeStyle = '#3b4e60';
-      for (var g = tol; g <= fullScaleDeg + 1e-6; g += tol) {
-        var d = g * pxPerDeg;
-        if (d > span) break;
+
+      // 轴刻度 + L 形标尺: 左缘标 θx 正半轴, 下缘标 θy 正半轴
+      var labelLaneL = area.x + Math.max(4, leftGutter - 26);
+      var labelLaneB = area.y + area.h - Math.max(4, bottomGutter - 14);
+      for (var ti = 0; ti < ringDegs.length; ti++) {
+        var tp = ringDegs[ti] * pxPerDeg;
+        if (tp > ringSpan + 1) continue;
+        ctx.strokeStyle = ringStyles[ti].stroke;
+        ctx.lineWidth = 1;
         ctx.beginPath();
-        ctx.moveTo(cx - d, cy - 4); ctx.lineTo(cx - d, cy + 4);
-        ctx.moveTo(cx + d, cy - 4); ctx.lineTo(cx + d, cy + 4);
-        ctx.moveTo(cx - 4, cy - d); ctx.lineTo(cx + 4, cy - d);
-        ctx.moveTo(cx - 4, cy + d); ctx.lineTo(cx + 4, cy + d);
+        ctx.moveTo(cx - tp, cy - 3); ctx.lineTo(cx - tp, cy + 3);
+        ctx.moveTo(cx + tp, cy - 3); ctx.lineTo(cx + tp, cy + 3);
+        ctx.moveTo(cx - 3, cy - tp); ctx.lineTo(cx + 3, cy - tp);
+        ctx.moveTo(cx - 3, cy + tp); ctx.lineTo(cx + 3, cy + tp);
         ctx.stroke();
+        // 引导线: 从刻度到标尺文字
+        ctx.strokeStyle = 'rgba(142, 163, 184, 0.22)';
+        ctx.setLineDash([2, 3]);
+        ctx.beginPath();
+        ctx.moveTo(labelLaneL + 18, cy - tp);
+        ctx.lineTo(cx - 3, cy - tp);
+        ctx.moveTo(cx + tp, cy + 3);
+        ctx.lineTo(cx + tp, labelLaneB - 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        var degText = ringDegs[ti].toFixed(1) + '°';
+        swayTickLabel(degText, labelLaneL + 18, cy - tp, ringStyles[ti].label, 'right', 'middle');
+        swayTickLabel(degText, cx + tp, labelLaneB - 2, ringStyles[ti].label, 'center', 'bottom');
       }
 
-      // 轴名: 横向 = 横滚, 纵向 = 俯仰
-      ctx.font = '600 10px system-ui, sans-serif';
+      ctx.font = '700 10px system-ui, sans-serif';
       ctx.fillStyle = '#f0a83b';
-      ctx.fillText('横滚 θy →', cx + span - 52, cy - 8);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('θy', cx + axisSpan + 5, cy);
       ctx.fillStyle = '#59a7e8';
-      ctx.fillText('↑ 俯仰 θx', cx + 8, cy - span + 12);
-      ctx.fillStyle = '#6b7c8c';
-      ctx.fillText('±' + tol.toFixed(2) + '°', cx + 6, cy + tol * pxPerDeg + 12);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText('θx', cx, cy - axisSpan - 4);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
 
-      if (thetaXDeg == null || thetaYDeg == null) return;
-
-      // 近 6s 轨迹尾迹 — 看摆动是在收敛还是在发散
-      var trail = [];
-      if (_swayFrames.length) {
-        var lastT = _swayFrames[_swayFrames.length - 1].t;
-        for (var i = _swayFrames.length - 1; i >= 0 && lastT - _swayFrames[i].t <= 6; i--) {
-          trail.push({ x: cx + toPx(_swayFrames[i].thetaYDeg), y: cy - toPx(_swayFrames[i].thetaXDeg) });
-        }
-      }
-      if (trail.length > 1) {
-        ctx.strokeStyle = 'rgba(240, 168, 59, 0.35)';
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(trail[0].x, trail[0].y);
-        for (var k = 1; k < trail.length; k++) ctx.lineTo(trail[k].x, trail[k].y);
-        ctx.stroke();
+      if (thetaXDeg == null || thetaYDeg == null) {
+        ctx.restore();
+        return;
       }
 
       var px = cx + toPx(thetaYDeg);
@@ -2002,38 +2123,24 @@ def render_live_html(
       ctx.fillRect(cx - 3, Math.min(cy, py), 6, Math.abs(py - cy));
 
       dot({ x: px, y: py }, col, 7);
+      ctx.restore();
     }
 
     function drawHookSway(box) {
-      drawPanel(box, 'Hook Sway / 抓钩摆角');
+      var swayTitle = box.w < 320 ? 'Hook Sway' : 'Hook Sway / 抓钩摆角';
+      drawPanel(box, swayTitle);
       if (!ANTI_SWAY) {
         label('Anti-sway disabled / 未启用防摇', box.x + 12, box.y + box.h / 2, '#91a3b3');
         return;
       }
       var sway = _liveControlState && _liveControlState.sway;
-      var latest = _liveControlState && _liveControlState.latest;
       var tol = (sway && sway.tol_deg != null) ? sway.tol_deg : SWAY_TOL_DEG;
       var valid = !!(sway && sway.valid);
       var thetaX = valid ? sway.theta_x_deg : null;
       var thetaY = valid ? sway.theta_y_deg : null;
       var peak = valid ? sway.theta_peak_deg : null;
 
-      var pad = 10;
-      var infoH = 88;
-      var crossArea = {
-        x: box.x + pad,
-        y: box.y + pad,
-        w: box.w - pad * 2,
-        h: box.h - pad * 2 - infoH,
-      };
-      drawSwayCross(crossArea, thetaX, thetaY, tol);
-
-      // --- 倾角信息区 ---
-      // 面板很窄, 只有短字段能并成两列; 长字段 (raw/Δv/状态) 各占整行,
-      // 否则 11px 文本会跨过中线互相压字。
-      var infoTop = crossArea.y + crossArea.h + 4;
-      var colL = box.x + pad + 2;
-      var colR = box.x + box.w / 2 + 2;
+      var pad = 8;
       var fmtDeg = function(v) { return v == null ? '--' : v.toFixed(2) + '°'; };
       var live = sway && sway.live;
       var pp = swayPeakToPeak(live && live.window_s ? live.window_s : 1.0);
@@ -2042,31 +2149,68 @@ def render_live_html(
         : (pp ? Math.max(pp.x, pp.y) : null);
       var winS = live && live.window_s != null ? live.window_s : 1.0;
       var periodS = live && (live.period_s != null ? live.period_s : live.period_model_s);
-      var dvx = latest && latest.antisway_dvx != null ? latest.antisway_dvx : 0;
-      var dvy = latest && latest.antisway_dvy != null ? latest.antisway_dvy : 0;
+      var tileH = 40;
+      var tileGap = 6;
+      var metaLineH = 14;
+      var metaRows = 3;
+      var infoH = tileH + tileGap + metaRows * metaLineH + 10;
+      var crossArea = {
+        x: box.x + pad,
+        y: box.y + pad,
+        w: Math.max(60, box.w - pad * 2),
+        h: Math.max(60, box.h - pad * 2 - infoH),
+      };
+      drawSwayCross(crossArea, thetaX, thetaY, tol);
 
-      ctx.font = '600 11px system-ui, sans-serif';
-      ctx.fillStyle = '#59a7e8';
-      ctx.fillText('θx 俯仰 ' + fmtDeg(thetaX), colL, infoTop + 11);
-      ctx.fillStyle = '#f0a83b';
-      ctx.fillText('θy 横滚 ' + fmtDeg(thetaY), colR, infoTop + 11);
+      // --- 倾角信息区: 双卡片 + 次要指标 + 状态条 ---
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(box.x + 1, box.y + 1, box.w - 2, box.h - 2);
+      ctx.clip();
 
-      ctx.fillStyle = peak != null ? swayAngleColor(peak, tol) : '#91a3b3';
-      ctx.fillText('|θ|max ' + fmtDeg(peak), colL, infoTop + 26);
-      // 判稳判据是峰峰值 (和调度器一致); |θ| 绝对值只用于核对倾角仪零点标定
-      ctx.fillStyle = ppMax != null ? swayAngleColor(ppMax, tol) : '#91a3b3';
-      ctx.fillText('峰峰' + winS.toFixed(1) + 's ' + (ppMax == null ? '--' : ppMax.toFixed(2) + '°'), colR, infoTop + 26);
+      var infoTop = crossArea.y + crossArea.h + 6;
+      var innerW = box.w - pad * 2;
+      var tileW = (innerW - tileGap) / 2;
+      var tiles = [
+        { title: '俯仰 θx', value: thetaX, color: '#59a7e8' },
+        { title: '横滚 θy', value: thetaY, color: '#f0a83b' },
+      ];
+      for (var ti = 0; ti < tiles.length; ti++) {
+        var t = tiles[ti];
+        var tx = box.x + pad + ti * (tileW + tileGap);
+        var ty = infoTop;
+        ctx.fillStyle = '#121a22';
+        ctx.fillRect(tx, ty, tileW, tileH);
+        ctx.strokeStyle = t.color;
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(tx + 0.5, ty + 0.5, tileW - 1, tileH - 1);
+        ctx.font = '600 10px system-ui, sans-serif';
+        ctx.fillStyle = '#8a9bab';
+        ctx.fillText(t.title, tx + 8, ty + 14);
+        ctx.font = '700 17px system-ui, sans-serif';
+        var vStr = t.value == null ? '--' : t.value.toFixed(2) + '°';
+        ctx.fillStyle = t.value == null ? '#91a3b3' : swayAngleColor(Math.abs(t.value), tol);
+        ctx.fillText(vStr, tx + 8, ty + 32);
+      }
 
-      ctx.fillStyle = '#6b7c8c';
-      ctx.fillText('raw Inc-Y ' + (sway && sway.pitch != null ? sway.pitch.toFixed(2) + '°' : '--')
-                   + '   Inc-X ' + (sway && sway.roll != null ? sway.roll.toFixed(2) + '°' : '--'),
-                   colL, infoTop + 41);
-      ctx.fillStyle = '#91a3b3';
-      ctx.fillText('Δv (' + dvx.toFixed(3) + ', ' + dvy.toFixed(3) + ') m/s', colL, infoTop + 56);
+      var metaTop = infoTop + tileH + tileGap;
+      var colL = box.x + pad + 2;
+      var colR = box.x + pad + Math.floor(innerW / 2) + 2;
+      var halfW = innerW / 2 - 6;
+      function metaLine(row, text, x, color) {
+        ctx.font = '600 10px system-ui, sans-serif';
+        ctx.fillStyle = color;
+        ctx.fillText(truncateText(text, halfW), x, metaTop + row * metaLineH);
+      }
+
+      metaLine(1, '|θ|max ' + fmtDeg(peak), colL, peak != null ? swayAngleColor(peak, tol) : '#91a3b3');
+      metaLine(1, '峰峰' + winS.toFixed(1) + 's ' + (ppMax == null ? '--' : ppMax.toFixed(2) + '°'),
+               colR, ppMax != null ? swayAngleColor(ppMax, tol) : '#91a3b3');
+      var rawText = 'Inc-Y ' + (sway && sway.pitch != null ? sway.pitch.toFixed(2) + '°' : '--')
+                  + '  Inc-X ' + (sway && sway.roll != null ? sway.roll.toFixed(2) + '°' : '--');
+      metaLine(2, rawText, colL, '#6b7c8c');
       if (periodS != null) {
-        ctx.fillStyle = '#6b7c8c';
-        ctx.fillText('T≈' + periodS.toFixed(1) + 's' + (live && live.window_full ? ' 窗满' : ' 窗未满'),
-                     colR, infoTop + 56);
+        metaLine(2, 'T≈' + periodS.toFixed(1) + 's' + (live && live.window_full ? ' 窗满' : ''), colR, '#6b7c8c');
       }
 
       var statusText;
@@ -2078,18 +2222,22 @@ def render_live_html(
         statusText = '采样中...';
         statusCol = '#91a3b3';
       } else if (live && live.window_full === false) {
-        statusText = '判稳窗填充中 (' + winS.toFixed(1) + 's)...';
+        statusText = '判稳窗填充中 (' + winS.toFixed(1) + 's)';
         statusCol = '#91a3b3';
       } else if (ppMax < tol) {
-        statusText = '已停摆 — 去趋势峰峰 < ' + tol.toFixed(2) + '° (可抓放)';
+        statusText = '已判稳 (峰峰<' + tol.toFixed(2) + '°)';
         statusCol = '#5ebd72';
       } else {
-        statusText = '仍在摆动 — 去趋势峰峰 ≥ ' + tol.toFixed(2) + '°';
+        statusText = '摆动中 (峰峰≥' + tol.toFixed(2) + '°)';
         statusCol = '#e05a47';
       }
-      ctx.font = '700 11px system-ui, sans-serif';
+      var statusY = metaTop + 3 * metaLineH - 2;
+      ctx.fillStyle = 'rgba(255,255,255,0.04)';
+      ctx.fillRect(box.x + pad, statusY - 11, innerW, 14);
+      ctx.font = '700 10px system-ui, sans-serif';
       ctx.fillStyle = statusCol;
-      ctx.fillText(statusText, colL, infoTop + 73);
+      ctx.fillText(truncateText(statusText, innerW - 4), colL, statusY);
+      ctx.restore();
     }
 
     function zPathFromFrames(frames, startIdx, endIdx, box, r, totalFrames) {
@@ -2466,11 +2614,8 @@ def render_live_html(
       const xTop = mapPlan({x: current.x, y: r.yMax}, box, r);
       const xBottom = mapPlan({x: current.x, y: r.yMin}, box, r);
       const now = mapPlan(current, box, r);
-      var baySway = ANTI_SWAY
-        ? swayMapOffset(_liveControlState && _liveControlState.sway, current.z)
-        : null;
       drawBridgeBeam(xTop, xBottom, current);
-      drawTrolley(now, current, box, r, baySway);
+      drawTrolley(now, current, box, r, null);
 
       // Position markers
       const initial = mapPlan(payload.initial, box, r);
@@ -2542,16 +2687,15 @@ def render_live_html(
     function layout(rect) {
       var sideH = rect.height - 124;
       if (rect.width > 900) {
-        const sideW = Math.max(270, rect.width * 0.28);
+        const sideW = Math.max(300, rect.width * 0.30);
         const bay = { x: 38, y: 82, w: rect.width - sideW - 58, h: sideH };
-        const hookSway = { x: bay.x + bay.w + 28, y: 82, w: sideW - 18, h: sideH * 0.58 };
-        const zbox = { x: hookSway.x, y: hookSway.y + hookSway.h + 52, w: hookSway.w, h: sideH - hookSway.h - 52 };
+        const hookSway = { x: bay.x + bay.w + 28, y: 82, w: sideW - 18, h: sideH * 0.62 };
+        const zbox = { x: hookSway.x, y: hookSway.y + hookSway.h + 52, w: hookSway.w, h: Math.max(80, sideH - hookSway.h - 52) };
         return { bay, hookSway, zbox };
       }
-      const bay = { x: 28, y: 82, w: rect.width - 56, h: rect.height * 0.46 };
-      // 十字靶 + 倾角信息区需要的高度比原来的双仪表条多, 窄屏下相应加高
-      const hookSway = { x: 28, y: bay.y + bay.h + 50, w: rect.width - 56, h: Math.max(200, rect.height * 0.26) };
-      const zbox = { x: 28, y: hookSway.y + hookSway.h + 48, w: rect.width - 56, h: rect.height - (hookSway.y + hookSway.h + 86) };
+      const bay = { x: 28, y: 82, w: rect.width - 56, h: rect.height * 0.42 };
+      const hookSway = { x: 28, y: bay.y + bay.h + 50, w: rect.width - 56, h: Math.max(220, rect.height * 0.28) };
+      const zbox = { x: 28, y: hookSway.y + hookSway.h + 48, w: rect.width - 56, h: Math.max(80, rect.height - (hookSway.y + hookSway.h + 86)) };
       return { bay, hookSway, zbox };
     }
 

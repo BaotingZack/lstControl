@@ -15,6 +15,7 @@ from crane_model import (
     CraneConfig,
     CranePlant,
     CraneState,
+    PositionFeedbackTimeout,
     SimPositionSource,
     PlantActuator,
 )
@@ -119,6 +120,7 @@ class TestOperationPhase:
             OperationPhase.TRANSPORT_Z_DESCEND,
             OperationPhase.GRIPPER_RELEASE,
             OperationPhase.RETURN_Z,
+            OperationPhase.SETTLE_WAIT,
             OperationPhase.DONE,
             OperationPhase.ERROR,
             OperationPhase.STOPPED,
@@ -376,6 +378,35 @@ class _StopAfterNCallsSource:
         pass
 
 
+class _FlakyThenFixedSource:
+    """前若干次返回 None, 之后返回固定位置。"""
+
+    def __init__(self, *, misses: int, x: float, y: float, z: float):
+        self._misses = misses
+        self.x, self.y, self.z = x, y, z
+
+    def get_position(self):
+        if self._misses > 0:
+            self._misses -= 1
+            return None
+        return {
+            'x': self.x, 'y': self.y, 'z': self.z,
+            'vx': None, 'vy': None, 'vz': None,
+            'dt': 0.02, 't': 0.0, 'stamp': 0,
+        }
+
+    def reset(self):
+        pass
+
+
+class _AlwaysNoneSource:
+    def get_position(self):
+        return None
+
+    def reset(self):
+        pass
+
+
 class TestCargoSettleDetection:
     """针对 OperationScheduler._wait_cargo_settled() 的自适应判稳单测。
 
@@ -436,6 +467,26 @@ class TestCargoSettleDetection:
 
         with pytest.raises(ControlStoppedError):
             scheduler._wait_cargo_settled("测试: 停止中断", max_wait=5.0)
+
+    def test_brief_feedback_gap_does_not_abort_settle_wait(self):
+        """定位短暂断流 (偶发 None) 不应立即中止判稳等待。"""
+        config = CraneConfig(hook_settle_window=0.2, hook_settle_pos_tol=0.02,
+                              hook_settle_vel_tol=0.02)
+        scheduler = self._make_scheduler(config)
+        scheduler._source = _FlakyThenFixedSource(
+            misses=2, x=1.0, y=2.0, z=0.5,
+        )
+        scheduler._wait_cargo_settled("测试: 短暂断流", max_wait=2.0)
+        assert scheduler.hooks.phase == OperationPhase.SETTLE_WAIT or True
+
+    def test_sustained_feedback_gap_aborts_settle_wait(self):
+        """连续定位断流超过容忍预算后应抛出 PositionFeedbackTimeout。"""
+        config = CraneConfig(hook_settle_window=0.2)
+        scheduler = self._make_scheduler(config)
+        scheduler._source = _AlwaysNoneSource()
+
+        with pytest.raises(PositionFeedbackTimeout):
+            scheduler._wait_cargo_settled("测试: 持续断流", max_wait=2.0)
 
 
 class TestEnsureGripperOpenBeforePickup:

@@ -64,11 +64,17 @@ def test_live_html_sway_panel_is_a_single_cross():
     html = render_live_html(plc_mode=True, anti_sway=True, sway_tol_deg=0.3)
     assert 'drawSwayCross' in html
     assert 'drawSwayAxisGauge' not in html, '单轴仪表已被十字靶取代'
-    assert '横滚 θy' in html and '俯仰 θx' in html
+    assert 'drawAxisArrow' in html
+    assert '俯仰 θx' in html and '横滚 θy' in html
+    assert '判稳±' not in html
     # 判稳看峰峰值 (与调度器一致), |θ| 绝对值只用于核对倾角仪零点
     assert 'swayPeakToPeak' in html
     assert '峰峰' in html
     assert 'T≈' in html
+    assert 'ringDegs = [0.3, 0.6, 1.0]' in html
+    assert 'swayTickLabel' in html
+    assert 'axisOverhang' in html
+    assert 'ringSpan' in html
 
 
 def test_live_html_includes_whole_job_timer():

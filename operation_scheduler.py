@@ -92,6 +92,7 @@ class OperationPhase(Enum):
     TRANSPORT_Z_DESCEND = auto()     # Phase 2c: Z 下降到卸货高度
     GRIPPER_RELEASE = auto()         # Phase 2d: 释放钢卷
     RETURN_Z = auto()                # Phase 3: Z 归位到 1.6m (含柔性起升)
+    SETTLE_WAIT = auto()             # 判稳等待 (XY/Z 到位后等货物平稳)
     DONE = auto()                    # 作业完成
     ERROR = auto()                   # 异常中止
     STOPPED = auto()                 # 操作员停止
@@ -109,6 +110,7 @@ class OperationPhase(Enum):
             OperationPhase.TRANSPORT_Z_DESCEND:     "Phase 2c: Z 下降到卸货高度",
             OperationPhase.GRIPPER_RELEASE:         "Phase 2d: 释放钢卷",
             OperationPhase.RETURN_Z:                "Phase 3: Z 归位到 1.6m",
+            OperationPhase.SETTLE_WAIT:             "等待货物平稳",
             OperationPhase.DONE:                    "作业完成",
             OperationPhase.ERROR:                   "异常中止",
             OperationPhase.STOPPED:                 "操作员停止",
@@ -297,12 +299,12 @@ class OperationScheduler:
         # 保存 control_state 引用供 _run_pd 使用
         self._control_state = control_state
 
-        def _record_phase(phase: OperationPhase) -> None:
+        def _record_phase(phase: OperationPhase, message: str = "") -> None:
             elapsed = time.monotonic() - t_start
             phase_history.append((elapsed, phase))
-            self.hooks.set_phase(phase)
+            self.hooks.set_phase(phase, message)
             if control_state is not None:
-                self._update_control_state_phase(control_state, phase)
+                self._update_control_state_phase(control_state, phase, message)
 
         try:
             # ================================================================
@@ -645,9 +647,18 @@ class OperationScheduler:
         pos_tol = cfg.hook_settle_pos_tol
 
         print(f"[Scheduler] {reason} — 等待货物平稳 (自适应判稳, 上限 {max_wait:.1f}s)...")
+        settle_msg = f"{reason} — 判稳中"
+        self.hooks.set_phase(OperationPhase.SETTLE_WAIT, settle_msg)
+        if self._control_state is not None:
+            self._update_control_state_phase(
+                self._control_state, OperationPhase.SETTLE_WAIT, settle_msg,
+            )
+
         t_start = time.monotonic()
         deadline = t_start + max_wait
         samples: list[tuple[float, float, float, float]] = []  # (t, x, y, z)
+        feedback_misses = 0
+        max_feedback_misses = 3  # 单次 get_position 最多等 2s; 连续 3 次≈6s 才判为断流
 
         while True:
             if self.hooks.should_stop():
@@ -655,9 +666,26 @@ class OperationScheduler:
 
             pos = self._source.get_position()
             if pos is None:
-                raise PositionFeedbackTimeout("等待货物平稳期间定位反馈超时")
+                feedback_misses += 1
+                if feedback_misses >= max_feedback_misses:
+                    raise PositionFeedbackTimeout(
+                        f"等待货物平稳期间定位反馈超时 ({feedback_misses} 次)"
+                    )
+                print(
+                    f"[Scheduler] {reason} — 定位短暂断流 "
+                    f"({feedback_misses}/{max_feedback_misses}), 继续等待..."
+                )
+                continue
+            feedback_misses = 0
 
             now = time.monotonic()
+            elapsed = now - t_start
+            status_msg = f"{reason} — 判稳中 ({elapsed:.1f}s / {max_wait:.0f}s)"
+            self.hooks.set_phase(OperationPhase.SETTLE_WAIT, status_msg)
+            if self._control_state is not None:
+                self._update_control_state_phase(
+                    self._control_state, OperationPhase.SETTLE_WAIT, status_msg,
+                )
             x, y, z = pos['x'], pos['y'], pos['z']
 
             samples.append((now, x, y, z))
@@ -791,12 +819,18 @@ class OperationScheduler:
 
         return False
 
-    def _update_control_state_phase(self, control_state, phase: OperationPhase) -> None:
+    def _update_control_state_phase(
+        self,
+        control_state,
+        phase: OperationPhase,
+        message: str = "",
+    ) -> None:
         """更新 ControlState 的阶段信息 (供前端轮询)。"""
         try:
             with control_state.lock:
                 control_state.scheduler_phase = phase
                 control_state.scheduler_phase_label = phase.label
+                control_state.scheduler_message = message or phase.label
         except Exception:
             pass
 
