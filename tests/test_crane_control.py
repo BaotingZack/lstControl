@@ -187,8 +187,8 @@ def test_browser_live_html_contains_canvas_bootstrap():
     assert "requestAnimationFrame" in html
     assert "Crane Live Control" in html
     assert "drawCraneBay" in html
-    assert "drawTrolleyCloseup" in html
-    assert "Trolley Movement" in html
+    assert "drawHoistProfile" in html
+    assert "Hoist Height" in html
     assert "!s.error && !s.stopped" in html
     assert "drawPlannedRoute" in html
     assert "drawActualTrajectories" in html

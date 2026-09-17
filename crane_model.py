@@ -325,6 +325,27 @@ class CraneConfig:
     # 远离目标方向的速度指令（速度伺服型行车"刹车"=指令归零而非反向脉冲）。
     reverse_guard_tol: float = 0.10    # 原 0.05; 扩大以减少目标附近反向脉冲→抓钩摆动
 
+    # --- 倾角仪 / 抓钩摆角 (UI 展示与 site_config; 闭环防摇控制逻辑在后续分支) ---
+    enable_anti_sway: bool = False
+    anti_sway_sway_gain: float = 0.0
+    anti_sway_angle_scale: float = 1.0
+    anti_sway_roll_bias: float = 0.0
+    anti_sway_pitch_bias: float = 0.0
+    anti_sway_roll_bias_closed: float | None = None
+    anti_sway_pitch_bias_closed: float | None = None
+    anti_sway_max_correction: float = 0.05
+    anti_sway_settle_damping: bool = True
+    anti_sway_settle_max_shift: float = 0.15
+    anti_sway_settle_dc_tau: float = 4.0
+    anti_sway_locked_max_shift: float = 0.15
+    anti_sway_settle_gain_scale: float = 1.5
+    rope_length_sheave_height: float = 2.31
+    rope_length_grab_offset: float = 1.5
+    hook_settle_window_periods: float = 0.55
+    hook_settle_window_max: float = 8.0
+    hook_sway_angle_tol_deg: float = 0.3
+    hook_sway_angle_tol_approach_deg: float = 0.6
+
     # --- 可选机械工作区 ---
     # 现场行程因设备而异，X/Y 不提供虚假的默认范围；PLC 部署时应显式配置。
     # 坐标零点由现场约定；未配置 workspace_z_bounds 时不擅自限制 Z 的正负。

@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 import time
+from pathlib import Path
 
 # Must be set before any matplotlib import (headless mode, no tkinter)
 import matplotlib
@@ -42,7 +44,18 @@ from crane_model import (  # noqa: E402
 )
 from live_server import build_live_payload, serve_live_view  # noqa: E402
 from plc_interface import PlcActuator, create_plc  # noqa: E402
-from ros_bridge import RosPositionSource, get_latest_pose, start_ros_bridge  # noqa: E402
+from ros_bridge import (  # noqa: E402
+    RosPositionSource,
+    configure_sway_live_analyzer,
+    get_latest_pose,
+    start_ros_bridge,
+)
+from site_config import (  # noqa: E402
+    DEFAULT_SITE_CONFIG_PATH,
+    build_sway_axis_mapping,
+    load_site_config,
+    resolve_anti_sway_settings,
+)
 from visualizer import CraneVisualizer  # noqa: E402
 
 
@@ -96,6 +109,19 @@ def _build_arg_parser():
                         help='path to libsscarctrl.so')
     parser.add_argument('--allow-mock-plc', action='store_true',
                         help='explicitly allow MockPLC when the real PLC library cannot load')
+    parser.add_argument('--anti-sway', action='store_true',
+                        help='enable closed-loop anti-sway (inclinometer sway feedback)')
+    parser.add_argument('--anti-sway-gain', type=float, default=None,
+                        help='anti-sway damping gain K [m/s per rad] (Δv = +K·θ); '
+                             'default 0.5 when --anti-sway')
+    parser.add_argument('--anti-sway-angle-deg', action='store_true',
+                        help='inclinometer roll/pitch are reported in degrees (required on site)')
+    parser.add_argument('--anti-sway-roll-bias', type=float, default=None,
+                        help='inclinometer roll zero bias (overrides site_config.json)')
+    parser.add_argument('--anti-sway-pitch-bias', type=float, default=None,
+                        help='inclinometer pitch zero bias (overrides site_config.json)')
+    parser.add_argument('--config', type=str, default=str(DEFAULT_SITE_CONFIG_PATH),
+                        help='site config JSON (inclinometer calibration, anti-sway; default: site_config.json)')
     parser.add_argument('--map-to-crane-origin-x', type=float, default=0.0,
                         help='crane origin X coordinate in the SLAM map')
     parser.add_argument('--map-to-crane-origin-y', type=float, default=0.0,
@@ -143,15 +169,56 @@ def _workspace_bounds_from_args(args, axis: str) -> tuple[float, float] | None:
     return (lower, upper)
 
 
-def _config_from_args(args) -> CraneConfig:
-    return CraneConfig(
-        max_velocity_xy=0.2,
-        max_velocity_z=0.2,
-        dt=0.01,
-        workspace_x_bounds=_workspace_bounds_from_args(args, 'x'),
-        workspace_y_bounds=_workspace_bounds_from_args(args, 'y'),
-        workspace_z_bounds=_workspace_bounds_from_args(args, 'z'),
+def _config_from_args(args, site: dict | None = None, argv: list[str] | None = None) -> CraneConfig:
+    site = site or {}
+    cli_argv = argv if argv is not None else sys.argv[1:]
+    anti = resolve_anti_sway_settings(
+        site,
+        cli_enable=args.anti_sway,
+        cli_enable_explicit='--anti-sway' in cli_argv,
+        cli_gain=args.anti_sway_gain,
+        cli_angle_deg=args.anti_sway_angle_deg,
+        cli_angle_deg_explicit='--anti-sway-angle-deg' in cli_argv,
+        cli_roll_bias=args.anti_sway_roll_bias,
+        cli_pitch_bias=args.anti_sway_pitch_bias,
     )
+    deg = math.pi / 180.0
+    crane_kwargs: dict = {
+        'max_velocity_xy': 0.2,
+        'max_velocity_z': 0.2,
+        'dt': 0.01,
+        'enable_anti_sway': anti['enable_anti_sway'],
+        'anti_sway_sway_gain': anti['anti_sway_sway_gain'],
+        'anti_sway_angle_scale': deg if anti['anti_sway_angle_deg'] else 1.0,
+        'anti_sway_roll_bias': anti['anti_sway_roll_bias'],
+        'anti_sway_pitch_bias': anti['anti_sway_pitch_bias'],
+        'workspace_x_bounds': _workspace_bounds_from_args(args, 'x'),
+        'workspace_y_bounds': _workspace_bounds_from_args(args, 'y'),
+        'workspace_z_bounds': _workspace_bounds_from_args(args, 'z'),
+    }
+    for key in (
+        'anti_sway_max_correction',
+        'anti_sway_settle_damping',
+        'anti_sway_settle_max_shift',
+        'hook_sway_angle_tol_deg',
+        'hook_sway_angle_tol_approach_deg',
+        'hook_settle_window_periods',
+        'hook_settle_window_max',
+        'anti_sway_settle_dc_tau',
+        'anti_sway_locked_max_shift',
+        'anti_sway_settle_gain_scale',
+        'anti_sway_roll_bias_closed',
+        'anti_sway_pitch_bias_closed',
+        'rope_length_sheave_height',
+        'rope_length_grab_offset',
+        'stabilize_delay',
+        'gripper_settle_max_wait',
+    ):
+        if key in anti:
+            crane_kwargs[key] = anti[key]
+        elif key in site:
+            crane_kwargs[key] = site[key]
+    return CraneConfig(**crane_kwargs)
 
 
 def _coordinate_transform_from_args(args) -> CoordinateTransform2D:
@@ -208,7 +275,29 @@ def _target_from_query(
 
 def main(argv=None):
     args = _build_arg_parser().parse_args(argv)
-    config = _config_from_args(args)
+    config_path = Path(args.config)
+    site = load_site_config(config_path)
+    if site:
+        print(f'[Config] loaded {config_path}: anti_sway={site.get("enable_anti_sway")}, '
+              f'roll_bias={site.get("anti_sway_roll_bias")}, '
+              f'pitch_bias={site.get("anti_sway_pitch_bias")}')
+    elif config_path.is_file():
+        print(f'[Config] {config_path} is empty or has no recognized keys')
+    config = _config_from_args(args, site, argv=argv)
+    axis_mapping = build_sway_axis_mapping(site)
+    if config.enable_anti_sway:
+        mx = axis_mapping.theta_x
+        my = axis_mapping.theta_y
+        print(
+            f'[Config] anti-sway ON: K={config.anti_sway_sway_gain:.3f}, '
+            f'roll_bias={config.anti_sway_roll_bias:.3f}, '
+            f'pitch_bias={config.anti_sway_pitch_bias:.3f}, '
+            f'|θ|_tol={config.hook_sway_angle_tol_deg:.2f}°'
+        )
+        print(
+            f'[Config] axis map: θx←{mx.angle_source}(sign={mx.angle_sign:+.0f}) 大车X, '
+            f'θy←{my.angle_source}(sign={my.angle_sign:+.0f}) 小车Y'
+        )
     coordinate_transform = _coordinate_transform_from_args(args)
     crane0 = CraneState(x0=0.0, y0=0.0, z0=0.0)
     map_target_pos = (args.target_x, args.target_y, args.target_z)
@@ -217,7 +306,51 @@ def main(argv=None):
     if args.plc_ip:
         plc = _connect_plc(args)
         try:
-            start_ros_bridge()
+            start_ros_bridge(
+                angle_scale=config.anti_sway_angle_scale,
+                roll_bias=config.anti_sway_roll_bias,
+                pitch_bias=config.anti_sway_pitch_bias,
+                axis_mapping=axis_mapping,
+                roll_bias_closed=config.anti_sway_roll_bias_closed,
+                pitch_bias_closed=config.anti_sway_pitch_bias_closed,
+            )
+
+            if config.enable_anti_sway:
+                configure_sway_live_analyzer(
+                    base_window=config.hook_settle_window,
+                    window_periods=config.hook_settle_window_periods,
+                    window_max=config.hook_settle_window_max,
+                    sheave_height=config.rope_length_sheave_height,
+                    grab_offset=config.rope_length_grab_offset,
+                    tol_deg=config.hook_sway_angle_tol_deg,
+                )
+                from ros_bridge import get_inclination_raw, get_sway_state
+                print(
+                    f'[Anti-sway] enabled K={config.anti_sway_sway_gain:.3f} m/s/rad, '
+                    f'angle_scale={config.anti_sway_angle_scale:.5f}, '
+                    f'settle |θ|<{config.hook_sway_angle_tol_deg:.2f}°'
+                )
+                if config.anti_sway_angle_scale == 1.0:
+                    print(
+                        '[Anti-sway] 警告: 未启用度制换算 (site_config 或 --anti-sway-angle-deg); '
+                        '若传感器为度制, K 会弱约 57 倍'
+                    )
+                print('Waiting for /inclination/j1939_msg (up to 3s)...')
+                inc_waited = 0.0
+                while get_inclination_raw() is None and inc_waited < 3.0:
+                    time.sleep(0.1)
+                    inc_waited += 0.1
+                raw = get_inclination_raw()
+                if raw is None:
+                    print('[Anti-sway] 警告: 未收到倾角仪数据 — 防摇/判稳将降级为 SLAM 位置')
+                else:
+                    sway = get_sway_state()
+                    thx = math.degrees(sway['theta_x']) if sway else float('nan')
+                    thy = math.degrees(sway['theta_y']) if sway else float('nan')
+                    print(
+                        f'[Anti-sway] inclination roll={raw.get("roll")}, pitch={raw.get("pitch")} '
+                        f'→ θx={thx:.3f}°, θy={thy:.3f}°'
+                    )
 
             # 等待首次定位数据 (超时 5s)
             print('Waiting for /localization_pose...')

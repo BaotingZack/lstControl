@@ -40,7 +40,7 @@ from crane_model import (
     run_pd_control,
 )
 from operation_scheduler import OperationScheduler, OperationPhase
-from ros_bridge import get_latest_pose, RosPositionSource
+from ros_bridge import get_latest_pose, get_sway_live_metrics, get_sway_snapshot, RosPositionSource
 from plc_interface import PlcActuator
 from visualizer import CraneVisualizer
 
@@ -843,6 +843,14 @@ def build_live_payload(
             'disturbanceX': item.get('disturbance_x', 0.0),
             'disturbanceY': item.get('disturbance_y', 0.0),
             'disturbanceZ': item.get('disturbance_z', 0.0),
+            'antiswayDvx': item.get('antisway_dvx'),
+            'antiswayDvy': item.get('antisway_dvy'),
+            'thetaXDeg': (
+                math.degrees(item['theta_x']) if item.get('theta_x') is not None else None
+            ),
+            'thetaYDeg': (
+                math.degrees(item['theta_y']) if item.get('theta_y') is not None else None
+            ),
             'phase': 'MOVE_TO_TARGET',
             'phaseLabel': 'Move to target',
         })
@@ -873,6 +881,10 @@ def build_live_payload(
         'velocityLimits': {
             'xy': config.max_velocity_xy,
             'z': config.max_velocity_z,
+        },
+        'antiSway': {
+            'enabled': config.enable_anti_sway,
+            'tolDeg': config.hook_sway_angle_tol_deg,
         },
         'phaseBoundaries': [
             {'t': round(t, 3), 'axis': axis, 'label': f'{axis.upper()} arrived'}
@@ -984,7 +996,43 @@ class LiveControlHooks(ControlHooks):
         return None
 
 
-def render_live_html(plc_mode: bool = False) -> str:
+def _sway_api_payload(server) -> dict[str, Any] | None:
+    """Build inclinometer snapshot for /api/control-state (None if anti-sway off)."""
+    config = getattr(server, 'config', None)
+    if config is None or not config.enable_anti_sway:
+        return None
+    snap = get_sway_snapshot()
+    snap['tol_deg'] = config.hook_sway_angle_tol_deg
+    snap['gain'] = config.anti_sway_sway_gain
+    pose = get_latest_pose()
+    z_grab = float(pose['z']) if pose and pose.get('z') is not None else 1.0
+    live = get_sway_live_metrics(z_grab)
+    if live is not None:
+        snap['live'] = live
+    return snap
+
+
+def _enrich_control_state_payload(server, body: dict) -> dict:
+    """Attach inclinometer + anti-sway config to control-state JSON."""
+    config = getattr(server, 'config', None)
+    if config is not None:
+        body['anti_sway'] = {
+            'enabled': config.enable_anti_sway,
+            'tol_deg': config.hook_sway_angle_tol_deg,
+            'gain': config.anti_sway_sway_gain,
+        }
+    sway = _sway_api_payload(server)
+    if sway is not None:
+        body['sway'] = sway
+    return body
+
+
+def render_live_html(
+    plc_mode: bool = False,
+    *,
+    anti_sway: bool = False,
+    sway_tol_deg: float = 0.3,
+) -> str:
     """Return the browser live view HTML.
 
     Args:
@@ -1240,6 +1288,34 @@ def render_live_html(plc_mode: bool = False) -> str:
       font-variant-numeric: tabular-nums;
     }
     .ticks span:last-child { text-align: right; }
+    .job-timer {
+      margin-top: 12px;
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+    }
+    .jt-cell {
+      background: #0f161d;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 7px 8px;
+      display: grid;
+      gap: 3px;
+    }
+    .jt-cell span {
+      color: var(--muted);
+      font-size: 10px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .jt-cell strong {
+      font-size: 14px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: #dce7ee;
+    }
+    .jt-total strong { color: var(--amber); font-size: 17px; }
+    .jt-total.jt-finished strong { color: var(--green); }
     .log {
       margin-top: 18px;
       display: grid;
@@ -1437,7 +1513,7 @@ def render_live_html(plc_mode: bool = False) -> str:
     </section>
     <aside class="side">
       <section class="status">
-        <div class="metric"><div class="label">Time</div><div class="value" id="time">0.0s</div></div>
+        <div class="metric"><div class="label">作业用时</div><div class="value" id="time">0.0s</div></div>
         <div class="metric"><div class="label">Frame</div><div class="value" id="frame">0</div></div>
         <div class="metric"><div class="label">Speed</div><div class="value" id="speed">1.0x</div></div>
       </section>
@@ -1489,6 +1565,11 @@ def render_live_html(plc_mode: bool = False) -> str:
         <div class="tab-panel active" id="tab-progress">
           <div class="track"><div class="progress" id="progress"></div></div>
           <div class="ticks"><span id="startTime">0.0s</span><span id="endTime">0.0s</span></div>
+          <div class="job-timer">
+            <div class="jt-cell"><span>开始作业</span><strong id="jobStart">--:--:--</strong></div>
+            <div class="jt-cell jt-total" id="jobTotalCell"><span>累计用时</span><strong id="jobElapsed">--</strong></div>
+            <div class="jt-cell"><span>完成作业</span><strong id="jobEnd">--:--:--</strong></div>
+          </div>
           <div class="log" id="phaseLog"></div>
         </div>
         <div class="tab-panel" id="tab-localization">
@@ -1538,6 +1619,8 @@ def render_live_html(plc_mode: bool = False) -> str:
   </main>
   <script>
     const PLC_MODE = __PLC_MODE__;
+    const ANTI_SWAY = __ANTI_SWAY__;
+    const SWAY_TOL_DEG = __SWAY_TOL_DEG__;
     const canvas = document.getElementById('scene');
     const ctx = canvas.getContext('2d');
     let payload;
@@ -1552,6 +1635,7 @@ def render_live_html(plc_mode: bool = False) -> str:
     // 直播用其 30 帧滑动窗口覆盖/裁掉这条轨迹, 方便展示成果。
     let _trajectoryFrozen = false;
     let _segBoundariesRecorded = 0;  // number of segment boundaries already captured (0/1/2)
+    let _swayFrames = [];  // {idx, thetaXDeg, thetaYDeg, thetaPeakDeg, t}
 
     const els = {
       rate: document.getElementById('rate'),
@@ -1579,6 +1663,10 @@ def render_live_html(plc_mode: bool = False) -> str:
       startTime: document.getElementById('startTime'),
       endTime: document.getElementById('endTime'),
       phaseLog: document.getElementById('phaseLog'),
+      jobStart: document.getElementById('jobStart'),
+      jobElapsed: document.getElementById('jobElapsed'),
+      jobEnd: document.getElementById('jobEnd'),
+      jobTotalCell: document.getElementById('jobTotalCell'),
       locoStatus: document.getElementById('locoStatus'),
       locoX: document.getElementById('locoX'),
       locoY: document.getElementById('locoY'),
@@ -1727,6 +1815,281 @@ def render_live_html(plc_mode: bool = False) -> str:
         x: box.x + (frameIndex / denom) * box.w,
         y: box.y + box.h - ((z - r.zMin) / (r.zMax - r.zMin)) * box.h,
       };
+    }
+
+    function swayAngleColor(peakDeg, tolDeg) {
+      if (peakDeg === null || peakDeg === undefined || isNaN(peakDeg)) return '#91a3b3';
+      if (peakDeg <= tolDeg) return '#5ebd72';
+      if (peakDeg <= tolDeg * 2) return '#f0a83b';
+      return '#e05a47';
+    }
+
+    // 时间戳用客户端单调时钟, 不能用 latest.t: 后者是每个 PD 阶段的局部时间,
+    // 阶段切换时会归零, 拿它算滑动窗口/画尾迹会在段边界处错乱。
+    function recordSwaySample(sway) {
+      if (!ANTI_SWAY || !sway || !sway.valid) return;
+      _swayFrames.push({
+        idx: _swayFrames.length,
+        t: performance.now() / 1000,
+        thetaXDeg: sway.theta_x_deg,
+        thetaYDeg: sway.theta_y_deg,
+        thetaPeakDeg: sway.theta_peak_deg,
+      });
+      if (_swayFrames.length > 6000) _swayFrames.shift();
+    }
+
+    /** 倾角仪摆角 → 平面地图上的载荷投影偏移 [m] (θx→X, θy→Y) */
+    function swayMapOffset(sway, z) {
+      if (!sway || !sway.valid) return null;
+      var L = Math.max(0.5, 8.0 - (z || 1.0) + 1.5);
+      var k = Math.PI / 180;
+      return {
+        dx: L * Math.sin(sway.theta_x_deg * k),
+        dy: L * Math.sin(sway.theta_y_deg * k),
+        thetaXDeg: sway.theta_x_deg,
+        thetaYDeg: sway.theta_y_deg,
+        peakDeg: sway.theta_peak_deg,
+        tol: sway.tol_deg != null ? sway.tol_deg : SWAY_TOL_DEG,
+        L: L,
+      };
+    }
+
+    /** 线性去趋势后的峰峰值 [deg] — 与调度器 sway_linear_detrend_peak_to_peak 一致。 */
+    function _linearDetrendPeak(values, times) {
+      var n = values.length;
+      if (n < 2) return 0;
+      var t0 = times[0];
+      var meanT = 0, meanV = 0;
+      for (var i = 0; i < n; i++) {
+        meanT += times[i] - t0;
+        meanV += values[i];
+      }
+      meanT /= n;
+      meanV /= n;
+      var num = 0, den = 0;
+      for (var j = 0; j < n; j++) {
+        var dt = times[j] - t0 - meanT;
+        num += dt * (values[j] - meanV);
+        den += dt * dt;
+      }
+      var minA = Infinity, maxA = -Infinity;
+      if (den < 1e-18) {
+        for (var k = 0; k < n; k++) {
+          var ac0 = values[k] - meanV;
+          minA = Math.min(minA, ac0); maxA = Math.max(maxA, ac0);
+        }
+      } else {
+        var slope = num / den;
+        var intercept = meanV - slope * meanT;
+        for (var m = 0; m < n; m++) {
+          var ac = values[m] - (slope * (times[m] - t0) + intercept);
+          minA = Math.min(minA, ac); maxA = Math.max(maxA, ac);
+        }
+      }
+      return maxA - minA;
+    }
+
+    /** 最近 windowSec 秒内 θx/θy 去趋势峰峰值 [deg] — 与调度器判稳判据一致。 */
+    function swayPeakToPeak(windowSec) {
+      if (_swayFrames.length < 3) return null;
+      var last = _swayFrames[_swayFrames.length - 1];
+      var times = [], xs = [], ys = [];
+      for (var i = _swayFrames.length - 1; i >= 0; i--) {
+        var f = _swayFrames[i];
+        if (last.t - f.t > windowSec) break;
+        times.unshift(f.t);
+        xs.unshift(f.thetaXDeg);
+        ys.unshift(f.thetaYDeg);
+      }
+      return times.length >= 3
+        ? { x: _linearDetrendPeak(xs, times), y: _linearDetrendPeak(ys, times) }
+        : null;
+    }
+
+    /** 十字靶标: 横轴=横滚角 θy (小车 Y), 纵轴=俯仰角 θx (大车 X)。
+     *  两轴合并到同一个坐标原点上, 一眼就能看出抓钩往哪个方向偏、偏多少。 */
+    function drawSwayCross(area, thetaXDeg, thetaYDeg, tol) {
+      var cx = area.x + area.w / 2;
+      var cy = area.y + area.h / 2;
+      var span = Math.min(area.w, area.h) / 2 - 16;
+      var fullScaleDeg = Math.max(tol * 3, 0.6);
+      var pxPerDeg = span / fullScaleDeg;
+      var toPx = function(deg) {
+        return Math.max(-span, Math.min(span, deg * pxPerDeg));
+      };
+
+      ctx.fillStyle = '#0f161d';
+      ctx.fillRect(area.x, area.y, area.w, area.h);
+      ctx.strokeStyle = '#2a3947';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(area.x, area.y, area.w, area.h);
+
+      // 容差圈 (±tol) 与满量程圈
+      ctx.save();
+      ctx.setLineDash([4, 4]);
+      ctx.strokeStyle = 'rgba(94, 189, 114, 0.6)';
+      ctx.beginPath(); ctx.arc(cx, cy, tol * pxPerDeg, 0, Math.PI * 2); ctx.stroke();
+      ctx.strokeStyle = 'rgba(240, 168, 59, 0.35)';
+      ctx.beginPath(); ctx.arc(cx, cy, Math.min(span, tol * 2 * pxPerDeg), 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+
+      // 十字轴 + 刻度 (每 tol 一格)
+      ctx.strokeStyle = '#46596b';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(cx - span, cy); ctx.lineTo(cx + span, cy);
+      ctx.moveTo(cx, cy - span); ctx.lineTo(cx, cy + span);
+      ctx.stroke();
+      ctx.strokeStyle = '#3b4e60';
+      for (var g = tol; g <= fullScaleDeg + 1e-6; g += tol) {
+        var d = g * pxPerDeg;
+        if (d > span) break;
+        ctx.beginPath();
+        ctx.moveTo(cx - d, cy - 4); ctx.lineTo(cx - d, cy + 4);
+        ctx.moveTo(cx + d, cy - 4); ctx.lineTo(cx + d, cy + 4);
+        ctx.moveTo(cx - 4, cy - d); ctx.lineTo(cx + 4, cy - d);
+        ctx.moveTo(cx - 4, cy + d); ctx.lineTo(cx + 4, cy + d);
+        ctx.stroke();
+      }
+
+      // 轴名: 横向 = 横滚, 纵向 = 俯仰
+      ctx.font = '600 10px system-ui, sans-serif';
+      ctx.fillStyle = '#f0a83b';
+      ctx.fillText('横滚 θy →', cx + span - 52, cy - 8);
+      ctx.fillStyle = '#59a7e8';
+      ctx.fillText('↑ 俯仰 θx', cx + 8, cy - span + 12);
+      ctx.fillStyle = '#6b7c8c';
+      ctx.fillText('±' + tol.toFixed(2) + '°', cx + 6, cy + tol * pxPerDeg + 12);
+
+      if (thetaXDeg == null || thetaYDeg == null) return;
+
+      // 近 6s 轨迹尾迹 — 看摆动是在收敛还是在发散
+      var trail = [];
+      if (_swayFrames.length) {
+        var lastT = _swayFrames[_swayFrames.length - 1].t;
+        for (var i = _swayFrames.length - 1; i >= 0 && lastT - _swayFrames[i].t <= 6; i--) {
+          trail.push({ x: cx + toPx(_swayFrames[i].thetaYDeg), y: cy - toPx(_swayFrames[i].thetaXDeg) });
+        }
+      }
+      if (trail.length > 1) {
+        ctx.strokeStyle = 'rgba(240, 168, 59, 0.35)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(trail[0].x, trail[0].y);
+        for (var k = 1; k < trail.length; k++) ctx.lineTo(trail[k].x, trail[k].y);
+        ctx.stroke();
+      }
+
+      var px = cx + toPx(thetaYDeg);
+      var py = cy - toPx(thetaXDeg);
+      var col = swayAngleColor(Math.max(Math.abs(thetaXDeg), Math.abs(thetaYDeg)), tol);
+
+      // 分量投影: 落在各自轴上的短线, 把"横向看横滚、纵向看俯仰"点出来
+      ctx.save();
+      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = 'rgba(220, 231, 238, 0.28)';
+      ctx.beginPath();
+      ctx.moveTo(px, cy); ctx.lineTo(px, py);
+      ctx.moveTo(cx, py); ctx.lineTo(px, py);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+
+      ctx.fillStyle = '#f0a83b';
+      ctx.fillRect(Math.min(cx, px), cy - 3, Math.abs(px - cx), 6);
+      ctx.fillStyle = '#59a7e8';
+      ctx.fillRect(cx - 3, Math.min(cy, py), 6, Math.abs(py - cy));
+
+      dot({ x: px, y: py }, col, 7);
+    }
+
+    function drawHookSway(box) {
+      drawPanel(box, 'Hook Sway / 抓钩摆角');
+      if (!ANTI_SWAY) {
+        label('Anti-sway disabled / 未启用防摇', box.x + 12, box.y + box.h / 2, '#91a3b3');
+        return;
+      }
+      var sway = _liveControlState && _liveControlState.sway;
+      var latest = _liveControlState && _liveControlState.latest;
+      var tol = (sway && sway.tol_deg != null) ? sway.tol_deg : SWAY_TOL_DEG;
+      var valid = !!(sway && sway.valid);
+      var thetaX = valid ? sway.theta_x_deg : null;
+      var thetaY = valid ? sway.theta_y_deg : null;
+      var peak = valid ? sway.theta_peak_deg : null;
+
+      var pad = 10;
+      var infoH = 88;
+      var crossArea = {
+        x: box.x + pad,
+        y: box.y + pad,
+        w: box.w - pad * 2,
+        h: box.h - pad * 2 - infoH,
+      };
+      drawSwayCross(crossArea, thetaX, thetaY, tol);
+
+      // --- 倾角信息区 ---
+      // 面板很窄, 只有短字段能并成两列; 长字段 (raw/Δv/状态) 各占整行,
+      // 否则 11px 文本会跨过中线互相压字。
+      var infoTop = crossArea.y + crossArea.h + 4;
+      var colL = box.x + pad + 2;
+      var colR = box.x + box.w / 2 + 2;
+      var fmtDeg = function(v) { return v == null ? '--' : v.toFixed(2) + '°'; };
+      var live = sway && sway.live;
+      var pp = swayPeakToPeak(live && live.window_s ? live.window_s : 1.0);
+      var ppMax = live && live.detrend_pp_max_deg != null
+        ? live.detrend_pp_max_deg
+        : (pp ? Math.max(pp.x, pp.y) : null);
+      var winS = live && live.window_s != null ? live.window_s : 1.0;
+      var periodS = live && (live.period_s != null ? live.period_s : live.period_model_s);
+      var dvx = latest && latest.antisway_dvx != null ? latest.antisway_dvx : 0;
+      var dvy = latest && latest.antisway_dvy != null ? latest.antisway_dvy : 0;
+
+      ctx.font = '600 11px system-ui, sans-serif';
+      ctx.fillStyle = '#59a7e8';
+      ctx.fillText('θx 俯仰 ' + fmtDeg(thetaX), colL, infoTop + 11);
+      ctx.fillStyle = '#f0a83b';
+      ctx.fillText('θy 横滚 ' + fmtDeg(thetaY), colR, infoTop + 11);
+
+      ctx.fillStyle = peak != null ? swayAngleColor(peak, tol) : '#91a3b3';
+      ctx.fillText('|θ|max ' + fmtDeg(peak), colL, infoTop + 26);
+      // 判稳判据是峰峰值 (和调度器一致); |θ| 绝对值只用于核对倾角仪零点标定
+      ctx.fillStyle = ppMax != null ? swayAngleColor(ppMax, tol) : '#91a3b3';
+      ctx.fillText('峰峰' + winS.toFixed(1) + 's ' + (ppMax == null ? '--' : ppMax.toFixed(2) + '°'), colR, infoTop + 26);
+
+      ctx.fillStyle = '#6b7c8c';
+      ctx.fillText('raw Inc-Y ' + (sway && sway.pitch != null ? sway.pitch.toFixed(2) + '°' : '--')
+                   + '   Inc-X ' + (sway && sway.roll != null ? sway.roll.toFixed(2) + '°' : '--'),
+                   colL, infoTop + 41);
+      ctx.fillStyle = '#91a3b3';
+      ctx.fillText('Δv (' + dvx.toFixed(3) + ', ' + dvy.toFixed(3) + ') m/s', colL, infoTop + 56);
+      if (periodS != null) {
+        ctx.fillStyle = '#6b7c8c';
+        ctx.fillText('T≈' + periodS.toFixed(1) + 's' + (live && live.window_full ? ' 窗满' : ' 窗未满'),
+                     colR, infoTop + 56);
+      }
+
+      var statusText;
+      var statusCol;
+      if (!valid) {
+        statusText = sway && sway.stale ? '倾角仪断流' : '等待倾角仪...';
+        statusCol = '#e05a47';
+      } else if (ppMax == null) {
+        statusText = '采样中...';
+        statusCol = '#91a3b3';
+      } else if (live && live.window_full === false) {
+        statusText = '判稳窗填充中 (' + winS.toFixed(1) + 's)...';
+        statusCol = '#91a3b3';
+      } else if (ppMax < tol) {
+        statusText = '已停摆 — 去趋势峰峰 < ' + tol.toFixed(2) + '° (可抓放)';
+        statusCol = '#5ebd72';
+      } else {
+        statusText = '仍在摆动 — 去趋势峰峰 ≥ ' + tol.toFixed(2) + '°';
+        statusCol = '#e05a47';
+      }
+      ctx.font = '700 11px system-ui, sans-serif';
+      ctx.fillStyle = statusCol;
+      ctx.fillText(statusText, colL, infoTop + 73);
     }
 
     function zPathFromFrames(frames, startIdx, endIdx, box, r, totalFrames) {
@@ -1993,31 +2356,72 @@ def render_live_html(plc_mode: bool = False) -> str:
       ctx.fillRect(p1.x - 4, p1.y - 23, 8, 46);
     }
 
-    function drawTrolley(p, current) {
-      const sway = Math.sin(current.t * 3.5) * Math.min(10, Math.abs(current.vy) * 28);
+    function drawTrolley(p, current, box, r, mapOff) {
+      var cartP = p;
+      var hookP = null;
+      var usePlanSway = mapOff && box && r;
+
+      if (usePlanSway) {
+        hookP = mapPlan({ x: current.x + mapOff.dx, y: current.y + mapOff.dy }, box, r);
+        cartP = {
+          x: p.x + (hookP.x - p.x) * 0.45,
+          y: p.y + (hookP.y - p.y) * 0.45,
+        };
+        ctx.save();
+        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = 'rgba(94, 189, 114, 0.5)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(p.x - 34, p.y - 20, 68, 40);
+        ctx.beginPath();
+        ctx.moveTo(p.x - 7, p.y); ctx.lineTo(p.x + 7, p.y);
+        ctx.moveTo(p.x, p.y - 7); ctx.lineTo(p.x, p.y + 7);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.strokeStyle = 'rgba(224, 90, 71, 0.8)';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(hookP.x, hookP.y);
+        ctx.stroke();
+        ctx.restore();
+        dot(hookP, swayAngleColor(mapOff.peakDeg, mapOff.tol), 9);
+      }
+
       ctx.fillStyle = 'rgba(0, 0, 0, 0.28)';
       ctx.beginPath();
-      ctx.ellipse(p.x + 4, p.y + 18, 33, 10, 0, 0, Math.PI * 2);
+      ctx.ellipse(cartP.x + 4, cartP.y + 18, 33, 10, 0, 0, Math.PI * 2);
       ctx.fill();
 
       ctx.fillStyle = '#f0a83b';
       ctx.strokeStyle = '#ffd18a';
       ctx.lineWidth = 2;
-      ctx.fillRect(p.x - 34, p.y - 20, 68, 40);
-      ctx.strokeRect(p.x - 34, p.y - 20, 68, 40);
+      ctx.fillRect(cartP.x - 34, cartP.y - 20, 68, 40);
+      ctx.strokeRect(cartP.x - 34, cartP.y - 20, 68, 40);
       ctx.fillStyle = '#203040';
-      ctx.fillRect(p.x - 18, p.y - 9, 36, 18);
+      ctx.fillRect(cartP.x - 18, cartP.y - 9, 36, 18);
 
       ctx.strokeStyle = '#c8d2dc';
       ctx.lineWidth = 3;
       ctx.beginPath();
-      ctx.moveTo(p.x, p.y + 20);
-      ctx.lineTo(p.x + sway, p.y + 92);
-      ctx.stroke();
-      ctx.fillStyle = '#e05a47';
-      ctx.beginPath();
-      ctx.arc(p.x + sway, p.y + 103, 12, 0, Math.PI * 2);
-      ctx.fill();
+      ctx.moveTo(cartP.x, cartP.y + 20);
+      if (usePlanSway && hookP) {
+        var ropeTipX = cartP.x + (hookP.x - p.x) * 0.35;
+        var ropeTipY = cartP.y + 92 + (hookP.y - p.y) * 0.15;
+        ctx.lineTo(ropeTipX, ropeTipY);
+        ctx.stroke();
+        ctx.fillStyle = '#e05a47';
+        ctx.beginPath();
+        ctx.arc(ropeTipX, ropeTipY + 11, 12, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        var fakeSway = Math.sin(current.t * 3.5) * Math.min(10, Math.abs(current.vy) * 28);
+        ctx.lineTo(cartP.x + fakeSway, cartP.y + 92);
+        ctx.stroke();
+        ctx.fillStyle = '#e05a47';
+        ctx.beginPath();
+        ctx.arc(cartP.x + fakeSway, cartP.y + 103, 12, 0, Math.PI * 2);
+        ctx.fill();
+      }
       ctx.strokeStyle = '#ffffff';
       ctx.lineWidth = 2;
       ctx.stroke();
@@ -2062,8 +2466,11 @@ def render_live_html(plc_mode: bool = False) -> str:
       const xTop = mapPlan({x: current.x, y: r.yMax}, box, r);
       const xBottom = mapPlan({x: current.x, y: r.yMin}, box, r);
       const now = mapPlan(current, box, r);
+      var baySway = ANTI_SWAY
+        ? swayMapOffset(_liveControlState && _liveControlState.sway, current.z)
+        : null;
       drawBridgeBeam(xTop, xBottom, current);
-      drawTrolley(now, current);
+      drawTrolley(now, current, box, r, baySway);
 
       // Position markers
       const initial = mapPlan(payload.initial, box, r);
@@ -2092,40 +2499,6 @@ def render_live_html(plc_mode: bool = False) -> str:
 
       label('X bridge ' + current.x.toFixed(2) + ' m', box.x + 16, box.y + 28, '#9fc9ed');
       label('Y trolley ' + current.y.toFixed(2) + ' m', box.x + 16, box.y + 48, '#ffe0a8');
-    }
-
-    function drawTrolleyCloseup(box, r, current) {
-      drawPanel(box, 'Trolley Movement');
-      const centerX = box.x + box.w * 0.5;
-      const railTop = box.y + 40;
-      const railBottom = box.y + box.h - 28;
-      const yToScreen = y => railBottom - ((y - r.yMin) / (r.yMax - r.yMin)) * (railBottom - railTop);
-      const cartY = yToScreen(current.y);
-      const placePos = payload.place || payload.target;
-      const targetY = placePos ? yToScreen(placePos.y) : cartY;
-
-      ctx.strokeStyle = '#596b7a';
-      ctx.lineWidth = 14;
-      ctx.beginPath(); ctx.moveTo(centerX, railTop); ctx.lineTo(centerX, railBottom); ctx.stroke();
-      ctx.strokeStyle = '#b7c2cc';
-      ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(centerX, railTop); ctx.lineTo(centerX, railBottom); ctx.stroke();
-
-      ctx.setLineDash([5, 5]);
-      ctx.strokeStyle = '#f0a83b';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath(); ctx.moveTo(box.x + 20, targetY); ctx.lineTo(box.x + box.w - 20, targetY); ctx.stroke();
-      ctx.setLineDash([]);
-      label('target Y', box.x + 22, targetY - 8, '#ffc263');
-
-      ctx.fillStyle = '#f0a83b';
-      ctx.strokeStyle = '#ffd18a';
-      ctx.lineWidth = 2;
-      ctx.fillRect(centerX - 58, cartY - 28, 116, 56);
-      ctx.strokeRect(centerX - 58, cartY - 28, 116, 56);
-      ctx.fillStyle = '#203040';
-      ctx.fillRect(centerX - 33, cartY - 13, 66, 26);
-      label(`${current.y.toFixed(2)} m`, centerX - 28, cartY + 48, '#ffe0a8');
     }
 
     function drawHoistProfile(box, r, current) {
@@ -2167,17 +2540,19 @@ def render_live_html(plc_mode: bool = False) -> str:
     }
 
     function layout(rect) {
+      var sideH = rect.height - 124;
       if (rect.width > 900) {
         const sideW = Math.max(270, rect.width * 0.28);
-        const bay = { x: 38, y: 82, w: rect.width - sideW - 58, h: rect.height - 124 };
-        const closeup = { x: bay.x + bay.w + 28, y: 82, w: sideW - 18, h: (rect.height - 154) * 0.58 };
-        const zbox = { x: closeup.x, y: closeup.y + closeup.h + 52, w: closeup.w, h: rect.height - (closeup.y + closeup.h + 90) };
-        return { bay, closeup, zbox };
+        const bay = { x: 38, y: 82, w: rect.width - sideW - 58, h: sideH };
+        const hookSway = { x: bay.x + bay.w + 28, y: 82, w: sideW - 18, h: sideH * 0.58 };
+        const zbox = { x: hookSway.x, y: hookSway.y + hookSway.h + 52, w: hookSway.w, h: sideH - hookSway.h - 52 };
+        return { bay, hookSway, zbox };
       }
-      const bay = { x: 28, y: 82, w: rect.width - 56, h: rect.height * 0.52 };
-      const closeup = { x: 28, y: bay.y + bay.h + 50, w: rect.width - 56, h: rect.height * 0.20 };
-      const zbox = { x: 28, y: closeup.y + closeup.h + 48, w: rect.width - 56, h: rect.height - (closeup.y + closeup.h + 86) };
-      return { bay, closeup, zbox };
+      const bay = { x: 28, y: 82, w: rect.width - 56, h: rect.height * 0.46 };
+      // 十字靶 + 倾角信息区需要的高度比原来的双仪表条多, 窄屏下相应加高
+      const hookSway = { x: 28, y: bay.y + bay.h + 50, w: rect.width - 56, h: Math.max(200, rect.height * 0.26) };
+      const zbox = { x: 28, y: hookSway.y + hookSway.h + 48, w: rect.width - 56, h: rect.height - (hookSway.y + hookSway.h + 86) };
+      return { bay, hookSway, zbox };
     }
 
     function draw() {
@@ -2197,7 +2572,7 @@ def render_live_html(plc_mode: bool = False) -> str:
       const current = payload.frames[frame];
       const boxes = layout(rect);
       drawCraneBay(boxes.bay, r, current);
-      drawTrolleyCloseup(boxes.closeup, r, current);
+      drawHookSway(boxes.hookSway);
       drawHoistProfile(boxes.zbox, r, current);
     }
 
@@ -2206,6 +2581,60 @@ def render_live_html(plc_mode: bool = False) -> str:
       if (ratio < 0.33) return '#5ebd72';
       if (ratio < 0.66) return '#f0a83b';
       return '#e05a47';
+    }
+
+    // 正常作业的阶段数 (Phase 0 → DONE), 用于在 PLC 模式下估算进度条。
+    // PLC 模式没有预先算好的轨迹, 总时长未知, 只能按阶段推进度。
+    const TOTAL_JOB_PHASES = 10;
+
+    function fmtDuration(sec) {
+      if (sec == null || isNaN(sec) || sec < 0) return '--';
+      if (sec < 60) return sec.toFixed(1) + 's';
+      const m = Math.floor(sec / 60);
+      const s = sec - m * 60;
+      if (m < 60) return m + 'm ' + (s < 10 ? '0' : '') + s.toFixed(1) + 's';
+      const h = Math.floor(m / 60);
+      return h + 'h ' + (m - h * 60) + 'm ' + s.toFixed(0) + 's';
+    }
+
+    function fmtClock(epochSec) {
+      if (epochSec == null) return '--:--:--';
+      return new Date(epochSec * 1000).toLocaleTimeString('zh-CN', { hour12: false });
+    }
+
+    /** 作业计时: 开始作业 → 完成作业 的整段耗时。
+     *  用服务端墙钟 (started_at/finished_at/elapsed), 不能用 latest.t —— 后者
+     *  是单个 PD 阶段的局部时间, 每换一个阶段就归零, 表示不了整段作业耗时。 */
+    function renderJobTimer(s) {
+      if (!s || s.started_at == null) {
+        els.jobStart.textContent = '--:--:--';
+        els.jobEnd.textContent = '--:--:--';
+        els.jobElapsed.textContent = '--';
+        els.jobTotalCell.classList.remove('jt-finished');
+        return null;
+      }
+      const finished = s.finished_at != null;
+      const elapsed = s.elapsed != null ? s.elapsed : 0;
+      els.jobStart.textContent = fmtClock(s.started_at);
+      els.jobEnd.textContent = finished ? fmtClock(s.finished_at)
+                                        : (s.running ? '进行中…' : '--:--:--');
+      els.jobElapsed.textContent = fmtDuration(elapsed);
+      els.jobTotalCell.classList.toggle('jt-finished', finished);
+
+      // 各阶段耗时 = 下一次阶段切换时刻 − 本次切换时刻; 最后一段用当前累计时间收口
+      const timeline = s.phase_timeline || [];
+      if (timeline.length) {
+        els.phaseLog.innerHTML = timeline.map(function(p, i) {
+          const end = i + 1 < timeline.length ? timeline[i + 1].at : elapsed;
+          return '<div><span>' + p.label + '</span><span>'
+               + fmtDuration(Math.max(0, end - p.at)) + '</span></div>';
+        }).join('');
+        els.startTime.textContent = '0.0s';
+        els.endTime.textContent = fmtDuration(elapsed);
+        els.progress.style.width =
+          Math.min(100, (timeline.length / TOTAL_JOB_PHASES) * 100) + '%';
+      }
+      return elapsed;
     }
 
     function renderStatus() {
@@ -2285,6 +2714,10 @@ def render_live_html(plc_mode: bool = False) -> str:
               _trajectoryFrozen = false;
               _lastTrailTime = -1;
               _segBoundariesRecorded = 0;
+              // 清掉上一次作业的计时/阶段记录, 等首次轮询带回新的 started_at
+              els.phaseLog.innerHTML = '';
+              els.progress.style.width = '0%';
+              els.jobTotalCell.classList.remove('jt-finished');
               if (!payload) {
                 payload = {
                   updateHz: 10, speed: 1, framePeriodMs: 100,
@@ -2509,7 +2942,17 @@ def render_live_html(plc_mode: bool = False) -> str:
       fetch('/api/control-state')
         .then(r => r.json())
         .then(s => {
-          if (!s.running && !s.done && !s.error && !s.stopped) return; // control not started yet
+          _liveControlState = s;
+          if (ANTI_SWAY) {
+            // 空闲时也采样: 作业开始前就能在十字靶上看到倾角仪零点与残余摆动
+            if (!_trajectoryFrozen && s.sway) recordSwaySample(s.sway);
+            if (s.sway) draw();
+          }
+          // 作业计时要一直刷新到终态之后 (完成/停止/异常都要留住最终耗时),
+          // 所以放在下面那些提前 return 之前。
+          const jobElapsed = renderJobTimer(s);
+          if (jobElapsed != null) els.time.textContent = fmtDuration(jobElapsed);
+          if (!s.running && !s.done && !s.error && !s.stopped) return;
           if (s.error) {
             _controlActive = false;
             els.ctrlMsg.textContent = 'Error: ' + s.error;
@@ -2576,6 +3019,7 @@ def render_live_html(plc_mode: bool = False) -> str:
             // Reset segment indices
             payload.segmentIndices = [];
             _segBoundariesRecorded = 0;
+            _swayFrames = [];
             // Keep existing frames for continuous trajectory, mark PD start
             payload.frames.push({t: d.t, x: d.x, y: d.y, z: d.z,
                                  vx: 0, vy: 0, vz: 0, vxCmd: 0, vyCmd: 0, vzCmd: 0,
@@ -2632,7 +3076,8 @@ def render_live_html(plc_mode: bool = False) -> str:
           var ex = ((d.p_ref_x||0) - (d.x||0)).toFixed(2);
           var ey = ((d.p_ref_y||0) - (d.y||0)).toFixed(2);
           var ez = ((d.p_ref_z||0) - (d.z||0)).toFixed(2);
-          els.time.textContent = (d.t || 0).toFixed(1) + 's';
+          // Time 显示整段作业累计耗时 (renderJobTimer 已写入); d.t 是当前 PD
+          // 阶段的局部时间, 每换一个阶段就归零, 不能用来表示作业耗时。
           // Show scheduler phase if available, otherwise PD info
           if (s.scheduler_phase_label) {
             els.phase.textContent = s.scheduler_phase_label;
@@ -2643,8 +3088,13 @@ def render_live_html(plc_mode: bool = False) -> str:
               + ' cmd=(' + (d.vx_cmd||0).toFixed(2) + ',' + (d.vy_cmd||0).toFixed(2) + ',' + (d.vz_cmd||0).toFixed(2) + ')m/s';
             els.phase.style.color = '#f0a83b';
           }
-          els.ctrlMsg.textContent = s.scheduler_phase_label || ('PD step #' + s.step_count);
-          els.ctrlMsg.style.color = '#5ebd72';
+          if (s.scheduler_message) {
+            els.ctrlMsg.textContent = s.scheduler_message;
+            els.ctrlMsg.style.color = s.scheduler_phase === 'SETTLE_WAIT' ? '#f0a83b' : '#5ebd72';
+          } else {
+            els.ctrlMsg.textContent = s.scheduler_phase_label || ('PD step #' + s.step_count);
+            els.ctrlMsg.style.color = '#5ebd72';
+          }
           els.x.textContent = (d.x || 0).toFixed(2);
           els.y.textContent = (d.y || 0).toFixed(2);
           els.z.textContent = (d.z || 0).toFixed(2);
@@ -2668,6 +3118,10 @@ def render_live_html(plc_mode: bool = False) -> str:
             t: d.t, x: d.x, y: d.y, z: d.z,
             vx: d.vx, vy: d.vy, vz: d.vz,
             vxCmd: d.vx_cmd, vyCmd: d.vy_cmd, vzCmd: d.vz_cmd,
+            antiswayDvx: d.antisway_dvx,
+            antiswayDvy: d.antisway_dvy,
+            thetaXDeg: s.sway && s.sway.valid ? s.sway.theta_x_deg : null,
+            thetaYDeg: s.sway && s.sway.valid ? s.sway.theta_y_deg : null,
             schedulerPhase: s.scheduler_phase || null,
             phaseLabel: 'PD Control',
           };
@@ -2789,7 +3243,10 @@ def render_live_html(plc_mode: bool = False) -> str:
   </script>
 </body>
 </html>"""
-    return html.replace('__PLC_MODE__', 'true' if plc_mode else 'false')
+    html = html.replace('__PLC_MODE__', 'true' if plc_mode else 'false')
+    html = html.replace('__ANTI_SWAY__', 'true' if anti_sway else 'false')
+    html = html.replace('__SWAY_TOL_DEG__', str(sway_tol_deg))
+    return html
 
 
 class _LiveRequestHandler(BaseHTTPRequestHandler):
@@ -2814,7 +3271,12 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         plc_mode = self.server.plc_actuator is not None
         if parsed.path in ('/', '/index.html'):
-            self._write(200, 'text/html; charset=utf-8', render_live_html(plc_mode).encode('utf-8'))
+            cfg = self.server.config
+            self._write(200, 'text/html; charset=utf-8', render_live_html(
+                plc_mode,
+                anti_sway=bool(cfg and cfg.enable_anti_sway),
+                sway_tol_deg=cfg.hook_sway_angle_tol_deg if cfg else 0.3,
+            ).encode('utf-8'))
         elif parsed.path in ('/calibration', '/calibration.html'):
             self._write(
                 200,
@@ -3220,12 +3682,10 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
     def _handle_control_state(self):
         """Return latest PD control state for frontend polling (10 Hz)."""
         cs = self.server.control_state
-        if cs is None:
-            self._write(200, 'application/json; charset=utf-8',
-                        json.dumps({'running': False, 'latest': None}).encode('utf-8'))
-            return
+        body = cs.snapshot() if cs is not None else {'running': False, 'latest': None}
+        body = _enrich_control_state_payload(self.server, body)
         self._write(200, 'application/json; charset=utf-8',
-                    json.dumps(cs.snapshot(), ensure_ascii=False).encode('utf-8'))
+                    json.dumps(body, ensure_ascii=False).encode('utf-8'))
 
     def log_message(self, format, *args):
         return
@@ -3249,12 +3709,18 @@ class ControlState:
         self.segment_boundaries: list = []  # frame indices marking segment transitions
         self.scheduler_phase: str | None = None
         self.scheduler_phase_label: str | None = None
+        self.scheduler_message: str | None = None
         self.step_count: int = 0
         self.arrivals: list = []            # [{'axis': 'x', 't': 1.23}, ...]
         self.done: bool = False
         self.error: str | None = None
         self.stopped: bool = False
         self.stop_reason: str | None = None
+        # 作业计时 (墙钟). PD 每步的 latest['t'] 每个阶段都会从 0 重新计时,
+        # 无法表示"开始作业→完成作业"的整段耗时, 故单独记录。
+        self.started_at: float | None = None    # time.time() at Apply Target
+        self.finished_at: float | None = None   # 完成/停止/出错的时刻
+        self.phase_timeline: list = []          # [{'phase','label','at'}, ...]
 
     def set_start(self, pos: dict, target: dict):
         with self.lock:
@@ -3271,6 +3737,21 @@ class ControlState:
             self.segment_boundaries = []
             self.scheduler_phase = None
             self.scheduler_phase_label = None
+            self.scheduler_message = None
+            self.started_at = time.time()
+            self.finished_at = None
+            self.phase_timeline = []
+
+    def set_phase_mark(self, phase_name: str, label: str) -> None:
+        """记录一次阶段切换时刻, 供前端展示各阶段耗时。"""
+        with self.lock:
+            if self.started_at is None:
+                return
+            self.phase_timeline.append({
+                'phase': phase_name,
+                'label': label,
+                'at': time.time() - self.started_at,
+            })
 
     def set_step(self, step_data: dict):
         with self.lock:
@@ -3287,6 +3768,7 @@ class ControlState:
             self.running = False
             self.stopped = False
             self.stop_reason = None
+            self.finished_at = time.time()
 
     def set_error(self, msg: str):
         with self.lock:
@@ -3295,6 +3777,7 @@ class ControlState:
             self.done = False
             self.stopped = False
             self.stop_reason = None
+            self.finished_at = time.time()
 
     def set_stopped(self, reason: str):
         with self.lock:
@@ -3303,15 +3786,26 @@ class ControlState:
             self.error = None
             self.stopped = True
             self.stop_reason = reason
+            self.finished_at = time.time()
 
     def snapshot(self) -> dict:
         with self.lock:
             phase = self.scheduler_phase
             phase_label = self.scheduler_phase_label
+            scheduler_message = self.scheduler_message
             pick_pos = self.pick_pos
             # scheduler_phase may be an OperationPhase enum or None
             phase_name = phase.name if hasattr(phase, 'name') else None
+            if self.started_at is None:
+                elapsed = None
+            else:
+                end = self.finished_at if self.finished_at is not None else time.time()
+                elapsed = end - self.started_at
             return {
+                'started_at': self.started_at,
+                'finished_at': self.finished_at,
+                'elapsed': elapsed,
+                'phase_timeline': list(self.phase_timeline),
                 'running': self.running,
                 'done': self.done,
                 'error': self.error,
@@ -3326,6 +3820,7 @@ class ControlState:
                 'segment_boundaries': list(self.segment_boundaries),
                 'scheduler_phase': phase_name,
                 'scheduler_phase_label': phase_label,
+                'scheduler_message': scheduler_message,
                 'arrivals': list(self.arrivals),
                 'latest': dict(self.latest) if self.latest else None,
             }

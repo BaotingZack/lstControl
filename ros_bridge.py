@@ -16,6 +16,8 @@ import time
 from typing import Any, Callable
 
 from coordinate_transform import CoordinateTransform2D
+from sway_estimator import InclinometerSwayEstimator, SwayAxisMapping
+from sway_settle import SwayLiveAnalyzer
 
 
 # ---- raw pose accessor (thread-safe, non-blocking) ----
@@ -106,6 +108,169 @@ def is_gripper_clamped() -> bool | None:
     return None  # ambiguous value
 
 
+# ---- sway sensor: /inclination/j1939_msg (thread-safe) ----
+
+_latest_inclination: dict[str, Any] | None = None
+_sway_lock = threading.Lock()
+_sway_estimator: InclinometerSwayEstimator | None = None
+_sway_live: SwayLiveAnalyzer | None = None
+_sway_has_data = False
+_last_inclination_wall: float | None = None
+
+
+def _deserialize_any(msg: Any) -> Any | None:
+    """把 rospy.AnyMsg 反序列化为实际消息对象 (容错, 失败返回 None)。
+
+    话题 /inclination/j1939_msg 的消息类型可能为设备自定义, 这里不硬依赖具体
+    类型: 用 AnyMsg 订阅 + connection header 里的类型串反序列化。
+    """
+    try:
+        from roslib.message import get_message_class
+    except ImportError:
+        return None
+    header = getattr(msg, '_connection_header', None) or {}
+    msg_type = header.get('type')
+    if not msg_type:
+        return None
+    klass = get_message_class(msg_type)
+    if klass is None and '/' in msg_type:
+        pkg, _, tname = msg_type.partition('/')
+        try:
+            mod = __import__(f'{pkg}.msg', fromlist=[tname])
+            klass = getattr(mod, tname, None)
+        except Exception:
+            klass = None
+    if klass is None:
+        return None
+    try:
+        real = klass()
+        real.deserialize(getattr(msg, '_buff', b''))
+        return real
+    except Exception:
+        return None
+
+
+def _inclination_callback(msg: Any) -> None:
+    global _latest_inclination, _sway_has_data, _last_inclination_wall
+    real = _deserialize_any(msg)
+    if real is None:
+        return
+    # j1939 vector: x=倾角仪 X 轴 (现场标定→小车 Y 方向→θy),
+    #              y=倾角仪 Y 轴 (现场标定→大车 X 方向→θx).
+    # 内部仍称 roll=vector.x, pitch=vector.y; 映射到 θx/θy 见 SwayAxisMapping/site_config。
+    vec = getattr(real, 'vector', None)
+    roll = getattr(vec, 'x', None) if vec is not None else getattr(real, 'roll', None)
+    pitch = getattr(vec, 'y', None) if vec is not None else getattr(real, 'pitch', None)
+    if roll is None and pitch is None:
+        return
+    with _sway_lock:
+        _latest_inclination = {'roll': roll, 'pitch': pitch}
+        _last_inclination_wall = time.monotonic()
+        _sway_has_data = True
+        if _sway_estimator is not None and _sway_live is not None:
+            sway = _sway_estimator.estimate(roll, pitch)
+            _sway_live.push(_last_inclination_wall, sway['theta_x'], sway['theta_y'])
+
+
+def get_inclination_raw() -> dict[str, float] | None:
+    """返回最新倾角仪原始 roll/pitch (调试/启动自检用)。"""
+    with _sway_lock:
+        if not _sway_has_data or _latest_inclination is None:
+            return None
+        return dict(_latest_inclination)
+
+
+def get_sway_state() -> dict[str, Any] | None:
+    """返回最新倾角仪摆角状态 {theta_x, theta_y}; 无数据或断流时返回 None。"""
+    with _sway_lock:
+        if _sway_estimator is None or not _sway_has_data or _last_inclination_wall is None:
+            return None
+        if time.monotonic() - _last_inclination_wall > 1.0:  # 数据断流 → 防摇安全退出
+            return None
+        inc = _latest_inclination or {}
+        gripper_closed = is_gripper_clamped()
+        return _sway_estimator.estimate(
+            inc.get('roll'), inc.get('pitch'), gripper_closed=gripper_closed,
+        )
+
+
+def configure_sway_live_analyzer(
+    *,
+    base_window: float = 0.6,
+    window_periods: float = 0.55,
+    window_max: float = 8.0,
+    sheave_height: float = 2.31,
+    grab_offset: float = 1.5,
+    tol_deg: float = 0.3,
+) -> None:
+    """启用实时摆角分析 (与调度器判稳窗/去趋势 PP 一致)。"""
+    global _sway_live
+    with _sway_lock:
+        _sway_live = SwayLiveAnalyzer(
+            base_window=base_window,
+            window_periods=window_periods,
+            window_max=window_max,
+            sheave_height=sheave_height,
+            grab_offset=grab_offset,
+            tol_deg=tol_deg,
+        )
+
+
+def get_sway_live_metrics(z_grab: float) -> dict[str, Any] | None:
+    """返回实时判稳指标; 未 configure 或无样本时返回 None。"""
+    with _sway_lock:
+        if _sway_live is None:
+            return None
+        return _sway_live.metrics(z_grab)
+
+
+def get_sway_snapshot(*, stale_after_s: float = 1.0) -> dict[str, Any]:
+    """返回 UI/调试用的倾角仪快照 (原始值 + 补偿后摆角, 度制便于展示)。"""
+    with _sway_lock:
+        if not _sway_has_data or _latest_inclination is None or _last_inclination_wall is None:
+            return {'valid': False, 'stale': True}
+        age_s = time.monotonic() - _last_inclination_wall
+        raw = dict(_latest_inclination)
+        stale = age_s > stale_after_s
+        sway = None
+        if _sway_estimator is not None and not stale:
+            gripper_closed = is_gripper_clamped()
+            sway = _sway_estimator.estimate(
+                raw.get('roll'), raw.get('pitch'), gripper_closed=gripper_closed,
+            )
+    if stale:
+        return {
+            'valid': False,
+            'stale': True,
+            'age_ms': round(age_s * 1000.0),
+            'roll': raw.get('roll'),
+            'pitch': raw.get('pitch'),
+        }
+    theta_x = float(sway['theta_x']) if sway else 0.0
+    theta_y = float(sway['theta_y']) if sway else 0.0
+    theta_x_deg = math.degrees(theta_x)
+    theta_y_deg = math.degrees(theta_y)
+    return {
+        'valid': True,
+        'stale': False,
+        'age_ms': round(age_s * 1000.0),
+        'roll': raw.get('roll'),
+        'pitch': raw.get('pitch'),
+        'theta_x': theta_x,
+        'theta_y': theta_y,
+        'theta_x_deg': theta_x_deg,
+        'theta_y_deg': theta_y_deg,
+        'theta_peak_deg': max(abs(theta_x_deg), abs(theta_y_deg)),
+    }
+
+
+class SwaySensorSource:
+    """供 run_pd_control 读取倾角仪摆角状态的轻量源 (类似 PositionSource 接口)。"""
+
+    def get_sway(self) -> dict[str, Any] | None:
+        return get_sway_state()
+
+
 def _ros_spin() -> None:
     """Blocking ROS 1 spin loop — runs in a daemon thread."""
     try:
@@ -146,15 +311,49 @@ def _ros_spin() -> None:
             print(f'[ros_bridge] Failed to subscribe to /crane/cmd_vel/anguler: {exc}')
             print('[ros_bridge] Gripper status via ROS will be unavailable')
 
+    # 倾角仪订阅 (best-effort): 话题/类型缺失时不影响主流程。
+    # 用 AnyMsg 订阅以兼容自定义 j1939 消息类型, 回调内再容错反序列化。
+    try:
+        rospy.Subscriber('/inclination/j1939_msg', rospy.AnyMsg, _inclination_callback)
+        print('[ros_bridge] Subscribed to /inclination/j1939_msg (AnyMsg)')
+    except Exception as exc:
+        print(f'[ros_bridge] Failed to subscribe to /inclination/j1939_msg: {exc}')
+        print('[ros_bridge] Sway sensing will be unavailable')
+
     rospy.spin()
 
 
-def start_ros_bridge() -> None:
-    """Start the ROS 1 subscriber in a daemon thread. Safe to call multiple times."""
-    global _node_started
+def start_ros_bridge(
+    angle_scale: float = 1.0,
+    roll_bias: float = 0.0,
+    pitch_bias: float = 0.0,
+    axis_mapping: SwayAxisMapping | None = None,
+    *,
+    roll_bias_closed: float | None = None,
+    pitch_bias_closed: float | None = None,
+) -> None:
+    """Start the ROS 1 subscriber in a daemon thread. Safe to call multiple times.
+
+    angle_scale: 倾角仪原始值 → 弧度 的换算系数 (角度制填 math.pi/180)。
+    roll_bias/pitch_bias: 零点偏置 (roll=倾角仪X, pitch=倾角仪Y), 与原始读数同单位。
+    axis_mapping: SwayAxisMapping, 将 roll/pitch 映射到 θx/θy。
+    """
+    global _node_started, _sway_estimator, _sway_live
     if _node_started:
         return
     _node_started = True
+    with _sway_lock:
+        if _sway_estimator is None:
+            _sway_estimator = InclinometerSwayEstimator(
+                mapping=axis_mapping,
+                angle_scale=angle_scale,
+                roll_bias=roll_bias,
+                pitch_bias=pitch_bias,
+                roll_bias_closed=roll_bias_closed,
+                pitch_bias_closed=pitch_bias_closed,
+            )
+        if _sway_live is None:
+            _sway_live = SwayLiveAnalyzer()
     thread = threading.Thread(target=_ros_spin, name='ros-bridge', daemon=True)
     thread.start()
 

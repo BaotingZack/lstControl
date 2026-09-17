@@ -1,0 +1,42 @@
+{
+  "_description": "现场倾角仪标定 — 空载抓钩完全张开, 5点静态采集 (见 倾角仪初值)",
+  "_calibrated_at": "2026-09-16",
+  "_axis_calibration": "倾角仪 Y→大车 X (θx); 倾角仪 X→小车 Y (θy); j1939 vector.y=pitch, vector.x=roll",
+
+  "_rope_calibration": "2026-09-17 由 bag lst_001~005 过零测周期反推: Z=0.36m→T=3.71s(L=3.42m), Z=0.98m→T=3.31s(2.72m), Z=1.52m→T=3.12s(2.42m)。sheave+offset=3.81 全行程 T 误差 -2.8%~+1.9%。旧值 8.0+1.5=9.5 使 L 偏大 2.7~3.3 倍",
+  "rope_length_sheave_height": 2.31,
+  "rope_length_grab_offset": 1.5,
+
+  "enable_anti_sway": true,
+  "_gain_note": "K [m/s per rad]; zeta_add = K/(2*sqrt(g*L))。取放货点 L=3.42m → ζ=0.5 需 K=5.8。全行程 K_opt 仅 4.9~5.8, 固定增益即可, 不需要 gain_schedule。整定阶梯: 2.6 → 3.9 → 5.3, 每档看摆幅衰减时间常数",
+  "anti_sway_sway_gain": 2.6,
+  "_max_correction_note": "消摆需要小车追着载荷走: 取放货点摆 1°→需 Δv 0.10 m/s, 摆 2°→0.20 m/s。旧值 0.08 会在 1° 就削顶",
+  "anti_sway_max_correction": 0.20,
+
+  "anti_sway_angle_deg": true,
+  "anti_sway_roll_bias": -1.159,
+  "anti_sway_pitch_bias": -0.166,
+  "anti_sway_roll_bias_closed": -1.139,
+  "anti_sway_pitch_bias_closed": -0.228,
+  "anti_sway_theta_x_from": "pitch",
+  "anti_sway_theta_y_from": "roll",
+  "anti_sway_theta_x_sign": 1.0,
+  "anti_sway_theta_y_sign": 1.0,
+
+  "hook_sway_angle_tol_deg": 0.3,
+  "hook_sway_angle_tol_approach_deg": 0.6,
+  "_window_note": "窗长 = 0.55 × T(Z); 绳长改对后取放货点约 2.0s, 最高点约 1.7s (旧的 9.5m 摆长会算出 3.4s)",
+  "hook_settle_window_periods": 0.55,
+  "hook_settle_window_max": 8.0,
+
+  "_dc_tau_note": "θ_ac 高通时间常数。缩短可加快抓钩张合引起的零偏阶跃衰减 (少占位移预算), 同时给出相位超前抵消速度环滞后; 2.5s 对 T≈3.2~3.7s 的摆只衰减 2.7%",
+  "anti_sway_settle_dc_tau": 2.5,
+  "anti_sway_settle_damping": true,
+  "_shift_note": "位移预算要同时容纳阻尼行程 (K*θ/ω, 摆2°约 0.05m) 与零偏阶跃瞬态 (约 0.06m)",
+  "anti_sway_settle_max_shift": 0.15,
+  "anti_sway_locked_max_shift": 0.15,
+  "anti_sway_settle_gain_scale": 1.5,
+
+  "stabilize_delay": 8.0,
+  "gripper_settle_max_wait": 10.0
+}
