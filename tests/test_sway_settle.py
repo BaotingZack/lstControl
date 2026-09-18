@@ -7,14 +7,53 @@ import math
 import pytest
 
 from sway_settle import (
+    GRAVITY,
+    SwayAmplitudeTracker,
     SwayLiveAnalyzer,
     ThetaDcTracker,
     adaptive_settle_window,
+    effective_rope_length,
     pendulum_period,
     sway_linear_detrend_peak_to_peak,
     sway_raw_peak_to_peak,
     window_samples_full,
+    wire_rope_length,
 )
+
+
+def test_physical_hoist_geometry():
+    """L_eff = 4 − Z; L_rope = 4 − Z − 1.5。禁止把 1.5 再加进摆长。"""
+    assert effective_rope_length(1.5) == pytest.approx(2.5)
+    assert effective_rope_length(0.36) == pytest.approx(3.64)
+    assert wire_rope_length(1.5) == pytest.approx(1.0)
+    assert wire_rope_length(0.36) == pytest.approx(2.14)
+    # 旧配法 sheave=4 offset=1.5 会把结构加两次
+    assert effective_rope_length(1.5, sheave_height=4.0, grab_offset=1.5) == pytest.approx(4.0)
+
+
+def test_energy_amplitude_tracks_sine():
+    """Â² = θ² + (θ̇/ωn)² 对已知正弦应接近振幅, 不必等半个周期。"""
+    L = 2.5
+    wn = math.sqrt(GRAVITY / L)
+    A = math.radians(1.0)
+    tr = SwayAmplitudeTracker(rate_tau=0.15)
+    dt = 0.05
+    last = 0.0
+    for k in range(80):
+        t = k * dt
+        theta = A * math.sin(wn * t)
+        last = tr.update(theta, 0.0, dt, wn)[2]
+    assert last == pytest.approx(A, rel=0.25)
+
+
+def test_energy_amplitude_rate_ignores_static_bias():
+    """纯零偏 |θ̇|≈0 → rate_amp 接近 0, 不能当成在摆。"""
+    tr = SwayAmplitudeTracker()
+    wn = 2.0
+    bias = math.radians(0.44)
+    for _ in range(30):
+        tr.update(bias, 0.0, 0.1, wn)
+    assert tr.last_rate_amp < math.radians(0.03)
 
 
 def test_pendulum_period_increases_with_lower_z():
@@ -78,6 +117,7 @@ def test_sway_live_analyzer_settled_on_constant_bias():
     m = live.metrics(z_grab=1.0)
     assert m['window_full'] is True
     assert m['detrend_pp_max_deg'] == pytest.approx(0.0, abs=0.01)
+    assert m['amp_max_deg'] is not None
     assert m['settled'] is True
 
 

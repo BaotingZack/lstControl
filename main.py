@@ -24,6 +24,7 @@ PLC 每个周期读取位置反馈，估计并滤波速度，使用 PD 输出速
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import math
 import sys
 import time
@@ -52,6 +53,7 @@ from ros_bridge import (  # noqa: E402
 )
 from site_config import (  # noqa: E402
     DEFAULT_SITE_CONFIG_PATH,
+    SITE_CONFIG_FIELDS,
     build_sway_axis_mapping,
     load_site_config,
     resolve_anti_sway_settings,
@@ -196,24 +198,12 @@ def _config_from_args(args, site: dict | None = None, argv: list[str] | None = N
         'workspace_y_bounds': _workspace_bounds_from_args(args, 'y'),
         'workspace_z_bounds': _workspace_bounds_from_args(args, 'z'),
     }
-    for key in (
-        'anti_sway_max_correction',
-        'anti_sway_settle_damping',
-        'anti_sway_settle_max_shift',
-        'hook_sway_angle_tol_deg',
-        'hook_sway_angle_tol_approach_deg',
-        'hook_settle_window_periods',
-        'hook_settle_window_max',
-        'anti_sway_settle_dc_tau',
-        'anti_sway_locked_max_shift',
-        'anti_sway_settle_gain_scale',
-        'anti_sway_roll_bias_closed',
-        'anti_sway_pitch_bias_closed',
-        'rope_length_sheave_height',
-        'rope_length_grab_offset',
-        'stabilize_delay',
-        'gripper_settle_max_wait',
-    ):
+    # 凡是 site_config 认识 (SITE_CONFIG_FIELDS) 且 CraneConfig 真有的字段, 一律
+    # 自动透传。这里原来是一份手写白名单, 漏写的键会静默失效 — 现场表现为"配置
+    # 改了没反应", anti_sway_settle_* 整组曾因此变成死配置。
+    config_fields = {f.name for f in dataclasses.fields(CraneConfig)}
+    passthrough = (SITE_CONFIG_FIELDS & config_fields) - set(crane_kwargs)
+    for key in sorted(passthrough):
         if key in anti:
             crane_kwargs[key] = anti[key]
         elif key in site:
@@ -325,10 +315,34 @@ def main(argv=None):
                     tol_deg=config.hook_sway_angle_tol_deg,
                 )
                 from ros_bridge import get_inclination_raw, get_sway_state
+                from sway_controller import damping_ratio, envelope_decay_time
+                from sway_settle import effective_rope_length
+
+                # 打印取放货高度下的等效阻尼比与 1°→容差 的预期消摆时间, 现场
+                # 整定增益时直接对着这两个数看 (判稳上限必须大于消摆时间+窗长)。
+                L_place = effective_rope_length(
+                    config.approach_safe_z,
+                    sheave_height=config.rope_length_sheave_height,
+                    grab_offset=config.rope_length_grab_offset,
+                )
+                zeta = damping_ratio(config.anti_sway_sway_gain, L_place)
+                t_decay = envelope_decay_time(
+                    config.anti_sway_sway_gain,
+                    L_place,
+                    1.0,
+                    config.hook_sway_angle_tol_deg,
+                )
                 print(
                     f'[Anti-sway] enabled K={config.anti_sway_sway_gain:.3f} m/s/rad, '
                     f'angle_scale={config.anti_sway_angle_scale:.5f}, '
-                    f'settle |θ|<{config.hook_sway_angle_tol_deg:.2f}°'
+                    f'settle 去趋势PP<{config.hook_sway_angle_tol_deg:.2f}°, '
+                    f'travel_damping='
+                    f'{"ON" if config.anti_sway_travel_damping else "OFF"}'
+                )
+                print(
+                    f'[Anti-sway] L={L_place:.2f}m → ζ={zeta:.2f}, '
+                    f'1°→{config.hook_sway_angle_tol_deg:.2f}° 预期 {t_decay:.1f}s '
+                    f'(判稳上限 {config.hook_settle_max_wait:.1f}s)'
                 )
                 if config.anti_sway_angle_scale == 1.0:
                     print(
@@ -436,6 +450,11 @@ def main(argv=None):
                 )
             else:
                 # PLC 模式非 live: 使用命令行 target 直接运行
+                sway_source = None
+                if config.enable_anti_sway:
+                    from ros_bridge import SwaySensorSource
+
+                    sway_source = SwaySensorSource()
                 history, arrival_events = run_pd_control(
                     source=ros_source,
                     actuator=plc_actuator,
@@ -444,6 +463,7 @@ def main(argv=None):
                     initial_state=crane0,
                     verbose=True,
                     is_simulation=False,
+                    sway_source=sway_source,
                 )
                 viz = CraneVisualizer(config)
                 viz.plot(history, arrival_events)

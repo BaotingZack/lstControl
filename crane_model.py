@@ -325,9 +325,23 @@ class CraneConfig:
     # 远离目标方向的速度指令（速度伺服型行车"刹车"=指令归零而非反向脉冲）。
     reverse_guard_tol: float = 0.10    # 原 0.05; 扩大以减少目标附近反向脉冲→抓钩摆动
 
-    # --- 倾角仪 / 抓钩摆角 (UI 展示与 site_config; 闭环防摇控制逻辑在后续分支) ---
+    # --- 倾角仪 / 抓钩摆角闭环防摇 ---
+    # 控制律 Δv = +K(L)·θ_ac 叠加到 PD 速度指令 (见 sway_controller 能量法),
+    # ζ = K/(2√(gL))。高速走行默认不叠 (假倾角); 目标附近低速或 XY 锁轴后
+    # 由 anti_sway_approach_damping 打开。锁轴后的软阻尼也在
+    # OperationScheduler._wait_cargo_settled() 内, 且必须先从摆动信号解出零偏
+    # 再动车。
     enable_anti_sway: bool = False
+    anti_sway_travel_damping: bool = False
+    # 到位附近才叠 θ_ac: 高速走行假倾角大, 全程叠加会推偏 PD。接近目标且
+    # XY 已慢下来后假倾角可忽略, 这时叠加才能消残摆。默认开。
+    anti_sway_approach_damping: bool = True
+    anti_sway_approach_pos: float = 0.40   # [m] 进入叠加的水平距离
+    anti_sway_approach_vel: float = 0.10   # [m/s] 且 XY 速度低于此 (加速度小)
     anti_sway_sway_gain: float = 0.0
+    # 绳长增益调度断点 ((L, K), ...), L 严格递增; 空=固定增益。现场 L 仅 2.4~3.4m,
+    # K_opt 跨度 4.9~5.8, 固定增益足够, 一般不需要调度。
+    anti_sway_gain_schedule: tuple = ()
     anti_sway_angle_scale: float = 1.0
     anti_sway_roll_bias: float = 0.0
     anti_sway_pitch_bias: float = 0.0
@@ -335,16 +349,37 @@ class CraneConfig:
     anti_sway_pitch_bias_closed: float | None = None
     anti_sway_max_correction: float = 0.05
     anti_sway_settle_damping: bool = True
-    anti_sway_settle_max_shift: float = 0.15
-    anti_sway_settle_dc_tau: float = 4.0
-    anti_sway_locked_max_shift: float = 0.15
+    # 位移预算 [m] — 阻尼要求小车追着载荷走, 必须允许偏离锚点一小段行程。
+    # 两个值语义不同, 不要设成一样:
+    #   locked_max_shift: 高 Z 悬停判稳 (抓钩离地, 横移安全) → 可放宽
+    #   settle_max_shift: Z 已下降到取放货高度、抓钩贴近钢卷时判稳 → 必须收紧;
+    #                     0 = 只判稳、横移一步都不走 (抓取/放货精度优先)
+    anti_sway_locked_max_shift: float = 0.06
+    anti_sway_settle_max_shift: float = 0.0
+    # 锚点回中增益 [1/s] — 见 AntiSwayRuntime.recenter_gain。必须远慢于摆频
+    # (ωn≈1.8 rad/s), 0.3 已实测不影响消摆速度; 调大到 ωn 量级会激励摆动。
+    anti_sway_hold_recenter_gain: float = 0.3
+    # θ_ac 高通时间常数 [s]: 倾角仪零偏随抓钩高度/张合变化 (见 doc/倾角仪初值, 幅度
+    # 约 0.3°, 与判稳容差同量级), 残留 DC 会让 Δv=K·θ_dc 变成恒定速度而把车推走。
+    # τ=2.5s 对 T≈3.2~3.7s 的摆只衰减约 2.7%, 同时给出约 12° 相位超前。
+    anti_sway_settle_dc_tau: float = 2.5
     anti_sway_settle_gain_scale: float = 1.5
-    rope_length_sheave_height: float = 2.31
-    rope_length_grab_offset: float = 1.5
+    # 绳长几何见 .cursor/rules/hoist-rope-geometry.mdc:
+    # 电子葫芦 H=4m, PLC Z=抓钩离地, 结构 h=1.5m → L_rope=H−Z−h, L_eff=H−Z。
+    # sheave=4、offset=0, 不要把 1.5 填进 grab_offset。
+    rope_length_sheave_height: float = 4.0
+    rope_length_grab_offset: float = 0.0
+    rope_length_structure: float = 1.5
+    rope_length_cable_stretch: float = 0.0
+    rope_length_min: float = 0.5
     hook_settle_window_periods: float = 0.55
     hook_settle_window_max: float = 8.0
     hook_sway_angle_tol_deg: float = 0.3
     hook_sway_angle_tol_approach_deg: float = 0.6
+    # 倾角判稳等待上限 [s]。必须留够"衰减时间 + 判稳窗填满"的余量:
+    # K=2.6 时 1°→0.3° 约需 3.2s, 判稳窗约 1.9s → 原来的 stabilize_delay=4.0s
+    # 会在摆幅刚压下去、窗还没填满时就超时放行。
+    hook_settle_max_wait: float = 12.0
 
     # --- 可选机械工作区 ---
     # 现场行程因设备而异，X/Y 不提供虚假的默认范围；PLC 部署时应显式配置。
@@ -390,6 +425,17 @@ class CraneConfig:
             'hook_settle_vel_tol': self.hook_settle_vel_tol,
             'hook_settle_pos_tol': self.hook_settle_pos_tol,
             'hook_settle_window': self.hook_settle_window,
+            'hook_settle_max_wait': self.hook_settle_max_wait,
+            'hook_sway_angle_tol_deg': self.hook_sway_angle_tol_deg,
+            # 增益符号即阻尼符号: K<0 会让 Δv 反向抽能, 把摆越推越大 (见
+            # sway_controller 的能量法推导), 必须在构造期就拦住。
+            'anti_sway_approach_pos': self.anti_sway_approach_pos,
+            'anti_sway_approach_vel': self.anti_sway_approach_vel,
+            'anti_sway_sway_gain': self.anti_sway_sway_gain,
+            'anti_sway_max_correction': self.anti_sway_max_correction,
+            'anti_sway_locked_max_shift': self.anti_sway_locked_max_shift,
+            'anti_sway_settle_max_shift': self.anti_sway_settle_max_shift,
+            'anti_sway_hold_recenter_gain': self.anti_sway_hold_recenter_gain,
             'gripper_settle_max_wait': self.gripper_settle_max_wait,
             'post_release_lift_delay': self.post_release_lift_delay,
             'arrival_pos_tol': self.arrival_pos_tol,
@@ -711,11 +757,17 @@ def run_pd_control(
     max_time: float | None = 180.0,
     verbose: bool = True,
     is_simulation: bool = True,
+    sway_source: object | None = None,
 ) -> tuple[list[dict], list[tuple[float, str]]]:
     """统一 PD 位置控制循环 — 仿真和 PLC 模式共用。
 
     控制律:
-      v_cmd = Kp * (target - measured) - Kd * filtered_velocity
+      v_cmd = Kp * (target - measured) - Kd * filtered_velocity + K(L)·θ_ac
+
+    末项是可选的摆角闭环防摇 (需 config.enable_anti_sway 且传入 sway_source),
+    作用是让行车在行进段就"追着载荷走"、到位时残余摆幅已经很小; 到位后 PD
+    循环即退出, 锁轴悬停期间的软阻尼由 OperationScheduler._wait_cargo_settled()
+    接管 (那里才是摆幅最大、且本循环已经不再下发指令的阶段)。
 
     仿真模式: SimPositionSource (100 Hz 非阻塞) + PlantActuator
     PLC 模式: RosPositionSource (10 Hz 阻塞) + PlcActuator
@@ -730,6 +782,10 @@ def run_pd_control(
         max_time:       最大运行时间 [s]
         verbose:        是否打印日志
         is_simulation:  True=仿真模式 (虚拟时间), False=PLC 模式 (真实时间)
+        sway_source:    可选摆角源, 需提供 get_sway() -> {'theta_x','theta_y'} | None
+                        (断流时返回 None, 防摇自动退化为纯 PD)。仅当
+                        config.anti_sway_travel_damping 为真时才真正叠加; 默认
+                        关闭, 避免加减速假倾角把 PD 轨迹推偏。
 
     Returns:
         (history, arrival_events):
@@ -824,6 +880,29 @@ def run_pd_control(
         ),
     }
 
+    # 摆角闭环防摇。全程走行默认关 (假倾角); 目标附近 / XY 锁轴后按
+    # anti_sway_approach_damping 打开。travel_on 仍可强制全程叠加。
+    anti_sway_runtime = None
+    travel_on = getattr(config, 'anti_sway_travel_damping', False)
+    approach_on = getattr(config, 'anti_sway_approach_damping', False)
+    if (
+        (travel_on or approach_on)
+        and sway_source is not None
+        and getattr(sway_source, 'get_sway', None) is not None
+    ):
+        from anti_sway_runtime import AntiSwayRuntime
+        from sway_controller import build_anti_sway
+
+        anti_sway_ctrl = build_anti_sway(config)
+        if anti_sway_ctrl is not None:
+            anti_sway_runtime = AntiSwayRuntime(
+                anti_sway=anti_sway_ctrl,
+                dc_tau=config.anti_sway_settle_dc_tau,
+                locked_max_shift=config.anti_sway_locked_max_shift,
+                recenter_gain=config.anti_sway_hold_recenter_gain,
+            )
+            anti_sway_runtime.reset(crane.x.position, crane.y.position)
+
     # 速度滤波器 — 共用, PLC 模式使用更大的 tau
     filters = {
         'x': LowPassVelocityEstimator(filter_tau, crane.x.position, crane.x.velocity),
@@ -849,6 +928,11 @@ def run_pd_control(
     vx_cmd = vy_cmd = vz_cmd = 0.0
     vx_raw = vy_raw = vz_raw = 0.0
     vx_filtered = vy_filtered = vz_filtered = 0.0
+
+    # 防摇输出记录 (UI 曲线; 未启用防摇时恒为 0/None)
+    antisway_dvx = antisway_dvy = 0.0
+    theta_x = theta_y = None
+    approach_logged = False
 
     # 扰动记录 (仅仿真模式非零)
     disturbance_x = disturbance_y = disturbance_z = 0.0
@@ -987,6 +1071,76 @@ def run_pd_control(
             vy_cmd = 0.0 if locked['y'] else controllers['y'].update(target_y, y_measured, vy_damp, dt)
             vz_cmd = 0.0 if locked['z'] else controllers['z'].update(target_z, z_measured, vz_damp, dt)
 
+            # --- STEP 3b: 摆角闭环防摇 — Δv = +K(L)·θ_ac 叠加到 XY 指令 ---
+            # 已锁轴的 XY 仍在预算内做软阻尼 (典型场景: XY 已到位、Z 还在下降,
+            # 此时不阻尼就等于放着摆一路摆到取放货高度)。摆角断流 (get_sway
+            # 返回 None) 时不更新 DC 跟踪器也不叠加, 自动退化为纯 PD。
+            antisway_dvx = antisway_dvy = 0.0
+            theta_x = theta_y = None
+            if anti_sway_runtime is not None:
+                from anti_sway_runtime import approach_damping_allowed
+
+                sway = sway_source.get_sway()
+                if sway is not None:
+                    theta_x = float(sway['theta_x'])
+                    theta_y = float(sway['theta_y'])
+                    z_remain = abs(target_z - z_measured)
+                    near_cargo = z_remain <= 0.30
+                    # 贴近取放货高度禁止横移 (与 settle_max_shift=0 一致)
+                    observe_only = (
+                        near_cargo and config.anti_sway_settle_max_shift <= 0.0
+                    )
+                    allow = (not observe_only) and approach_damping_allowed(
+                        err_x=target_x - x_measured,
+                        err_y=target_y - y_measured,
+                        vx=vx_damp,
+                        vy=vy_damp,
+                        locked_x=locked['x'],
+                        locked_y=locked['y'],
+                        travel_on=travel_on,
+                        approach_on=approach_on,
+                        approach_pos=config.anti_sway_approach_pos,
+                        approach_vel=config.anti_sway_approach_vel,
+                    )
+                    if allow:
+                        anti_sway_runtime.locked_max_shift = (
+                            config.anti_sway_settle_max_shift
+                            if near_cargo
+                            else config.anti_sway_locked_max_shift
+                        )
+                        (
+                            vx_cmd, vy_cmd, antisway_dvx, antisway_dvy,
+                        ) = anti_sway_runtime.merge_xy_commands(
+                            vx_cmd, vy_cmd,
+                            theta_x=theta_x,
+                            theta_y=theta_y,
+                            z_grab=z_measured,
+                            x=x_measured,
+                            y=y_measured,
+                            locked_x=locked['x'],
+                            locked_y=locked['y'],
+                            dt=dt,
+                            max_velocity_xy=config.max_velocity_xy,
+                            gain_scale=(
+                                config.anti_sway_settle_gain_scale
+                                if locked['x'] and locked['y']
+                                else 1.0
+                            ),
+                        )
+                        if not approach_logged:
+                            print(
+                                f"[Anti-sway] 接近/锁轴阻尼 ON  "
+                                f"err_xy={math.hypot(target_x - x_measured, target_y - y_measured):.2f}m "
+                                f"z_remain={z_remain:.2f}m "
+                                f"θ=({math.degrees(theta_x):+.2f},{math.degrees(theta_y):+.2f})° "
+                                f"Â={math.degrees(anti_sway_runtime.last_amp):.2f}° "
+                                f"Δv=({antisway_dvx:+.3f},{antisway_dvy:+.3f})"
+                            )
+                            approach_logged = True
+                    elif approach_logged:
+                        print("[Anti-sway] 接近/锁轴阻尼 OFF")
+                        approach_logged = False
+
             # Z 目标附近的微调门控 (仅 PLC 模式)。抓钩高度反馈带滞后 (S7 轮询/PLC
             # 扫描, 抖动期间还会沿用旧读数), 在最后几厘米里若继续按"仍在变化的读数"
             # 去修高度设定值, 等于追一个过时的误差: 误差符号来回翻, 设定值跟着来回
@@ -1064,6 +1218,12 @@ def run_pd_control(
                     axis.velocity = 0.0
                     locked[name] = True
                     arrival_events.append((t, name))
+                    # 锁轴瞬间把位移预算的锚点搬到锁定点。锚点若还停在出发位置,
+                    # |x−anchor| 会是整段行程 (米级) 远超预算, 软阻尼就只剩"朝出发
+                    # 点回拉"的半个周期 → 被半波整流成单向漂移 (见 AntiSwayRuntime
+                    # .set_anchor)。
+                    if anti_sway_runtime is not None and name in ('x', 'y'):
+                        anti_sway_runtime.set_anchor(**{name: target})
                     if hooks is not None:
                         hooks.on_arrival(name, t)
 
@@ -1079,6 +1239,12 @@ def run_pd_control(
                 'vx_raw': vx_raw, 'vy_raw': vy_raw, 'vz_raw': vz_raw,
                 'vx_filtered': vx_filtered, 'vy_filtered': vy_filtered, 'vz_filtered': vz_filtered,
                 'disturbance_x': disturbance_x, 'disturbance_y': disturbance_y, 'disturbance_z': disturbance_z,
+                'antisway_dvx': antisway_dvx, 'antisway_dvy': antisway_dvy,
+                'theta_x': theta_x, 'theta_y': theta_y,
+                'antisway_amp_deg': (
+                    math.degrees(anti_sway_runtime.last_amp)
+                    if anti_sway_runtime is not None else None
+                ),
             }
             history.append(step_data)
 

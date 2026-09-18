@@ -2203,7 +2203,8 @@ def render_live_html(
         ctx.fillText(truncateText(text, halfW), x, metaTop + row * metaLineH);
       }
 
-      metaLine(1, '|θ|max ' + fmtDeg(peak), colL, peak != null ? swayAngleColor(peak, tol) : '#91a3b3');
+      var amp = live && live.amp_max_deg != null ? live.amp_max_deg : peak;
+      metaLine(1, 'Â ' + fmtDeg(amp), colL, amp != null ? swayAngleColor(amp, tol * 0.5) : '#91a3b3');
       metaLine(1, '峰峰' + winS.toFixed(1) + 's ' + (ppMax == null ? '--' : ppMax.toFixed(2) + '°'),
                colR, ppMax != null ? swayAngleColor(ppMax, tol) : '#91a3b3');
       var rawText = 'Inc-Y ' + (sway && sway.pitch != null ? sway.pitch.toFixed(2) + '°' : '--')
@@ -3707,6 +3708,14 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         target_pos = (target_x, target_y, target_z)
 
         # Create scheduler with coordinate transform for proper frontend display
+        # 摆角源: 倾角仪在线时供判稳与防摇使用 (get_sway_state 在数据断流时返回
+        # None, 调度器据此自动降级为位置判稳)。未启用防摇则不注入, 行为不变。
+        sway_provider = None
+        if server.config is not None and server.config.enable_anti_sway:
+            from ros_bridge import get_sway_state
+
+            sway_provider = get_sway_state
+
         scheduler = OperationScheduler(
             plc=plc,
             source=server.ros_source,
@@ -3715,6 +3724,7 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             is_simulation=False,
             coordinate_transform=server.coordinate_transform,
             z_is_hoist_height=has_hoist_z,
+            sway_provider=sway_provider,
         )
 
         # Store scheduler reference for stop/reset

@@ -20,9 +20,15 @@ Operation Scheduler — 完整起重机作业流程编排
   抓钩动作确认后安全等待 0.5s (机械动作确认延时, 与摆动无关, 固定值)
   释放完全确认后 → 停留 post_release_lift_delay (~2s) → 直接抬升到目标高度
 
-自适应判稳 (效率与安全兼顾, 替代"盲等固定时长"):
-  用实测位置反馈判断货物是否真正静止 (速度 + 滑动窗口位置峰峰值双重判据)。
-  已经静止 → 提前放行, 不必等满上限时长 (提升效率);
+自适应判稳 + 悬停防摇 (效率与安全兼顾, 替代"盲等固定时长"):
+  有倾角仪 (注入 sway_provider) 时走 _wait_settled_by_sway():
+    - 判据 = 载荷摆角的去趋势峰峰值 < hook_sway_angle_tol_deg, 直接盯载荷
+    - 同时主动下发 Δv=+K·θ_ac 把摆消掉 (PD 循环此时已退出, 不主动给指令的话
+      1° 的摆只能靠自然阻尼衰减几十秒)
+    - 悬停动车受位移预算/速度上限/断流停车三重约束
+  无倾角仪时退回 _wait_settled_by_position(): 速度 + 滑动窗口位置峰峰值双判据。
+    注意它测的是车体而非载荷, 对"车停了、钩还在摆"不敏感, 只能作兜底。
+  已经平稳 → 提前放行, 不必等满上限时长 (提升效率);
   仍在摆动/回弹 → 持续等待直到真正平稳, 而不是等满固定时长后就不管
   三七二十一继续抓钩动作 (这正是"货物未放稳/未释放完就抓钩"风险的根源)。
   超时兜底: 与抓钩状态确认超时一致, 打印警告后继续执行 (软失败), 避免
@@ -204,6 +210,16 @@ class SchedulerHooks:
             }
 
 
+class _SwayProviderSource:
+    """把 sway_provider 可调用适配成 run_pd_control 期望的 get_sway() 接口。"""
+
+    def __init__(self, read_sway: Callable[[], dict | None]):
+        self._read_sway = read_sway
+
+    def get_sway(self) -> dict | None:
+        return self._read_sway()
+
+
 # ---------------------------------------------------------------------------
 # 调度器
 # ---------------------------------------------------------------------------
@@ -223,6 +239,19 @@ class OperationScheduler:
     # 最大单次 PD 运行时间 [s] — 单次移动不应超过此值
     _PD_MAX_TIME = 300.0  # 5 min per PD segment
 
+    # 判稳期间单次 get_position 最多等 2s; 连续 3 次≈6s 才判为定位断流
+    _MAX_SETTLE_FEEDBACK_MISSES = 3
+    # 摆角持续断流多久后放弃倾角判稳、降级为位置判据 [s]
+    # (get_sway 自身已有 1s 的数据新鲜度门限, 这里是它之上的连续失败窗口)
+    _SWAY_STALE_FALLBACK_S = 2.0
+    # 发散保护: 悬停阻尼期间摆幅相对初值放大到该倍数即判为"阻尼在注入能量",
+    # 立即撤掉阻尼并停车。Δv=+K·θ 的符号就是阻尼的符号 — 倾角轴映射/符号标反
+    # (anti_sway_theta_x_sign 等) 会让同一套公式变成负阻尼, 把摆越推越大。
+    # 这是首次现场联调最需要的安全网, 比事后看曲线快得多。
+    _SWAY_DIVERGENCE_RATIO = 1.8
+    # 发散判据的绝对幅值下限 = 容差 × 该系数 (避免把小幅外扰误判成负阻尼)
+    _SWAY_DIVERGENCE_TOL_FACTOR = 2.0
+
     def __init__(
         self,
         plc: PLCInterface,
@@ -234,6 +263,7 @@ class OperationScheduler:
         gripper_provider: Callable[[], tuple[bool | None, bool | None]] | None = None,
         coordinate_transform: object | None = None,
         z_is_hoist_height: bool = False,
+        sway_provider: Callable[[], dict | None] | None = None,
     ):
         """
         Args:
@@ -245,6 +275,9 @@ class OperationScheduler:
             gripper_provider:  可选的抓钩状态提供者: () -> (clamped, released)
             coordinate_transform: 坐标变换 (crane→map), 用于前端展示
             z_is_hoist_height: Z 是否来自抓钩实测高度
+            sway_provider:     可选摆角提供者: () -> {'theta_x','theta_y'} | None
+                               (断流时返回 None)。提供后判稳改用倾角指标, 并在
+                               锁轴悬停期间做软阻尼消摆; 缺省则沿用位置判稳。
         """
         self._plc = plc
         self._source = source
@@ -254,6 +287,16 @@ class OperationScheduler:
         self._gripper_provider = gripper_provider
         self._coordinate_transform = coordinate_transform
         self._z_is_hoist_height = z_is_hoist_height
+        self._sway_provider = sway_provider
+
+        # 倾角判稳分析器 + 锁轴软阻尼运行时 (无摆角源/未启用防摇时为 None)
+        self._sway_analyzer = self._build_sway_analyzer()
+        self._sway_damper = self._build_sway_damper()
+        # 行进段防摇: run_pd_control 要的是 get_sway() 对象接口, 这里复用
+        # _read_sway 的校验 (NaN/断流过滤), 避免两条通路各写一份。
+        self._pd_sway_source = (
+            _SwayProviderSource(self._read_sway) if sway_provider is not None else None
+        )
 
         # 共享调度钩子
         self.hooks = SchedulerHooks()
@@ -265,8 +308,92 @@ class OperationScheduler:
         self._pd_hooks: _PdToSchedulerAdapter | None = None
 
     # ------------------------------------------------------------------
+    # 防摇 / 判稳构件
+    # ------------------------------------------------------------------
+
+    def _build_sway_analyzer(self):
+        """倾角判稳分析器 — 与离线 bag 分析共用同一套去趋势峰峰值指标。"""
+        if self._sway_provider is None:
+            return None
+        from sway_settle import SwayLiveAnalyzer
+
+        cfg = self._config
+        return SwayLiveAnalyzer(
+            base_window=cfg.hook_settle_window,
+            window_periods=cfg.hook_settle_window_periods,
+            window_max=cfg.hook_settle_window_max,
+            sheave_height=cfg.rope_length_sheave_height,
+            grab_offset=cfg.rope_length_grab_offset,
+            tol_deg=cfg.hook_sway_angle_tol_deg,
+        )
+
+    def _build_sway_damper(self):
+        """锁轴软阻尼运行时。
+
+        PD 循环在三轴全部锁定的瞬间就退出并停车, 而摆幅最大的恰恰是之后的悬停
+        判稳阶段 — 那时没有任何执行器在作用, 1° 的摆只能靠钢丝绳自然阻尼
+        (ζ≈1~2%, 包络时间常数几十秒) 衰减, 等不到。这里补上悬停期的主动阻尼。
+        """
+        if self._sway_provider is None:
+            return None
+        cfg = self._config
+        if not cfg.enable_anti_sway or not cfg.anti_sway_settle_damping:
+            return None
+        from anti_sway_runtime import AntiSwayRuntime
+        from sway_controller import build_anti_sway
+
+        controller = build_anti_sway(cfg)
+        if controller is None:
+            return None
+        return AntiSwayRuntime(
+            anti_sway=controller,
+            dc_tau=cfg.anti_sway_settle_dc_tau,
+            locked_max_shift=cfg.anti_sway_locked_max_shift,
+            gain_scale=cfg.anti_sway_settle_gain_scale,
+            recenter_gain=cfg.anti_sway_hold_recenter_gain,
+        )
+
+    def _read_sway(self) -> dict | None:
+        """读取摆角; provider 异常一律视为断流 (降级为位置判稳, 不中断作业)。"""
+        if self._sway_provider is None:
+            return None
+        try:
+            sway = self._sway_provider()
+        except Exception as exc:  # 传感器/ROS 侧异常不该掀翻整个作业
+            print(f"[Scheduler] 摆角读取异常, 本次判稳降级为位置判据: {exc}")
+            return None
+        if not sway:
+            return None
+        theta_x = sway.get('theta_x')
+        theta_y = sway.get('theta_y')
+        if theta_x is None or theta_y is None:
+            return None
+        if not (math.isfinite(theta_x) and math.isfinite(theta_y)):
+            return None
+        return {'theta_x': float(theta_x), 'theta_y': float(theta_y)}
+
+    # ------------------------------------------------------------------
     # 公开接口
     # ------------------------------------------------------------------
+
+    def damp_in_place(
+        self,
+        max_wait: float | None = None,
+        *,
+        damp_max_shift: float | None = None,
+    ) -> None:
+        """原地消摆 — 现场联调用的最小闭环入口 (不走作业流程, 不动抓钩/Z)。
+
+        走的就是作业流程里那段悬停判稳+主动阻尼的同一份代码, 因此可以用它单独
+        核验防摇的收敛方向与整定增益, 而不必为了测防摇先跑一整套取放。
+
+        以当前位置为锚点, 在 XY 上做预算内的软阻尼直到摆幅进入容差或等满上限。
+        """
+        self._wait_cargo_settled(
+            "原地消摆",
+            self._config.stabilize_delay if max_wait is None else max_wait,
+            damp_max_shift=damp_max_shift,
+        )
 
     def execute(
         self,
@@ -376,8 +503,12 @@ class OperationScheduler:
             if self.hooks.should_stop():
                 raise ControlStoppedError("操作员停止")
 
+            # 抓钩此时已贴近钢卷, 横移有碰撞风险 → 位移预算收紧到
+            # anti_sway_settle_max_shift。绝大部分摆幅应该在上面 Z 还高时就已消掉。
             self._wait_cargo_settled(
-                "Z 下降到取货高度后, 夹取前", self._config.gripper_settle_max_wait
+                "Z 下降到取货高度后, 夹取前",
+                self._config.gripper_settle_max_wait,
+                damp_max_shift=self._config.anti_sway_settle_max_shift,
             )
             self._plc.gripper_clamp()
             self._wait_gripper_clamped()
@@ -447,8 +578,11 @@ class OperationScheduler:
             if self.hooks.should_stop():
                 raise ControlStoppedError("操作员停止")
 
+            # 同 Phase 1c: 钢卷已贴近垛位, 位移预算必须收紧
             self._wait_cargo_settled(
-                "Z 下降到卸货高度后, 释放前", self._config.gripper_settle_max_wait
+                "Z 下降到卸货高度后, 释放前",
+                self._config.gripper_settle_max_wait,
+                damp_max_shift=self._config.anti_sway_settle_max_shift,
             )
             self._plc.gripper_release()
             self._wait_gripper_released()
@@ -606,6 +740,15 @@ class OperationScheduler:
             max_time=self._PD_MAX_TIME,
             verbose=True,
             is_simulation=self._is_simulation,
+            # 高速走行不叠倾角 (假倾角); 目标附近 / 锁轴后由 approach_damping 打开。
+            sway_source=(
+                self._pd_sway_source
+                if (
+                    self._config.anti_sway_travel_damping
+                    or self._config.anti_sway_approach_damping
+                )
+                else None
+            ),
         )
         return history, arrival_events
 
@@ -619,8 +762,272 @@ class OperationScheduler:
             remaining = deadline - time.monotonic()
             time.sleep(min(0.1, max(0.01, remaining)))
 
-    def _wait_cargo_settled(self, reason: str, max_wait: float) -> None:
-        """自适应等待货物平稳 — 用实测位置反馈判断, 代替盲等固定时长。
+    def _wait_cargo_settled(
+        self,
+        reason: str,
+        max_wait: float,
+        *,
+        damp_max_shift: float | None = None,
+    ) -> None:
+        """等待货物平稳 — 有倾角仪走倾角判稳+主动阻尼, 否则退回位置判稳。
+
+        Args:
+            reason:         日志/UI 里的阶段说明
+            max_wait:       等待上限 [s]; 倾角判稳会取 max(它, hook_settle_max_wait),
+                            因为消摆需要的时间由绳长和增益决定, 不是由原先"盲等"
+                            的经验时长决定 (K=2.6 时 1°→0.3° 就要 3.2s, 再加判稳
+                            窗填满约 1.9s, 原来的 4.0s 必然超时放行)
+            damp_max_shift: 本次悬停允许偏离锚点的位移预算 [m]; None=用
+                            anti_sway_locked_max_shift。抓钩已下降到贴近钢卷时
+                            必须传更小的值 (见 anti_sway_settle_max_shift)
+        """
+        if self._sway_analyzer is not None and self._read_sway() is not None:
+            self._wait_settled_by_sway(
+                reason,
+                max(max_wait, self._config.hook_settle_max_wait),
+                damp_max_shift=damp_max_shift,
+            )
+        else:
+            self._wait_settled_by_position(reason, max_wait)
+
+    def _wait_settled_by_sway(
+        self,
+        reason: str,
+        max_wait: float,
+        *,
+        damp_max_shift: float | None = None,
+    ) -> None:
+        """倾角判稳 + 悬停软阻尼 — 直接盯载荷摆角, 并主动把摆消掉。
+
+        为什么必须在这里主动给指令: run_pd_control() 的循环条件是
+        `while not all(locked.values())`, 三轴一锁齐就退出并 stop_motion(), 而摆幅
+        最大的恰恰是之后的悬停判稳阶段。此时没有任何执行器在作用, 1° 的摆只能
+        靠钢丝绳自然阻尼衰减 (ζ≈1~2% → 包络时间常数几十秒), 判稳窗内根本等不到。
+        叠加 Δv=+K·θ_ac 后等效阻尼比 ζ=K/(2√(gL)), 现场 K≈5 对应 ζ≈0.45,
+        1°→0.3° 只需 1~2s。
+
+        三重安全约束 (悬停期主动动车, 必须约束住):
+          1. 位移预算: 相对锚点 (进入悬停时的位置) 超出预算后只放行朝锚点回拉的
+             方向 (clamp_damping_axis), 结构上不可能越走越远
+          2. 速度上限: 悬停期唯一的速度来源就是防摇修正量, 故直接以
+             anti_sway_max_correction 为硬上限 (gain_scale 会放大 Δv, 必须再钳一次)
+          3. 摆角断流立即停车: 宁可不消摆, 也不能拿过期摆角盲目动车; 持续断流
+             超过 _SWAY_STALE_FALLBACK_S 则整段降级为位置判稳
+
+        判稳判据用去趋势峰峰值而非 |θ|: 倾角仪零偏随抓钩高度/张合变化 (见
+        doc/倾角仪初值, 幅度约 0.3°, 与容差同量级), 用绝对值判会被零偏直接顶穿。
+        """
+        cfg = self._config
+        analyzer = self._sway_analyzer
+        analyzer.reset()
+        damper = self._sway_damper
+        max_shift = (
+            cfg.anti_sway_locked_max_shift if damp_max_shift is None else damp_max_shift
+        )
+        if damp_max_shift is not None and damp_max_shift <= 0.0:
+            # 贴近钢卷: 预算为 0 表示只判稳、横移一步都不能走, 否则抓取/放货
+            # 位置会被软阻尼推偏。高 Z 悬停仍用 locked_max_shift 做主动消摆。
+            damper = None
+        if damper is not None:
+            damper.locked_max_shift = max_shift
+
+        damp_label = (
+            f"主动阻尼 K={cfg.anti_sway_sway_gain:.1f}×{cfg.anti_sway_settle_gain_scale:.1f}, "
+            f"预算 ±{max_shift * 100:.0f}cm"
+            if damper is not None
+            else "仅观测 (未启用阻尼)"
+        )
+        print(
+            f"[Scheduler] {reason} — 倾角判稳 (去趋势PP < {cfg.hook_sway_angle_tol_deg:.2f}°, "
+            f"上限 {max_wait:.1f}s, {damp_label})..."
+        )
+        self._set_settle_phase(f"{reason} — 判稳中")
+
+        t_start = time.monotonic()
+        deadline = t_start + max_wait
+        last_t = t_start
+        anchor: tuple[float, float] | None = None
+        feedback_misses = 0
+        stale_since: float | None = None
+        commanding = False
+        max_dv = cfg.anti_sway_max_correction
+        pp_baseline: float | None = None  # 发散保护的摆幅基准 (取历史最小值)
+        pp_peak: float | None = None      # 观测期峰值, 作发散基准的下限
+        # 零偏仍用本次悬停自己的摆动解算 (不接力行进段假倾角)。
+        # 但真在摆时不必干等 0.6T: rate_amp 门限会挡住纯零偏, 等零偏解出后
+        # 再把 θ_dc 扣干净。否则 4~12s 窗口里前 2s 完全不阻尼, 到位残摆消不掉。
+        prime_armed = False
+        damp_started = False
+
+        try:
+            while True:
+                if self.hooks.should_stop():
+                    raise ControlStoppedError("操作员在等待货物平稳期间停止")
+
+                pos = self._source.get_position()
+                if pos is None:
+                    feedback_misses += 1
+                    if feedback_misses >= self._MAX_SETTLE_FEEDBACK_MISSES:
+                        raise PositionFeedbackTimeout(
+                            f"等待货物平稳期间定位反馈超时 ({feedback_misses} 次)"
+                        )
+                    print(
+                        f"[Scheduler] {reason} — 定位短暂断流 "
+                        f"({feedback_misses}/{self._MAX_SETTLE_FEEDBACK_MISSES}), 继续等待..."
+                    )
+                    continue
+                feedback_misses = 0
+
+                now = time.monotonic()
+                dt = max(now - last_t, 1e-3)
+                last_t = now
+                x, y, z = pos['x'], pos['y'], pos['z']
+
+                if anchor is None:
+                    # 悬停起点即锚点: PD 刚锁轴停车, 此刻位置就是要守住的目标
+                    anchor = (x, y)
+                    if damper is not None:
+                        damper.reset(x, y)
+
+                sway = self._read_sway()
+                if sway is None:
+                    if commanding:
+                        self._actuator.stop_motion()
+                        commanding = False
+                    if stale_since is None:
+                        stale_since = now
+                    elif now - stale_since > self._SWAY_STALE_FALLBACK_S:
+                        print(
+                            f"[Scheduler] 警告: {reason} — 摆角持续断流 "
+                            f"{now - stale_since:.1f}s, 降级为位置判稳"
+                        )
+                        self._wait_settled_by_position(
+                            reason, max(deadline - now, 0.0)
+                        )
+                        return
+                else:
+                    stale_since = None
+                    analyzer.push(now, sway['theta_x'], sway['theta_y'])
+                    if damper is not None and not prime_armed:
+                        bias = damper.prime_dc(analyzer.samples(), z)
+                        if bias is not None:
+                            prime_armed = True
+                            print(
+                                f"[Scheduler] {reason} — 由摆动信号解出静态零偏 "
+                                f"({math.degrees(bias[0]):+.3f}°, "
+                                f"{math.degrees(bias[1]):+.3f}°), 已置入高通"
+                            )
+                    if damper is not None:
+                        vx, vy, _, _ = damper.merge_xy_commands(
+                            0.0, 0.0,
+                            theta_x=sway['theta_x'],
+                            theta_y=sway['theta_y'],
+                            z_grab=z,
+                            x=x, y=y,
+                            locked_x=True,
+                            locked_y=True,
+                            dt=dt,
+                            max_velocity_xy=max_dv,
+                        )
+                        self._actuator.apply(vx, vy, 0.0, dt)
+                        commanding = True
+                        if not damp_started and (abs(vx) > 1e-4 or abs(vy) > 1e-4):
+                            damp_started = True
+                            print(
+                                f"[Scheduler] {reason} — 开始阻尼 "
+                                f"θ=({math.degrees(sway['theta_x']):+.2f}, "
+                                f"{math.degrees(sway['theta_y']):+.2f})° "
+                                f"Â={math.degrees(damper.last_amp):.2f}° "
+                                f"Δv=({vx:+.3f},{vy:+.3f})"
+                                + (" (零偏已解)" if prime_armed else " (边摆边学零偏)")
+                            )
+
+                metrics = analyzer.metrics(z)
+                elapsed = now - t_start
+                pp = metrics['detrend_pp_max_deg']
+
+                # 发散保护 — 见 _SWAY_DIVERGENCE_RATIO。除了"相对基准放大 1.8 倍",
+                # 还要求绝对幅值超过容差的 _SWAY_DIVERGENCE_TOL_FACTOR 倍: 摆幅
+                # 已经压到 0.1° 时一阵风把它推到 0.35° 也满足 1.8 倍, 但那是外扰
+                # 不是负阻尼, 误判会白白关掉正常工作的防摇。
+                divergence_floor = (
+                    cfg.hook_sway_angle_tol_deg * self._SWAY_DIVERGENCE_TOL_FACTOR
+                )
+                if pp is not None:
+                    pp_peak = pp if pp_peak is None else max(pp_peak, pp)
+                # 只在已经开始阻尼之后看发散。窗刚填满时 PP 从残缺窗涨到满幅,
+                # 那是观测几何不是负阻尼; 用观测期峰值做基准可滤掉这一段。
+                if (
+                    damper is not None
+                    and commanding
+                    and pp is not None
+                    and metrics['window_full']
+                ):
+                    if pp_baseline is None:
+                        pp_baseline = pp_peak if pp_peak is not None else pp
+                    elif (
+                        pp > pp_baseline * self._SWAY_DIVERGENCE_RATIO
+                        and pp > divergence_floor
+                    ):
+                        print(
+                            f"[Scheduler] 警告: {reason} — 摆幅在阻尼作用下反而放大 "
+                            f"({pp_baseline:.3f}° → {pp:.3f}°), 立即停止防摇阻尼。"
+                            f" 请核对倾角仪轴映射与符号 "
+                            f"(anti_sway_theta_x_from/_sign, anti_sway_theta_y_from/_sign):"
+                            f" Δv=+K·θ 的符号标反会变成负阻尼。"
+                        )
+                        damper = None
+                        if commanding:
+                            self._actuator.stop_motion()
+                            commanding = False
+                    elif pp < pp_baseline:
+                        pp_baseline = pp
+                self._set_settle_phase(
+                    f"{reason} — 判稳中 ({elapsed:.1f}s / {max_wait:.0f}s"
+                    + (f", 摆 {pp:.2f}°)" if pp is not None else ")")
+                )
+
+                if metrics['settled']:
+                    shift = math.hypot(x - anchor[0], y - anchor[1])
+                    print(
+                        f"[Scheduler] {reason} — 摆幅已收敛 "
+                        f"(PP {pp:.3f}° < {cfg.hook_sway_angle_tol_deg:.2f}°, "
+                        f"窗 {metrics['window_s']:.2f}s, 用时 {elapsed:.2f}s, "
+                        f"偏离锚点 {shift * 1000:.0f}mm)"
+                    )
+                    return
+
+                if now >= deadline:
+                    shift = math.hypot(x - anchor[0], y - anchor[1])
+                    pp_txt = f"{pp:.3f}°" if pp is not None else "n/a"
+                    print(
+                        f"[Scheduler] 警告: {reason} — 倾角判稳超时 ({max_wait:.1f}s), "
+                        f"当前 PP {pp_txt} 仍超 {cfg.hook_sway_angle_tol_deg:.2f}°, "
+                        f"偏离锚点 {shift * 1000:.0f}mm, 继续执行"
+                    )
+                    return
+
+                if self._is_simulation:
+                    time.sleep(HOOK_SETTLE_POLL_INTERVAL)
+        finally:
+            # 无论是否下发过阻尼, 退出时都必须停车。观测期没动车时这一下是空操作;
+            # 下发过则必须把最后一帧速度收回, 否则 PLC 看门狗会一直保持着执行。
+            self._actuator.stop_motion()
+
+    def _set_settle_phase(self, message: str) -> None:
+        self.hooks.set_phase(OperationPhase.SETTLE_WAIT, message)
+        if self._control_state is not None:
+            self._update_control_state_phase(
+                self._control_state, OperationPhase.SETTLE_WAIT, message,
+            )
+
+    def _wait_settled_by_position(self, reason: str, max_wait: float) -> None:
+        """位置判稳 (无倾角数据时的兜底) — 用实测位置反馈判断, 代替盲等固定时长。
+
+        适用范围的重要限制: 位置反馈来自 SLAM/PLC, 测的是大车/小车**车体**, 不是
+        吊在钢缆下的载荷。轴一锁定车体就静止, 窗口内位置峰峰值≈0, 所以这个判据
+        对"车体已停、吊钩还在摆"完全不敏感 — 它只能排除车体自身的漂移/爬行。
+        有倾角仪时必须优先走 _wait_settled_by_sway()。
 
         设计目标: 效率与安全兼顾。
           - 货物已经静止 → 满足判稳窗口后立即放行, 可能远小于 max_wait (提速)
@@ -646,19 +1053,14 @@ class OperationScheduler:
         vel_tol = cfg.hook_settle_vel_tol
         pos_tol = cfg.hook_settle_pos_tol
 
-        print(f"[Scheduler] {reason} — 等待货物平稳 (自适应判稳, 上限 {max_wait:.1f}s)...")
-        settle_msg = f"{reason} — 判稳中"
-        self.hooks.set_phase(OperationPhase.SETTLE_WAIT, settle_msg)
-        if self._control_state is not None:
-            self._update_control_state_phase(
-                self._control_state, OperationPhase.SETTLE_WAIT, settle_msg,
-            )
+        print(f"[Scheduler] {reason} — 等待货物平稳 (位置判稳, 上限 {max_wait:.1f}s)...")
+        self._set_settle_phase(f"{reason} — 判稳中")
 
         t_start = time.monotonic()
         deadline = t_start + max_wait
         samples: list[tuple[float, float, float, float]] = []  # (t, x, y, z)
         feedback_misses = 0
-        max_feedback_misses = 3  # 单次 get_position 最多等 2s; 连续 3 次≈6s 才判为断流
+        max_feedback_misses = self._MAX_SETTLE_FEEDBACK_MISSES
 
         while True:
             if self.hooks.should_stop():
@@ -680,12 +1082,9 @@ class OperationScheduler:
 
             now = time.monotonic()
             elapsed = now - t_start
-            status_msg = f"{reason} — 判稳中 ({elapsed:.1f}s / {max_wait:.0f}s)"
-            self.hooks.set_phase(OperationPhase.SETTLE_WAIT, status_msg)
-            if self._control_state is not None:
-                self._update_control_state_phase(
-                    self._control_state, OperationPhase.SETTLE_WAIT, status_msg,
-                )
+            self._set_settle_phase(
+                f"{reason} — 判稳中 ({elapsed:.1f}s / {max_wait:.0f}s)"
+            )
             x, y, z = pos['x'], pos['y'], pos['z']
 
             samples.append((now, x, y, z))

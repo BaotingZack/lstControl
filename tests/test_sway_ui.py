@@ -48,6 +48,7 @@ def test_enrich_control_state_payload():
     assert body['anti_sway']['tol_deg'] == 0.3
     assert 'sway' in body
     assert 'live' in body['sway']
+    assert 'amp_max_deg' in body['sway']['live']
 
 
 def test_live_html_includes_sway_panel_when_anti_sway():
@@ -70,6 +71,7 @@ def test_live_html_sway_panel_is_a_single_cross():
     # 判稳看峰峰值 (与调度器一致), |θ| 绝对值只用于核对倾角仪零点
     assert 'swayPeakToPeak' in html
     assert '峰峰' in html
+    assert 'amp_max_deg' in html
     assert 'T≈' in html
     assert 'ringDegs = [0.3, 0.6, 1.0]' in html
     assert 'swayTickLabel' in html

@@ -1,0 +1,27 @@
+---
+description: 电子葫芦与钢丝绳几何 — 由 PLC 抓钩高度实时反推绳长
+alwaysApply: true
+---
+
+# 电子葫芦 / 钢丝绳几何
+
+现场起升是**电子葫芦**。`site_config.json` 已按实物取值：`sheave_height=4.0`，`grab_offset=0`。
+
+## 硬件
+
+- 电子葫芦出绳点离地 **H = 4 m**
+- PLC `GetActualLiftHeight()` = 抓钩离地高度 **Z**
+- 抓钩工作点 → 钢丝绳连接处 **h = 1.5 m**
+
+```
+地面 ── Z ── [抓钩] ── h=1.5m ── [绳端连接] ── L_rope ── [葫芦出绳点 = 4m]
+```
+
+## 反推
+
+- 钢丝绳：`L_rope = H − Z − h`（`wire_rope_length()`）
+- 摆长：`L_eff = H − Z`（`effective_rope_length()`，offset=0）
+
+Z 升高 → 绳缩短。禁止 `L = 4 − Z + 1.5`（h 加了两次）。不要把 1.5 填进 `grab_offset`。
+
+判稳窗、增益 ζ、防摇 `Δv=+K(L)·θ` 共用 `L_eff`，只改 `site_config` 这一处。

@@ -155,8 +155,9 @@ def _inclination_callback(msg: Any) -> None:
     real = _deserialize_any(msg)
     if real is None:
         return
-    # j1939 vector: x=倾角仪 X 轴 (现场标定→小车 Y 方向→θy),
-    #              y=倾角仪 Y 轴 (现场标定→大车 X 方向→θx).
+    # j1939 vector (现场安装确认 2026-09-18):
+    #   x=倾角仪 X 轴 ∥ 小航车轴, 正向一致  → θy (sign +1)
+    #   y=倾角仪 Y 轴 ∥ 大航车轴, 正向相反  → θx (sign -1)
     # 内部仍称 roll=vector.x, pitch=vector.y; 映射到 θx/θy 见 SwayAxisMapping/site_config。
     vec = getattr(real, 'vector', None)
     roll = getattr(vec, 'x', None) if vec is not None else getattr(real, 'roll', None)
@@ -199,8 +200,8 @@ def configure_sway_live_analyzer(
     base_window: float = 0.6,
     window_periods: float = 0.55,
     window_max: float = 8.0,
-    sheave_height: float = 2.31,
-    grab_offset: float = 1.5,
+    sheave_height: float = 4.0,
+    grab_offset: float = 0.0,
     tol_deg: float = 0.3,
 ) -> None:
     """启用实时摆角分析 (与调度器判稳窗/去趋势 PP 一致)。"""

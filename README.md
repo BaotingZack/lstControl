@@ -6,6 +6,23 @@
 - **Y**：小行车（台车），沿桥架横移方向
 - **Z**：吊钩（抓斗），高度方向
 
+## 目录
+
+| 位置 | 内容 |
+|------|------|
+| 当前目录 | 运行入口与控制核心：`main.py`、`live_server.py`、调度/PD/PLC/ROS、防摇与 `site_config.json` |
+| `script/` | 现场联调与离线分析脚本（不参与作业主循环） |
+| `doc/` | 方案说明、bag 分析、倾角仪初值等文档 |
+| `tests/` | 单元测试与闭环仿真测试 |
+| `plc_lib/` | PLC 动态库 |
+
+现场常用：
+
+```bash
+python3 script/check_sway_sign.py              # 只读：轴映射/符号核验
+python3 script/damp_hold_test.py --plc-ip …    # 原地消摆联调（会动车）
+```
+
 ## 近期重要更新（PLC 现场调试）
 
 以下改动针对 PLC 模式现场测试中发现的问题，已合并进主分支：
