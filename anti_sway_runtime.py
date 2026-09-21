@@ -12,6 +12,7 @@ import math
 from dataclasses import dataclass, field
 
 from sway_controller import AntiSwayController
+from sway_guard import SwayGrowthGuard
 from sway_settle import (
     GRAVITY,
     SwayAmplitudeTracker,
@@ -83,6 +84,10 @@ class AntiSwayRuntime:
     # 静态零偏 / 恒减速假倾角的 |θ̇|≈0, 用 rate_amp 门限避免把偏置当成摆去推车。
     # 0.15°: 挡住 ~0.3° 慢变假倾角的微分残差, 仍放行 0.3° 以上的真摆。
     amp_floor: float = math.radians(0.15)
+    guard: SwayGrowthGuard | None = None
+    # New terminal policy: natural-motion qualification and gradual engagement.
+    # False is retained only for legacy comparisons and isolated mechanism tests.
+    terminal_mode: bool = False
 
     dc: ThetaDcTracker = field(init=False)
     amp: SwayAmplitudeTracker = field(init=False)
@@ -96,6 +101,11 @@ class AntiSwayRuntime:
             else self.dc_tracker
         )
         self.amp = SwayAmplitudeTracker()
+        if self.guard is None:
+            self.guard = SwayGrowthGuard()
+        from sway_qualification import SwayFeedbackQualifier
+        self.qualifier = SwayFeedbackQualifier() if self.terminal_mode else None
+        self.blend = [0., 0.]
 
     def reset(
         self,
@@ -114,6 +124,10 @@ class AntiSwayRuntime:
             self.dc.reset()
             self.amp.reset()
             self.last_amp = 0.0
+            self.guard.reset_window()
+            if self.qualifier is not None:
+                self.qualifier.reset()
+            self.blend = [0., 0.]
         if anchor_x is not None and anchor_y is not None:
             self.anchor_xy = (anchor_x, anchor_y)
 
@@ -142,6 +156,15 @@ class AntiSwayRuntime:
         self.dc.seed(*bias)
         return bias
 
+    def suspend(self, dt: float) -> None:
+        """缺测时清除差分/增长观测窗，恢复数据后不能把跨断流跳变当成本拍角速度。"""
+        self.amp.reset()
+        self.last_amp = 0.
+        self.guard.pause(dt)
+        if self.qualifier is not None:
+            self.qualifier.reset(preserve_revoked=True)
+        self.blend = [0., 0.]
+
     def set_anchor(self, x: float | None = None, y: float | None = None) -> None:
         """更新锚点; 只更新传入的分量, 另一轴保持原值。
 
@@ -166,17 +189,24 @@ class AntiSwayRuntime:
         gain_scale: float | None = None,
     ) -> tuple[float, float, float, float]:
         """返回 (dv_x, dv_y, theta_ac_x, theta_ac_y)。"""
+        if dt > .5:
+            self.amp.reset()
         ac_x, ac_y = self.dc.update(theta_x, theta_y, dt)
         L = self.anti_sway.rope_model.compute(z_grab)
         omega_n = math.sqrt(GRAVITY / max(L, 0.5))
-        _, _, self.last_amp = self.amp.update(ac_x, ac_y, dt, omega_n)
+        _, _, self.last_amp = self.amp.update(
+            ac_x, ac_y, dt, omega_n,
+            rate_sample_x=theta_x, rate_sample_y=theta_y,
+        )
         tx = ac_x if self.use_ac else theta_x
         ty = ac_y if self.use_ac else theta_y
-        # 静态偏置 |θ̇|≈0 → 不下发, 避免零偏积分成定位漂移
-        if self.amp.last_rate_amp < self.amp_floor:
-            return 0.0, 0.0, ac_x, ac_y
+        # 两轴独立：一轴在摆不能释放另一轴的静态残差。
         scale = self.gain_scale if gain_scale is None else gain_scale
         dvx, dvy, _ = self.anti_sway.compute(tx, ty, z_grab)
+        if self.amp.last_rate_amp_x < self.amp_floor:
+            dvx = 0.0
+        if self.amp.last_rate_amp_y < self.amp_floor:
+            dvy = 0.0
         return dvx * scale, dvy * scale, ac_x, ac_y
 
     def merge_xy_commands(
@@ -194,17 +224,33 @@ class AntiSwayRuntime:
         dt: float,
         max_velocity_xy: float,
         gain_scale: float | None = None,
+        feedback_allowed: bool = True,
+        feedback_axes: tuple[bool, bool] = (True, True),
     ) -> tuple[float, float, float, float]:
         """未锁轴: Δv 叠加 PD; 已锁轴: 仅预算内软阻尼 (vx/vy 由 PD 置 0 后替换)。"""
+        if not all(math.isfinite(v) for v in (theta_x, theta_y, z_grab, x, y, dt)) or dt <= 0:
+            self.suspend(dt if math.isfinite(dt) and dt > 0 else 0.)
+            return vx_cmd, vy_cmd, 0., 0.
         dvx, dvy, _, _ = self.compute_dv(
             theta_x, theta_y, z_grab, dt, gain_scale=gain_scale,
         )
+        length = self.anti_sway.rope_model.compute(z_grab)
+        period = 2 * math.pi * math.sqrt(length / GRAVITY)
+        qualified = ((True, True) if self.qualifier is None else
+                     self.qualifier.update(theta_x, theta_y, x, y, length, dt))
+        allowed = [feedback_allowed and feedback_axes[a] and qualified[a]
+                   and not self.guard.blocked[a] for a in (0, 1)]
+        for a in (0, 1):
+            self.blend[a] = (min(1., self.blend[a] + dt / (.25 * period))
+                             if self.terminal_mode and allowed[a] else float(allowed[a]))
         ax, ay = self.anchor_xy if self.anchor_xy is not None else (x, y)
 
         if locked_x:
             dvx = self._locked_axis_dv(dvx, x - ax)
+            dvx *= self.blend[0]
             vx_out = max(-max_velocity_xy, min(max_velocity_xy, dvx))
         else:
+            dvx *= self.blend[0]
             vx_out = max(
                 -max_velocity_xy,
                 min(max_velocity_xy, vx_cmd + dvx),
@@ -212,12 +258,25 @@ class AntiSwayRuntime:
 
         if locked_y:
             dvy = self._locked_axis_dv(dvy, y - ay)
+            dvy *= self.blend[1]
             vy_out = max(-max_velocity_xy, min(max_velocity_xy, dvy))
         else:
+            dvy *= self.blend[1]
             vy_out = max(
                 -max_velocity_xy,
                 min(max_velocity_xy, vy_cmd + dvy),
             )
+        blocked_x, blocked_y = self.guard.update(
+            theta_x, theta_y, dt=dt, period_s=period,
+            commanded=(feedback_allowed and abs(vx_out - vx_cmd) > 1e-9,
+                       feedback_allowed and abs(vy_out - vy_cmd) > 1e-9),
+            feedback_allowed=feedback_allowed,
+        )
+        # 撤回整条附加通路，包括锁轴回中；其余 PD 命令原样保留。
+        if blocked_x or not allowed[0]:
+            vx_out, dvx = vx_cmd, 0.0
+        if blocked_y or not allowed[1]:
+            vy_out, dvy = vy_cmd, 0.0
         return vx_out, vy_out, dvx, dvy
 
     def _locked_axis_dv(self, dv: float, shift: float) -> float:

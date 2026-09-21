@@ -292,6 +292,8 @@ class SwayAmplitudeTracker:
     _rate_y: float = 0.0
     last_amp: float = 0.0
     last_rate_amp: float = 0.0
+    last_rate_amp_x: float = 0.0
+    last_rate_amp_y: float = 0.0
     last_ac_x: float = 0.0
     last_ac_y: float = 0.0
 
@@ -302,6 +304,7 @@ class SwayAmplitudeTracker:
         self._rate_y = 0.0
         self.last_amp = 0.0
         self.last_rate_amp = 0.0
+        self.last_rate_amp_x = self.last_rate_amp_y = 0.0
         self.last_ac_x = 0.0
         self.last_ac_y = 0.0
 
@@ -311,15 +314,21 @@ class SwayAmplitudeTracker:
         ac_y: float,
         dt: float,
         omega_n: float,
+        *,
+        rate_sample_x: float | None = None,
+        rate_sample_y: float | None = None,
     ) -> tuple[float, float, float]:
         """返回 (Âx, Ây, Âmax) [rad]。"""
         dt = max(dt, 1e-4)
         wn = max(omega_n, 0.2)
+        # 控制活动判断用传感器自身的变化，避免 DC 学习的衰减被误判为真实运动。
+        sx = ac_x if rate_sample_x is None else rate_sample_x
+        sy = ac_y if rate_sample_y is None else rate_sample_y
         if self._prev_x is None:
-            self._prev_x, self._prev_y = ac_x, ac_y
-        raw_x = (ac_x - self._prev_x) / dt
-        raw_y = (ac_y - self._prev_y) / dt
-        self._prev_x, self._prev_y = ac_x, ac_y
+            self._prev_x, self._prev_y = sx, sy
+        raw_x = (sx - self._prev_x) / dt
+        raw_y = (sy - self._prev_y) / dt
+        self._prev_x, self._prev_y = sx, sy
         alpha = math.exp(-dt / max(self.rate_tau, 0.05))
         self._rate_x = alpha * self._rate_x + (1.0 - alpha) * raw_x
         self._rate_y = alpha * self._rate_y + (1.0 - alpha) * raw_y
@@ -327,7 +336,9 @@ class SwayAmplitudeTracker:
         amp_x = math.hypot(ac_x, self._rate_x / wn)
         amp_y = math.hypot(ac_y, self._rate_y / wn)
         self.last_amp = max(amp_x, amp_y)
-        self.last_rate_amp = max(abs(self._rate_x), abs(self._rate_y)) / wn
+        self.last_rate_amp_x = abs(self._rate_x) / wn
+        self.last_rate_amp_y = abs(self._rate_y) / wn
+        self.last_rate_amp = max(self.last_rate_amp_x, self.last_rate_amp_y)
         return amp_x, amp_y, self.last_amp
 
     def amplitude_at(self, omega_n: float) -> float:

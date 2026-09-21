@@ -71,13 +71,21 @@ def run_simulation(
     config: CraneConfig,
     verbose: bool = True,
     max_time: float | None = 180.0,
+    *,
+    sway_sim=None,
+    sway_safe_height: float | None = None,
 ) -> tuple[list[dict], list[tuple[float, str]]]:
     """仿真模式: 使用 plant model 运行一次 PD 控制到完成。
 
     此函数是对 run_pd_control() 的薄封装, 保持与旧代码/测试的兼容性。
     PLC 模式请直接使用 run_pd_control() + RosPositionSource + PlcActuator。
     """
-    plant = CranePlant(config)
+    if sway_sim is None:
+        plant = CranePlant(config)
+    else:
+        from sway_simulation import SwayCranePlant
+
+        plant = SwayCranePlant(config, sway_sim, initial_state)
     source = SimPositionSource(plant, initial_state, config)
     actuator = PlantActuator(plant, initial_state, config)
     return run_pd_control(
@@ -89,6 +97,10 @@ def run_simulation(
         verbose=verbose,
         max_time=max_time,
         is_simulation=True,
+        sway_source=plant if sway_sim is not None else None,
+        simulation_duration=sway_sim.duration_s if sway_sim is not None else None,
+        simulation_hold=sway_sim.hold_after_arrival if sway_sim is not None else False,
+        sway_safe_height=sway_safe_height,
     )
 
 
@@ -111,8 +123,11 @@ def _build_arg_parser():
                         help='path to libsscarctrl.so')
     parser.add_argument('--allow-mock-plc', action='store_true',
                         help='explicitly allow MockPLC when the real PLC library cannot load')
-    parser.add_argument('--anti-sway', action='store_true',
-                        help='enable closed-loop anti-sway (inclinometer sway feedback)')
+    anti_sway_switch = parser.add_mutually_exclusive_group()
+    anti_sway_switch.add_argument('--anti-sway', action='store_true', default=None,
+                                 help='enable closed-loop anti-sway (inclinometer sway feedback)')
+    anti_sway_switch.add_argument('--no-anti-sway', dest='anti_sway', action='store_false', default=None,
+                                 help='disable angle feedback even when enabled in site_config.json')
     parser.add_argument('--anti-sway-gain', type=float, default=None,
                         help='anti-sway damping gain K [m/s per rad] (Δv = +K·θ); '
                              'default 0.5 when --anti-sway')
@@ -122,6 +137,27 @@ def _build_arg_parser():
                         help='inclinometer roll zero bias (overrides site_config.json)')
     parser.add_argument('--anti-sway-pitch-bias', type=float, default=None,
                         help='inclinometer pitch zero bias (overrides site_config.json)')
+    parser.add_argument('--sim-sway', choices=('ideal', 'inclinometer'),
+                        help='simulate physical rope sway with ideal or gripper-mounted angle feedback')
+    parser.add_argument('--sim-duration', type=float, default=30., help='sway observation duration [s], including after arrival')
+    parser.add_argument('--sim-initial-z', type=float, default=1.5, help='initial height [m] for sway experiments')
+    parser.add_argument('--sim-static-bias', choices=('none', 'empty', 'loaded'), default='empty',
+                        help='B2 static readings from 0918; loaded changes measurement bias, not inertia')
+    parser.add_argument('--sim-angle-delay', type=float, default=0., help='assumed measurement delay [s], inclinometer mode only')
+    parser.add_argument('--sim-angle-tau', type=float, default=0., help='assumed measurement filter time constant [s]')
+    for axis in ('x', 'y'):
+        parser.add_argument(f'--sim-angle-scale-{axis}', type=float, default=1., help='assumed attitude/rope angle gain; -1 reverses direction')
+        parser.add_argument(f'--sim-bias-{axis}-deg', type=float, default=0., help='additional residual angle offset in crane axes [deg]')
+        parser.add_argument(f'--sim-initial-theta-{axis}-deg', type=float, default=0. if axis == 'x' else 1., help='initial true rope angle [deg]')
+    parser.add_argument('--sim-hold-damping', action='store_true',
+                        help='bench experiment: allow 6 cm hold damping at target height (simulation only)')
+    parser.add_argument('--sim-travel-damping', action='store_true',
+                        help='experiment with angle feedback throughout travel, including constant-height moves')
+    parser.add_argument('--sim-terminal-damping', action='store_true',
+                        help='test qualified terminal feedback at an explicitly clear target height')
+    parser.add_argument('--sim-disturbance', action='store_true',
+                        help='include the legacy external disturbance/noise model in sway experiments')
+    parser.add_argument('--sim-output', default='sway_simulation_result', help='sway JSON/PNG output prefix')
     parser.add_argument('--config', type=str, default=str(DEFAULT_SITE_CONFIG_PATH),
                         help='site config JSON (inclinometer calibration, anti-sway; default: site_config.json)')
     parser.add_argument('--map-to-crane-origin-x', type=float, default=0.0,
@@ -176,8 +212,8 @@ def _config_from_args(args, site: dict | None = None, argv: list[str] | None = N
     cli_argv = argv if argv is not None else sys.argv[1:]
     anti = resolve_anti_sway_settings(
         site,
-        cli_enable=args.anti_sway,
-        cli_enable_explicit='--anti-sway' in cli_argv,
+        cli_enable=bool(args.anti_sway),
+        cli_enable_explicit=args.anti_sway is not None,
         cli_gain=args.anti_sway_gain,
         cli_angle_deg=args.anti_sway_angle_deg,
         cli_angle_deg_explicit='--anti-sway-angle-deg' in cli_argv,
@@ -264,7 +300,14 @@ def _target_from_query(
 
 
 def main(argv=None):
-    args = _build_arg_parser().parse_args(argv)
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+    cli_argv = sys.argv[1:] if argv is None else argv
+    sim_flags = any(arg.startswith('--sim-') for arg in cli_argv)
+    if sim_flags and args.plc_ip:
+        parser.error('--sim-* options cannot be used with --plc-ip')
+    if sim_flags and args.sim_sway is None:
+        parser.error('--sim-* options require --sim-sway ideal|inclinometer')
     config_path = Path(args.config)
     site = load_site_config(config_path)
     if site:
@@ -274,6 +317,31 @@ def main(argv=None):
     elif config_path.is_file():
         print(f'[Config] {config_path} is empty or has no recognized keys')
     config = _config_from_args(args, site, argv=argv)
+    sway_sim = None
+    if args.sim_sway is not None:
+        from sway_simulation import SwaySimulationConfig
+
+        sway_sim = SwaySimulationConfig(
+            sensor_mode=args.sim_sway, duration_s=args.sim_duration,
+            static_bias=args.sim_static_bias, angle_delay_s=args.sim_angle_delay,
+            angle_tau_s=args.sim_angle_tau,
+            angle_scale_x=args.sim_angle_scale_x, angle_scale_y=args.sim_angle_scale_y,
+            bias_x_deg=args.sim_bias_x_deg, bias_y_deg=args.sim_bias_y_deg,
+            initial_theta_x_deg=args.sim_initial_theta_x_deg,
+            initial_theta_y_deg=args.sim_initial_theta_y_deg,
+            hold_after_arrival=args.sim_hold_damping,
+        )
+        config = dataclasses.replace(config, enable_disturbance=args.sim_disturbance)
+        if args.sim_hold_damping or args.sim_travel_damping:
+            config = dataclasses.replace(config, anti_sway_settle_max_shift=.06)
+            print('[Simulation] bench hold damping enabled: target-height displacement budget = 0.06 m')
+        if args.sim_travel_damping:
+            config = dataclasses.replace(config, anti_sway_travel_damping=True)
+            print('[Simulation] experimental travel angle feedback enabled')
+        if args.sim_terminal_damping:
+            config = dataclasses.replace(config, anti_sway_terminal_enabled=True,
+                                         anti_sway_travel_damping=False)
+        print(f'[Simulation] {sway_sim}')
     axis_mapping = build_sway_axis_mapping(site)
     if config.enable_anti_sway:
         mx = axis_mapping.theta_x
@@ -289,7 +357,7 @@ def main(argv=None):
             f'θy←{my.angle_source}(sign={my.angle_sign:+.0f}) 小车Y'
         )
     coordinate_transform = _coordinate_transform_from_args(args)
-    crane0 = CraneState(x0=0.0, y0=0.0, z0=0.0)
+    crane0 = CraneState(x0=0.0, y0=0.0, z0=args.sim_initial_z if sway_sim is not None else 0.0)
     map_target_pos = (args.target_x, args.target_y, args.target_z)
 
     # ---- PLC 模式 ----
@@ -484,7 +552,17 @@ def main(argv=None):
         initial_state=crane0,
         config=config,
         verbose=True,
+        sway_sim=sway_sim,
+        sway_safe_height=target_pos[2] if args.sim_terminal_damping else None,
+        max_time=sway_sim.duration_s + config.dt + 1. if sway_sim is not None else 180.,
     )
+
+    if sway_sim is not None:
+        from sway_simulation import save_simulation_result
+
+        metrics = save_simulation_result(history, config, sway_sim, args.sim_output)
+        print(f'[Simulation] metrics: {metrics}')
+        print(f'[Simulation] saved {args.sim_output}.json and {args.sim_output}.png')
 
     initial_pos = (crane0.x.position, crane0.y.position, crane0.z.position)
     viz = CraneVisualizer(config)
@@ -510,6 +588,9 @@ def main(argv=None):
                 initial_state=CraneState(x0=start_pos[0], y0=start_pos[1], z0=start_pos[2]),
                 config=config,
                 verbose=False,
+                sway_sim=sway_sim,
+                sway_safe_height=requested_target[2] if args.sim_terminal_damping else None,
+                max_time=sway_sim.duration_s + config.dt + 1. if sway_sim is not None else 180.,
             )
             _state['initial'] = start_pos
             _state['target'] = requested_target

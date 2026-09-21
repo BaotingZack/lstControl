@@ -13,6 +13,7 @@ DEFAULT_SITE_CONFIG_PATH = Path(__file__).resolve().parent / 'site_config.json'
 # Keys applied to CraneConfig; keys starting with '_' are metadata only.
 SITE_CONFIG_FIELDS = frozenset({
     'enable_anti_sway',
+    'anti_sway_terminal_enabled',
     'anti_sway_travel_damping',
     'anti_sway_approach_damping',
     'anti_sway_approach_pos',

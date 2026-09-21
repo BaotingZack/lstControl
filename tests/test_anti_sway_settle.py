@@ -95,6 +95,7 @@ class _FakeActuator:
 def _config(**overrides) -> CraneConfig:
     defaults = dict(
         enable_anti_sway=True,
+        anti_sway_terminal_enabled=False,  # legacy guard/budget mechanism tests
         anti_sway_sway_gain=2.6,
         anti_sway_angle_scale=1.0,
         anti_sway_max_correction=0.20,
@@ -149,6 +150,74 @@ def _decaying_sway(clock: _Clock, amp_deg: float, tau: float, period: float = 3.
         }
 
     return provider
+
+
+def test_terminal_settle_cannot_enable_feedback_from_free_sway_alone(clock):
+    source = _FakeSource(clock)
+    actuator = _FakeActuator()
+    cfg = _config(anti_sway_terminal_enabled=True, hook_settle_max_wait=8.)
+    sch = _scheduler(cfg, source, actuator, _decaying_sway(clock, 1., 1e6))
+    sch._wait_cargo_settled('terminal qualification', 8.)
+    assert actuator.applied
+    assert all(vx == vy == 0 for vx, vy, _, _ in actuator.applied)
+
+
+def test_pd_withdrawal_survives_transition_to_settle(clock):
+    """升降段已撤回的小车轴，在随后独立判稳运行时不能重新推车。"""
+    t0 = clock.now()
+
+    class HoistSource(_FakeSource):
+        lowering = True
+        segment_t0 = t0
+
+        def reset(self):
+            self.segment_t0 = clock.now()
+
+        def get_position(self):
+            pos = super().get_position()
+            pos['t'] = clock.now() - self.segment_t0
+            if self.lowering:
+                self.z = max(.5, 1.5 - (clock.now() - t0) * .05)
+                pos['z'] = self.z
+            return pos
+
+    class LoopActuator(_FakeActuator):
+        def update_state(self, state, position):
+            for axis in ('x', 'y', 'z'):
+                getattr(state, axis).position = position[axis]
+                getattr(state, axis).velocity = position['v' + axis]
+
+        def cleanup(self):
+            pass
+
+    source = HoistSource(clock)
+    actuator = LoopActuator()
+    cfg = _config()
+
+    def sway():
+        t = clock.now() - t0
+        return {'theta_x': 0., 'theta_y': math.radians(.4 * math.exp(t / 10) * math.sin(2 * math.pi * t / 3.5))}
+
+    sch = _scheduler(cfg, source, actuator, sway)
+    from crane_model import CraneState
+    sch._run_pd((5., 3., .5), CraneState(5., 3., 1.5), 'lower')
+    before = len(actuator.applied)
+    assert any(abs(vy) > .001 for _, vy, _, _ in actuator.applied)
+    source.lowering = False
+    sch._wait_cargo_settled('after lowering', 4., damp_max_shift=.06)
+    assert actuator.applied[before:]
+    assert all(vy == 0. for _, vy, _, _ in actuator.applied[before:]), '新判稳阶段不得复位撤回状态'
+
+
+def test_no_shift_settle_observes_without_sending_commands(clock):
+    source = _FakeSource(clock)
+    actuator = _FakeActuator()
+    cfg = _config(hook_settle_max_wait=8.)
+    sch = _scheduler(cfg, source, actuator, _decaying_sway(clock, 1., 1e6))
+    sch._wait_cargo_settled('observe', 8., damp_max_shift=0.)
+    assert not actuator.applied
+    assert sch._sway_guard.last_pp[0] is not None
+    assert sch._sway_guard.blocked == (False, False)
 
 
 # ---------------------------------------------------------------------------
@@ -359,12 +428,11 @@ class TestSettleSafety:
         sch = _scheduler(cfg, source, actuator, growing)
         sch._wait_cargo_settled("test", 1.0)
 
-        assert sch._sway_damper is not None, "发散保护只关本次阻尼, 不应污染实例"
-        # 撤掉阻尼后不再有新指令: 最后若干周期必须是停车而非继续下发
+        assert sch._sway_guard.blocked == (True, False)
+        # 逐轴撤回仍允许另一轴工作；检查的是恶化轴保持零速，而非 apply 的调用次数。
         assert actuator.stop_calls >= 1
-        n_applied = len(actuator.applied)
-        assert n_applied > 0
-        assert n_applied < source.calls, "发散后应停止下发, 而不是每周期都发"
+        assert any(abs(vx) > .001 for vx in actuator.vx_commands)
+        assert all(vx == 0. for vx in actuator.vx_commands[-40:])
 
 
 # ---------------------------------------------------------------------------

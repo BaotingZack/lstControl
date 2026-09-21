@@ -244,13 +244,6 @@ class OperationScheduler:
     # 摆角持续断流多久后放弃倾角判稳、降级为位置判据 [s]
     # (get_sway 自身已有 1s 的数据新鲜度门限, 这里是它之上的连续失败窗口)
     _SWAY_STALE_FALLBACK_S = 2.0
-    # 发散保护: 悬停阻尼期间摆幅相对初值放大到该倍数即判为"阻尼在注入能量",
-    # 立即撤掉阻尼并停车。Δv=+K·θ 的符号就是阻尼的符号 — 倾角轴映射/符号标反
-    # (anti_sway_theta_x_sign 等) 会让同一套公式变成负阻尼, 把摆越推越大。
-    # 这是首次现场联调最需要的安全网, 比事后看曲线快得多。
-    _SWAY_DIVERGENCE_RATIO = 1.8
-    # 发散判据的绝对幅值下限 = 容差 × 该系数 (避免把小幅外扰误判成负阻尼)
-    _SWAY_DIVERGENCE_TOL_FACTOR = 2.0
 
     def __init__(
         self,
@@ -288,6 +281,7 @@ class OperationScheduler:
         self._coordinate_transform = coordinate_transform
         self._z_is_hoist_height = z_is_hoist_height
         self._sway_provider = sway_provider
+        self._sway_guard = self._new_sway_guard()
 
         # 倾角判稳分析器 + 锁轴软阻尼运行时 (无摆角源/未启用防摇时为 None)
         self._sway_analyzer = self._build_sway_analyzer()
@@ -327,6 +321,10 @@ class OperationScheduler:
             tol_deg=cfg.hook_sway_angle_tol_deg,
         )
 
+    def _new_sway_guard(self):
+        from sway_guard import SwayGrowthGuard
+        return SwayGrowthGuard(min_pp_rad=math.radians(2 * self._config.hook_sway_angle_tol_deg))
+
     def _build_sway_damper(self):
         """锁轴软阻尼运行时。
 
@@ -351,6 +349,8 @@ class OperationScheduler:
             locked_max_shift=cfg.anti_sway_locked_max_shift,
             gain_scale=cfg.anti_sway_settle_gain_scale,
             recenter_gain=cfg.anti_sway_hold_recenter_gain,
+            guard=self._sway_guard,
+            terminal_mode=cfg.anti_sway_terminal_enabled,
         )
 
     def _read_sway(self) -> dict | None:
@@ -415,6 +415,10 @@ class OperationScheduler:
         # 校验位置合法性 (由 config 的 workspace 约束和有限性检查)
         self._config.validate_target(start_pos)
         self._config.validate_target(target_pos)
+        # 明确开始一项新作业才清除撤回；各 PD/判稳阶段共享这一对象。
+        self._sway_guard = self._new_sway_guard()
+        if self._sway_damper is not None:
+            self._sway_damper.guard = self._sway_guard
 
         sx, sy, sz = start_pos
         tx, ty, tz = target_pos
@@ -740,6 +744,11 @@ class OperationScheduler:
             max_time=self._PD_MAX_TIME,
             verbose=True,
             is_simulation=self._is_simulation,
+            sway_guard=self._sway_guard,
+            sway_safe_height=(
+                self._config.approach_safe_z if phase_label == 'APPROACH_XY' else
+                self._config.transport_safe_z if phase_label == 'TRANSPORT_XY' else None
+            ),
             # 高速走行不叠倾角 (假倾角); 目标附近 / 锁轴后由 approach_damping 打开。
             sway_source=(
                 self._pd_sway_source
@@ -824,17 +833,15 @@ class OperationScheduler:
         max_shift = (
             cfg.anti_sway_locked_max_shift if damp_max_shift is None else damp_max_shift
         )
-        if damp_max_shift is not None and damp_max_shift <= 0.0:
-            # 贴近钢卷: 预算为 0 表示只判稳、横移一步都不能走, 否则抓取/放货
-            # 位置会被软阻尼推偏。高 Z 悬停仍用 locked_max_shift 做主动消摆。
-            damper = None
+        # 预算为 0 时保留观测，但不发送任何横移命令。
+        feedback_allowed = max_shift > 0.
         if damper is not None:
             damper.locked_max_shift = max_shift
 
         damp_label = (
             f"主动阻尼 K={cfg.anti_sway_sway_gain:.1f}×{cfg.anti_sway_settle_gain_scale:.1f}, "
             f"预算 ±{max_shift * 100:.0f}cm"
-            if damper is not None
+            if damper is not None and feedback_allowed
             else "仅观测 (未启用阻尼)"
         )
         print(
@@ -851,8 +858,7 @@ class OperationScheduler:
         stale_since: float | None = None
         commanding = False
         max_dv = cfg.anti_sway_max_correction
-        pp_baseline: float | None = None  # 发散保护的摆幅基准 (取历史最小值)
-        pp_peak: float | None = None      # 观测期峰值, 作发散基准的下限
+        guard_event_count = len(self._sway_guard.events)
         # 零偏仍用本次悬停自己的摆动解算 (不接力行进段假倾角)。
         # 但真在摆时不必干等 0.6T: rate_amp 门限会挡住纯零偏, 等零偏解出后
         # 再把 θ_dc 扣干净。否则 4~12s 窗口里前 2s 完全不阻尼, 到位残摆消不掉。
@@ -891,6 +897,8 @@ class OperationScheduler:
 
                 sway = self._read_sway()
                 if sway is None:
+                    if damper is not None:
+                        damper.suspend(dt)
                     if commanding:
                         self._actuator.stop_motion()
                         commanding = False
@@ -928,9 +936,16 @@ class OperationScheduler:
                             locked_y=True,
                             dt=dt,
                             max_velocity_xy=max_dv,
+                            feedback_allowed=feedback_allowed,
                         )
-                        self._actuator.apply(vx, vy, 0.0, dt)
-                        commanding = True
+                        if feedback_allowed:
+                            self._actuator.apply(vx, vy, 0.0, dt)
+                            commanding = True
+                        for event in self._sway_guard.events[guard_event_count:]:
+                            print(f"[Scheduler] {reason} — {event['axis'].upper()} 轴振荡增长 "
+                                  f"{event['baseline_deg']:.3f}° → {event['pp_deg']:.3f}° PP，"
+                                  "撤回该轴角度修正，本作业后续阶段保持 PD")
+                        guard_event_count = len(self._sway_guard.events)
                         if not damp_started and (abs(vx) > 1e-4 or abs(vy) > 1e-4):
                             damp_started = True
                             print(
@@ -946,42 +961,6 @@ class OperationScheduler:
                 elapsed = now - t_start
                 pp = metrics['detrend_pp_max_deg']
 
-                # 发散保护 — 见 _SWAY_DIVERGENCE_RATIO。除了"相对基准放大 1.8 倍",
-                # 还要求绝对幅值超过容差的 _SWAY_DIVERGENCE_TOL_FACTOR 倍: 摆幅
-                # 已经压到 0.1° 时一阵风把它推到 0.35° 也满足 1.8 倍, 但那是外扰
-                # 不是负阻尼, 误判会白白关掉正常工作的防摇。
-                divergence_floor = (
-                    cfg.hook_sway_angle_tol_deg * self._SWAY_DIVERGENCE_TOL_FACTOR
-                )
-                if pp is not None:
-                    pp_peak = pp if pp_peak is None else max(pp_peak, pp)
-                # 只在已经开始阻尼之后看发散。窗刚填满时 PP 从残缺窗涨到满幅,
-                # 那是观测几何不是负阻尼; 用观测期峰值做基准可滤掉这一段。
-                if (
-                    damper is not None
-                    and commanding
-                    and pp is not None
-                    and metrics['window_full']
-                ):
-                    if pp_baseline is None:
-                        pp_baseline = pp_peak if pp_peak is not None else pp
-                    elif (
-                        pp > pp_baseline * self._SWAY_DIVERGENCE_RATIO
-                        and pp > divergence_floor
-                    ):
-                        print(
-                            f"[Scheduler] 警告: {reason} — 摆幅在阻尼作用下反而放大 "
-                            f"({pp_baseline:.3f}° → {pp:.3f}°), 立即停止防摇阻尼。"
-                            f" 请核对倾角仪轴映射与符号 "
-                            f"(anti_sway_theta_x_from/_sign, anti_sway_theta_y_from/_sign):"
-                            f" Δv=+K·θ 的符号标反会变成负阻尼。"
-                        )
-                        damper = None
-                        if commanding:
-                            self._actuator.stop_motion()
-                            commanding = False
-                    elif pp < pp_baseline:
-                        pp_baseline = pp
                 self._set_settle_phase(
                     f"{reason} — 判稳中 ({elapsed:.1f}s / {max_wait:.0f}s"
                     + (f", 摆 {pp:.2f}°)" if pp is not None else ")")

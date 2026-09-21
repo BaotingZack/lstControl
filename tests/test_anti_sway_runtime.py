@@ -63,6 +63,22 @@ def test_static_bias_does_not_command():
     assert last[0] == 0.0 and last[1] == 0.0
 
 
+@pytest.mark.parametrize('static_axis', [0, 1])
+def test_other_axis_sway_never_releases_static_offset(static_axis):
+    """B2 载荷残差约 0.43°：另一轴摆动不能把它释放成约 20 mm/s 车速。"""
+    rt = _runtime(
+        anti_sway=AntiSwayController(RopeLengthModel(4.0), sway_gain=2.6),
+        dc_tau=2.5,
+    )
+    corrections = []
+    for step in range(150):
+        theta = [math.radians(.8) * math.sin(2 * math.pi * step * .1 / 3.5)] * 2
+        theta[static_axis] = math.radians(.45)
+        corrections.append(rt.compute_dv(*theta, z_grab=1.0, dt=.1)[:2])
+    assert max(abs(v[static_axis]) for v in corrections) == 0.0
+    assert max(abs(v[1 - static_axis]) for v in corrections) > .01
+
+
 def test_clamp_damping_blocks_outward_only():
     assert clamp_damping_axis(0.05, 0.09, 0.08) == 0.0
     assert clamp_damping_axis(-0.05, 0.09, 0.08) == -0.05

@@ -89,6 +89,8 @@ class CranePlant:
     再叠加低频外扰和测量噪声，让仿真更接近现场行车。
     """
 
+    snap_arrivals = True
+
     def __init__(self, config):
         self.config = config
         self._rng = random.Random(config.disturbance_seed)
@@ -128,6 +130,12 @@ class CranePlant:
         axis.velocity = self._clamp_velocity(axis_name, servo_velocity + disturbance)
         axis.position += axis.velocity * dt
         return disturbance
+
+    def update(self, state, commands, targets, locked, dt, t) -> tuple[float, float, float]:
+        """Advance all axes; optional physical plants can couple their motion here."""
+        return tuple(self.update_axis(name, getattr(state, name), command, target,
+                                      locked[name], dt, t)
+                     for name, command, target in zip(('x', 'y', 'z'), commands, targets))
 
     def velocity_disturbance(self, axis_name: str, t: float) -> float:
         """低频风载/负载摆动等效速度扰动。"""
@@ -327,17 +335,16 @@ class CraneConfig:
 
     # --- 倾角仪 / 抓钩摆角闭环防摇 ---
     # 控制律 Δv = +K(L)·θ_ac 叠加到 PD 速度指令 (见 sway_controller 能量法),
-    # ζ = K/(2√(gL))。高速走行默认不叠 (假倾角); 目标附近低速或 XY 锁轴后
-    # 由 anti_sway_approach_damping 打开。锁轴后的软阻尼也在
-    # OperationScheduler._wait_cargo_settled() 内, 且必须先从摆动信号解出零偏
-    # 再动车。
+    # ζ = K/(2√(gL)) 仅适用于理想角度/速度执行。新末端策略先以自然支点运动
+    # 按轴检查测量一致性，进入末端窗口后渐入；位置到位不等于防摇完成。
+    # 调度器仍保留后续独立判稳，但无独立激励的自由摆不能新取得反馈资格。
     enable_anti_sway: bool = False
+    anti_sway_terminal_enabled: bool = True
     anti_sway_travel_damping: bool = False
-    # 到位附近才叠 θ_ac: 高速走行假倾角大, 全程叠加会推偏 PD。接近目标且
-    # XY 已慢下来后假倾角可忽略, 这时叠加才能消残摆。默认开。
+    # 末端按轴窗口同时考虑速度×周期和制动距离；接近目标本身不能证明角度可信。
     anti_sway_approach_damping: bool = True
-    anti_sway_approach_pos: float = 0.40   # [m] 进入叠加的水平距离
-    anti_sway_approach_vel: float = 0.10   # [m/s] 且 XY 速度低于此 (加速度小)
+    anti_sway_approach_pos: float = 0.40   # [m] 末端窗口最小距离；旧机制使用合成距离
+    anti_sway_approach_vel: float = 0.10   # [m/s] 兼容旧配置，不作为硬速度门限
     anti_sway_sway_gain: float = 0.0
     # 绳长增益调度断点 ((L, K), ...), L 严格递增; 空=固定增益。现场 L 仅 2.4~3.4m,
     # K_opt 跨度 4.9~5.8, 固定增益足够, 一般不需要调度。
@@ -357,7 +364,7 @@ class CraneConfig:
     anti_sway_locked_max_shift: float = 0.06
     anti_sway_settle_max_shift: float = 0.0
     # 锚点回中增益 [1/s] — 见 AntiSwayRuntime.recenter_gain。必须远慢于摆频
-    # (ωn≈1.8 rad/s), 0.3 已实测不影响消摆速度; 调大到 ωn 量级会激励摆动。
+    # (ωn≈1.8 rad/s)，现有 0.3 不在本轮提高；实际效果不能只靠量纲判断。
     anti_sway_hold_recenter_gain: float = 0.3
     # θ_ac 高通时间常数 [s]: 倾角仪零偏随抓钩高度/张合变化 (见 doc/倾角仪初值, 幅度
     # 约 0.3°, 与判稳容差同量级), 残留 DC 会让 Δv=K·θ_dc 变成恒定速度而把车推走。
@@ -376,9 +383,8 @@ class CraneConfig:
     hook_settle_window_max: float = 8.0
     hook_sway_angle_tol_deg: float = 0.3
     hook_sway_angle_tol_approach_deg: float = 0.6
-    # 倾角判稳等待上限 [s]。必须留够"衰减时间 + 判稳窗填满"的余量:
-    # K=2.6 时 1°→0.3° 约需 3.2s, 判稳窗约 1.9s → 原来的 stabilize_delay=4.0s
-    # 会在摆幅刚压下去、窗还没填满时就超时放行。
+    # 倾角判稳等待上限 [s]。末端消摆超时与 settled 分开记录；之后可能仍需
+    # PD 恢复位置/速度。调度器后续独立等待不包含在这段控制完成时间内。
     hook_settle_max_wait: float = 12.0
 
     # --- 可选机械工作区 ---
@@ -758,6 +764,10 @@ def run_pd_control(
     verbose: bool = True,
     is_simulation: bool = True,
     sway_source: object | None = None,
+    simulation_duration: float | None = None,
+    sway_guard: object | None = None,
+    sway_safe_height: float | None = None,
+    simulation_hold: bool = False,
 ) -> tuple[list[dict], list[tuple[float, str]]]:
     """统一 PD 位置控制循环 — 仿真和 PLC 模式共用。
 
@@ -765,9 +775,11 @@ def run_pd_control(
       v_cmd = Kp * (target - measured) - Kd * filtered_velocity + K(L)·θ_ac
 
     末项是可选的摆角闭环防摇 (需 config.enable_anti_sway 且传入 sway_source),
-    作用是让行车在行进段就"追着载荷走"、到位时残余摆幅已经很小; 到位后 PD
-    循环即退出, 锁轴悬停期间的软阻尼由 OperationScheduler._wait_cargo_settled()
-    接管 (那里才是摆幅最大、且本循环已经不再下发指令的阶段)。
+    新末端策略先按轴检验自然运动下的测量一致性，再在明确安全高度的末端
+    窗口渐入。首次到位与控制完成分开：反馈参与后继续有限时间消摆，完整周期
+    角度 PP、位置和速度均合格才记录 settled；缺测/失配退出、超时分别记录。
+    OperationScheduler._wait_cargo_settled() 仍保留独立确认等待，不能把本函数
+    的完成时间当作整个作业周期。关闭末端策略可用于旧机制对照。
 
     仿真模式: SimPositionSource (100 Hz 非阻塞) + PlantActuator
     PLC 模式: RosPositionSource (10 Hz 阻塞) + PlcActuator
@@ -783,9 +795,14 @@ def run_pd_control(
         verbose:        是否打印日志
         is_simulation:  True=仿真模式 (虚拟时间), False=PLC 模式 (真实时间)
         sway_source:    可选摆角源, 需提供 get_sway() -> {'theta_x','theta_y'} | None
-                        (断流时返回 None, 防摇自动退化为纯 PD)。仅当
-                        config.anti_sway_travel_damping 为真时才真正叠加; 默认
-                        关闭, 避免加减速假倾角把 PD 轨迹推偏。
+                        (断流时返回 None, 防摇自动退化为纯 PD)。按配置在
+                        接近/锁轴或全程走行阶段叠加，并遵守取放货附近禁动门限。
+        simulation_duration: 仿真固定观测时长 [s]；指定时到位后继续观测。
+                        max_time 仍是总超时上限；PLC 模式禁止此选项。
+        sway_guard:     可选的作业共享按轴增长保护；阶段切换不清除已撤回状态。
+        sway_safe_height: 调度明确的运输安全高度；达到后可在末端窗口阻尼。
+                        None 保留原贴货限制，不推断未知货物间隙。
+        simulation_hold: 仅机制实验：到位后继续控制，不能称为停车后的残摆。
 
     Returns:
         (history, arrival_events):
@@ -794,6 +811,14 @@ def run_pd_control(
     """
     from pd_controller import PositionPDController
     from velocity_filter import LowPassVelocityEstimator
+
+    if simulation_duration is not None:
+        if not is_simulation or not math.isfinite(simulation_duration) or simulation_duration <= 0:
+            raise ValueError('simulation_duration requires simulation mode and a positive finite duration')
+    if simulation_hold and not is_simulation:
+        raise ValueError('simulation_hold requires simulation mode')
+    if sway_safe_height is not None and not math.isfinite(sway_safe_height):
+        raise ValueError('sway_safe_height must be finite')
 
     # 复制初始状态
     crane = CraneState(
@@ -892,6 +917,7 @@ def run_pd_control(
     ):
         from anti_sway_runtime import AntiSwayRuntime
         from sway_controller import build_anti_sway
+        from sway_guard import SwayGrowthGuard
 
         anti_sway_ctrl = build_anti_sway(config)
         if anti_sway_ctrl is not None:
@@ -900,6 +926,12 @@ def run_pd_control(
                 dc_tau=config.anti_sway_settle_dc_tau,
                 locked_max_shift=config.anti_sway_locked_max_shift,
                 recenter_gain=config.anti_sway_hold_recenter_gain,
+                terminal_mode=config.anti_sway_terminal_enabled,
+                amp_floor=math.radians(config.hook_sway_angle_tol_deg / 4
+                                       if config.anti_sway_terminal_enabled else .15),
+                guard=sway_guard if sway_guard is not None else SwayGrowthGuard(
+                    min_pp_rad=math.radians(2 * config.hook_sway_angle_tol_deg),
+                ),
             )
             anti_sway_runtime.reset(crane.x.position, crane.y.position)
 
@@ -933,6 +965,16 @@ def run_pd_control(
     antisway_dvx = antisway_dvy = 0.0
     theta_x = theta_y = None
     approach_logged = False
+    guard_event_count = len(anti_sway_runtime.guard.events) if anti_sway_runtime else 0
+    from sway_terminal import TerminalSwayMonitor, terminal_distance
+    terminal_monitor = TerminalSwayMonitor()
+    terminal_axes = [False, False]
+    terminal_applied = False
+    terminal_start = None
+    terminal_outcome = 'moving'
+    terminal_withdrawn = False
+    control_complete = False
+    terminal_policy = anti_sway_runtime is not None and config.anti_sway_terminal_enabled
 
     # 扰动记录 (仅仿真模式非零)
     disturbance_x = disturbance_y = disturbance_z = 0.0
@@ -950,6 +992,7 @@ def run_pd_control(
         print("=" * 50)
 
     source.reset()
+    t = 0.0
 
     # Rebind source/actuator to the copied crane state
     # (SimPositionSource/PlantActuator hold a reference to the original
@@ -966,7 +1009,8 @@ def run_pd_control(
 
     completed = False
     try:
-        while not all(locked.values()):
+        while (t < simulation_duration - config.dt * 1e-6
+               if simulation_duration is not None else not control_complete):
             # --- 检查钩子中断 ---
             if hooks is not None and hooks.should_stop():
                 raise ControlStoppedError(f'{mode_label} control stopped by external request')
@@ -974,6 +1018,9 @@ def run_pd_control(
             # --- STEP 1: 获取位置反馈 ---
             pos = source.get_position()
             if pos is None:
+                if anti_sway_runtime is not None:
+                    anti_sway_runtime.suspend(0.)
+                    terminal_monitor.reset()
                 consecutive_feedback_timeouts += 1
                 if consecutive_feedback_timeouts < 3:
                     if verbose:
@@ -1001,6 +1048,9 @@ def run_pd_control(
             try:
                 validated = _validate_position_feedback(pos, config)
             except PositionFeedbackError:
+                if anti_sway_runtime is not None:
+                    anti_sway_runtime.suspend(0.)
+                    terminal_monitor.reset()
                 if (
                     not is_simulation
                     and last_accepted_pos is not None
@@ -1026,6 +1076,9 @@ def run_pd_control(
                     or abs(pos['z'] - last_accepted_pos['z']) > max_step_z
                 )
                 if jumped:
+                    if anti_sway_runtime is not None:
+                        anti_sway_runtime.suspend(0.)
+                        terminal_monitor.reset()
                     if consecutive_bad_frames < config.max_consecutive_bad_frames:
                         consecutive_bad_frames += 1
                         if verbose:
@@ -1070,6 +1123,7 @@ def run_pd_control(
             vx_cmd = 0.0 if locked['x'] else controllers['x'].update(target_x, x_measured, vx_damp, dt)
             vy_cmd = 0.0 if locked['y'] else controllers['y'].update(target_y, y_measured, vy_damp, dt)
             vz_cmd = 0.0 if locked['z'] else controllers['z'].update(target_z, z_measured, vz_damp, dt)
+            vx_pd, vy_pd = vx_cmd, vy_cmd
 
             # --- STEP 3b: 摆角闭环防摇 — Δv = +K(L)·θ_ac 叠加到 XY 指令 ---
             # 已锁轴的 XY 仍在预算内做软阻尼 (典型场景: XY 已到位、Z 还在下降,
@@ -1077,15 +1131,23 @@ def run_pd_control(
             # 返回 None) 时不更新 DC 跟踪器也不叠加, 自动退化为纯 PD。
             antisway_dvx = antisway_dvy = 0.0
             theta_x = theta_y = None
+            antisway_allowed = False
+            terminal_settled = False
             if anti_sway_runtime is not None:
                 from anti_sway_runtime import approach_damping_allowed
 
                 sway = sway_source.get_sway()
+                if sway is not None and not all(math.isfinite(float(sway[k])) for k in ('theta_x', 'theta_y')):
+                    sway = None
+                if sway is None:
+                    anti_sway_runtime.suspend(dt)
+                    terminal_monitor.reset()
                 if sway is not None:
                     theta_x = float(sway['theta_x'])
                     theta_y = float(sway['theta_y'])
                     z_remain = abs(target_z - z_measured)
-                    near_cargo = z_remain <= 0.30
+                    near_cargo = (z_remain <= 0.30 if sway_safe_height is None else
+                                  z_measured < sway_safe_height - config.arrival_pos_tol_z)
                     # 贴近取放货高度禁止横移 (与 settle_max_shift=0 一致)
                     observe_only = (
                         near_cargo and config.anti_sway_settle_max_shift <= 0.0
@@ -1102,32 +1164,47 @@ def run_pd_control(
                         approach_pos=config.anti_sway_approach_pos,
                         approach_vel=config.anti_sway_approach_vel,
                     )
+                    period = 2 * math.pi * math.sqrt(
+                        anti_sway_runtime.anti_sway.rope_model.compute(z_measured) / 9.81)
+                    if terminal_policy:
+                        for a, (error, speed) in enumerate(((target_x - x_measured, vx_filtered),
+                                                          (target_y - y_measured, vy_filtered))):
+                            distance = terminal_distance(speed, period, config.anti_sway_approach_pos,
+                                config.max_velocity_xy, config.max_acceleration_xy)
+                            terminal_axes[a] |= bool(travel_on or (approach_on and abs(error) <= distance))
+                        allow = not observe_only and any(terminal_axes)
+                    allow = allow and not terminal_withdrawn and (not control_complete or simulation_hold)
+                    antisway_allowed = allow
+                    anti_sway_runtime.locked_max_shift = (
+                        config.anti_sway_settle_max_shift
+                        if near_cargo
+                        else config.anti_sway_locked_max_shift
+                    )
+                    # 每个有效样本都更新观测；门控只决定能否向 PD 添加修正。
+                    vx_cmd, vy_cmd, antisway_dvx, antisway_dvy = anti_sway_runtime.merge_xy_commands(
+                        vx_cmd, vy_cmd, theta_x=theta_x, theta_y=theta_y,
+                        z_grab=z_measured, x=x_measured, y=y_measured,
+                        locked_x=locked['x'], locked_y=locked['y'], dt=dt,
+                        max_velocity_xy=config.max_velocity_xy,
+                        gain_scale=(config.anti_sway_settle_gain_scale
+                                    if not terminal_policy and locked['x'] and locked['y'] else 1.0),
+                        feedback_allowed=allow,
+                        feedback_axes=tuple(terminal_axes) if terminal_policy else (True, True),
+                    )
+                    terminal_applied |= abs(vx_cmd - vx_pd) + abs(vy_cmd - vy_pd) > 1e-8
+                    terminal_settled = terminal_monitor.update(t=t, theta=(theta_x, theta_y),
+                        error=(target_x - x_measured, target_y - y_measured),
+                        velocity=(vx_damp, vy_damp), period=period,
+                        angle_tol=math.radians(config.hook_sway_angle_tol_deg),
+                        pos_tol=config.arrival_pos_tol, vel_tol=config.velocity_deadband)
+                    for event in anti_sway_runtime.guard.events[guard_event_count:]:
+                        if verbose:
+                            print(f"[Anti-sway] {event['axis'].upper()} 轴振荡增长 "
+                                  f"{event['baseline_deg']:.3f}° → {event['pp_deg']:.3f}° PP，"
+                                  "撤回该轴角度修正，本作业后续阶段保持 PD")
+                    guard_event_count = len(anti_sway_runtime.guard.events)
                     if allow:
-                        anti_sway_runtime.locked_max_shift = (
-                            config.anti_sway_settle_max_shift
-                            if near_cargo
-                            else config.anti_sway_locked_max_shift
-                        )
-                        (
-                            vx_cmd, vy_cmd, antisway_dvx, antisway_dvy,
-                        ) = anti_sway_runtime.merge_xy_commands(
-                            vx_cmd, vy_cmd,
-                            theta_x=theta_x,
-                            theta_y=theta_y,
-                            z_grab=z_measured,
-                            x=x_measured,
-                            y=y_measured,
-                            locked_x=locked['x'],
-                            locked_y=locked['y'],
-                            dt=dt,
-                            max_velocity_xy=config.max_velocity_xy,
-                            gain_scale=(
-                                config.anti_sway_settle_gain_scale
-                                if locked['x'] and locked['y']
-                                else 1.0
-                            ),
-                        )
-                        if not approach_logged:
+                        if not approach_logged and verbose:
                             print(
                                 f"[Anti-sway] 接近/锁轴阻尼 ON  "
                                 f"err_xy={math.hypot(target_x - x_measured, target_y - y_measured):.2f}m "
@@ -1137,7 +1214,7 @@ def run_pd_control(
                                 f"Δv=({antisway_dvx:+.3f},{antisway_dvy:+.3f})"
                             )
                             approach_logged = True
-                    elif approach_logged:
+                    elif approach_logged and verbose:
                         print("[Anti-sway] 接近/锁轴阻尼 OFF")
                         approach_logged = False
 
@@ -1154,14 +1231,18 @@ def run_pd_control(
                 if near_target_z and z_feedback_moving:
                     vz_cmd = 0.0
 
+            if control_complete and not simulation_hold:
+                vx_cmd = vy_cmd = vz_cmd = 0.0
+                antisway_dvx = antisway_dvy = 0.0
+
             # --- STEP 4: 执行 — 委托给 Actuator ---
             if is_simulation:
                 # 仿真模式: plant.update_axis() 更新 state
                 plant = getattr(source, '_plant', None)
                 if plant is not None:
-                    disturbance_x = plant.update_axis('x', crane.x, vx_cmd, target_x, locked['x'], dt, t)
-                    disturbance_y = plant.update_axis('y', crane.y, vy_cmd, target_y, locked['y'], dt, t)
-                    disturbance_z = plant.update_axis('z', crane.z, vz_cmd, target_z, locked['z'], dt, t)
+                    disturbance_x, disturbance_y, disturbance_z = plant.update(
+                        crane, (vx_cmd, vy_cmd, vz_cmd), (target_x, target_y, target_z), locked, dt, t,
+                    )
             else:
                 # PLC 模式: 发送指令到真实 PLC。连接/心跳的瞬时抖动 (已在
                 # PlcActuator/心跳线程做了容忍与背后自愈) 不应让这一次瞬时
@@ -1171,6 +1252,9 @@ def run_pd_control(
                 try:
                     actuator.apply(vx_cmd, vy_cmd, vz_cmd, dt)
                 except RuntimeError as exc:
+                    if anti_sway_runtime is not None:
+                        anti_sway_runtime.suspend(0.)
+                        terminal_monitor.reset()
                     if consecutive_actuator_errors < config.max_consecutive_actuator_errors:
                         consecutive_actuator_errors += 1
                         if verbose:
@@ -1214,10 +1298,12 @@ def run_pd_control(
                 # 去抖: 连续满足才累加, 一旦有一帧不满足立即清零。
                 arrival_streak[name] = arrival_streak[name] + 1 if arrived_now else 0
                 if arrival_streak[name] >= config.arrival_debounce_cycles:
-                    axis.position = target
-                    axis.velocity = 0.0
+                    if not is_simulation or getattr(getattr(source, '_plant', None), 'snap_arrivals', True):
+                        axis.position = target
+                        axis.velocity = 0.0
                     locked[name] = True
-                    arrival_events.append((t, name))
+                    if not any(axis_name == name for _, axis_name in arrival_events):
+                        arrival_events.append((t, name))
                     # 锁轴瞬间把位移预算的锚点搬到锁定点。锚点若还停在出发位置,
                     # |x−anchor| 会是整段行程 (米级) 远超预算, 软阻尼就只剩"朝出发
                     # 点回拉"的半个周期 → 被半波整流成单向漂移 (见 AntiSwayRuntime
@@ -1227,6 +1313,39 @@ def run_pd_control(
                     if hooks is not None:
                         hooks.on_arrival(name, t)
 
+            if all(locked.values()) and not control_complete:
+                if terminal_start is None:
+                    terminal_start = t
+                eligible = (terminal_policy and terminal_applied and antisway_allowed
+                            and theta_x is not None and any(
+                                q and not b for q, b in zip(anti_sway_runtime.qualifier.allowed,
+                                                            anti_sway_runtime.guard.blocked)))
+                if not eligible:
+                    if not terminal_withdrawn:
+                        terminal_outcome = 'feedback_withdrawn' if terminal_applied and terminal_policy else 'position_only'
+                    control_complete = True
+                elif terminal_settled:
+                    terminal_outcome, control_complete = 'settled', True
+                elif t - terminal_start >= config.hook_settle_max_wait:
+                    terminal_outcome, control_complete = 'settle_timeout', True
+                if control_complete and terminal_policy and terminal_applied:
+                    # Withdrawal stops the angle path, NOT the position contract.
+                    # A locked support may have moved during damping or a gust.
+                    # Recover under ordinary PD; never blind-recenter with a bad angle.
+                    for name, axis, target in (('x', crane.x, target_x), ('y', crane.y, target_y)):
+                        # PLC arrival display snaps state to target/zero; it is
+                        # not a new measurement. Simulation uses post-step truth.
+                        position = axis.position if is_simulation else pos[name]
+                        velocity = axis.velocity if is_simulation else (
+                            vx_damp if name == 'x' else vy_damp)
+                        if (abs(position - target) >= config.arrival_pos_tol
+                                or abs(velocity) >= config.velocity_deadband):
+                            terminal_withdrawn = True
+                            locked[name] = False
+                            arrival_streak[name] = 0
+                            controllers[name].reset()
+                            control_complete = False
+
             # --- STEP 6: 记录历史 ---
             step_data = {
                 't': t,
@@ -1235,6 +1354,14 @@ def run_pd_control(
                 'p_ref_x': target_x, 'p_ref_y': target_y, 'p_ref_z': target_z,
                 'v_ref_x': 0.0, 'v_ref_y': 0.0, 'v_ref_z': 0.0,
                 'vx_cmd': vx_cmd, 'vy_cmd': vy_cmd, 'vz_cmd': vz_cmd,
+                'vx_pd': vx_pd, 'vy_pd': vy_pd,
+                'antisway_applied_dvx': vx_cmd - vx_pd,
+                'antisway_applied_dvy': vy_cmd - vy_pd,
+                'antisway_allowed': antisway_allowed,
+                'control_complete': control_complete,
+                'terminal_outcome': terminal_outcome,
+                'terminal_active_x': terminal_axes[0],
+                'terminal_active_y': terminal_axes[1],
                 'x_measured': x_measured, 'y_measured': y_measured, 'z_measured': z_measured,
                 'vx_raw': vx_raw, 'vy_raw': vy_raw, 'vz_raw': vz_raw,
                 'vx_filtered': vx_filtered, 'vy_filtered': vy_filtered, 'vz_filtered': vz_filtered,
@@ -1246,6 +1373,15 @@ def run_pd_control(
                     if anti_sway_runtime is not None else None
                 ),
             }
+            if anti_sway_runtime is not None:
+                step_data.update(anti_sway_runtime.guard.snapshot())
+                step_data['theta_ac_x'] = anti_sway_runtime.amp.last_ac_x if theta_x is not None else None
+                step_data['theta_ac_y'] = anti_sway_runtime.amp.last_ac_y if theta_y is not None else None
+                if anti_sway_runtime.qualifier is not None:
+                    step_data.update(anti_sway_runtime.qualifier.snapshot())
+            if is_simulation and hasattr(getattr(source, '_plant', None), 'sway_snapshot'):
+                step_data.update(source._plant.sway_snapshot(crane))
+                step_data['sim_position_arrived'] = all(locked.values())
             history.append(step_data)
 
             if hooks is not None:
@@ -1255,7 +1391,8 @@ def run_pd_control(
         if verbose:
             final = history[-1]
             print("=" * 50)
-            print(f"{mode_label}完成! 总时间: {final['t']:.2f}s")
+            outcome = '观测结束' if simulation_duration is not None else '完成'
+            print(f"{mode_label}{outcome}! 总时间: {final['t']:.2f}s")
             print(f"最终位置: X={final['x']:.3f}, Y={final['y']:.3f}, Z={final['z']:.3f}")
         return history, arrival_events
     finally:

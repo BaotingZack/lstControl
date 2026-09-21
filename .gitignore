@@ -5,3 +5,6 @@ __pycache__/
 
 # Generated images
 *.png
+
+# Reproducible 0918 analysis / simulation exports
+artifacts/inclinometer_0918/
