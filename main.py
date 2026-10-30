@@ -6,19 +6,14 @@ PLC 每个周期读取位置反馈，估计并滤波速度，使用 PD 输出速
 
   v_cmd = Kp * (target_position - measured_position) - Kd * filtered_velocity
 
-两种运行模式 (通过 --plc-ip 自动切换):
+两种运行方式:
 
-  仿真模式 (无 --plc-ip):
-    - 位置反馈来自仿真对象模型 (CranePlant)
-    - 100 Hz 固定步长
-    - 命令行动目标, 启动后自动运行
-    - --live 时浏览器回放已完成的仿真
+  默认 `python main.py`:
+    - 打开浏览器（/ptp/sim 与 /ptp/live 子页）
+    - 默认尝试连接 PLC 192.168.0.1；连不上仍可用仿真子页
+    - 使用 --no-live 则只跑命令行仿真/控制并保存曲线图
 
-  PLC 模式 (指定 --plc-ip):
-    - 位置反馈来自 ROS /localization_pose (10 Hz)
-    - 10 Hz 事件驱动, 跟随定位数据节奏
-    - 开 UI 后设置 Target → Apply Target → 开始 PD 控制
-    - HTTP 轮询控制状态，SSE 保留为诊断通道
+  指定 --plc-ip / --no-plc 等见 --help。
 """
 
 from __future__ import annotations
@@ -56,24 +51,40 @@ def run_simulation(
     config: CraneConfig,
     verbose: bool = True,
     max_time: float | None = 180.0,
+    *,
+    enable_anti_sway: bool = False,
+    anti_sway_mode: str = 'off',
+    site: dict | None = None,
 ) -> tuple[list[dict], list[tuple[float, str]]]:
     """仿真模式: 使用 plant model 运行一次 PD 控制到完成。
 
-    此函数是对 run_pd_control() 的薄封装, 保持与旧代码/测试的兼容性。
-    PLC 模式请直接使用 run_pd_control() + RosPositionSource + PlcActuator。
+    anti_sway_mode: off | incl (K·θ) | gantry (并联角度 PD)。legacy enable_anti_sway=True → incl。
     """
-    plant = CranePlant(config)
-    source = SimPositionSource(plant, initial_state, config)
-    actuator = PlantActuator(plant, initial_state, config)
+    from anti_sway.sim_feedback import SimSwayFeedback
+    from anti_sway.ptp_config import apply_ptp_anti_sway_mode, normalize_anti_sway_mode
+
+    mode = normalize_anti_sway_mode(anti_sway_mode, legacy_enabled=enable_anti_sway)
+    run_config = apply_ptp_anti_sway_mode(config, mode, site or {})
+    sway_source = None
+    if mode != 'off' and mode != 'input_shape':
+        sway_source = SimSwayFeedback(
+            sheave_height=run_config.rope_length_sheave_height,
+            grab_offset=run_config.rope_length_grab_offset,
+        )
+        sway_source.reset()
+    plant = CranePlant(run_config)
+    source = SimPositionSource(plant, initial_state, run_config)
+    actuator = PlantActuator(plant, initial_state, run_config)
     return run_pd_control(
         source=source,
         actuator=actuator,
-        config=config,
+        config=run_config,
         target_pos=target_pos,
         initial_state=initial_state,
         verbose=verbose,
         max_time=max_time,
         is_simulation=True,
+        sway_source=sway_source,
     )
 
 
@@ -86,16 +97,23 @@ def _build_arg_parser():
     parser.add_argument('--target-x', type=float, default=8.0, help='target X bridge position')
     parser.add_argument('--target-y', type=float, default=6.0, help='target Y trolley position')
     parser.add_argument('--target-z', type=float, default=1.5, help='target Z hoist position')
-    parser.add_argument('--live', action='store_true', help='show browser live view after simulation')
+    parser.add_argument('--live', action=argparse.BooleanOptionalAction, default=True,
+                        help='open browser UI (default: on; --no-live for batch-only)')
     parser.add_argument('--hz', type=float, default=10.0, help='live display refresh rate in Hz')
     parser.add_argument('--speed', type=float, default=1.0, help='live replay speed multiplier')
     parser.add_argument('--host', default='127.0.0.1', help='live web server host')
     parser.add_argument('--port', type=int, default=8000, help='live web server port')
-    parser.add_argument('--plc-ip', default='', help='PLC IP (empty = lab simulation; set to e.g. 192.168.0.1 for real PLC)')
+    parser.add_argument('--plc-ip', default='192.168.0.1',
+                        help='PLC IP (default 192.168.0.1; use "" or --no-plc to skip PLC)')
+    parser.add_argument('--no-plc', action='store_true',
+                        help='do not connect PLC; simulation subpage only')
     parser.add_argument('--plc-lib', default='plc_lib/lib/libsscarctrl.so',
                         help='path to libsscarctrl.so')
     parser.add_argument('--allow-mock-plc', action='store_true',
                         help='explicitly allow MockPLC when the real PLC library cannot load')
+    from site_config import DEFAULT_SITE_CONFIG_PATH  # noqa: E402
+    parser.add_argument('--config', type=str, default=str(DEFAULT_SITE_CONFIG_PATH),
+                        help='site config JSON (inclinometer calibration; default site_config.json)')
     parser.add_argument('--map-to-crane-origin-x', type=float, default=0.0,
                         help='crane origin X coordinate in the SLAM map')
     parser.add_argument('--map-to-crane-origin-y', type=float, default=0.0,
@@ -206,6 +224,259 @@ def _target_from_query(
     )
 
 
+def _query_bool(query: dict[str, list[str]], name: str, default: bool = False) -> bool:
+    values = query.get(name)
+    if not values:
+        return default
+    return str(values[-1]).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _anti_sway_mode_from_query(query: dict[str, list[str]]) -> str:
+    from site_config import normalize_anti_sway_mode
+
+    values = query.get('anti_sway_mode')
+    mode = str(values[-1]).strip().lower() if values else None
+    legacy = _query_bool(query, 'anti_sway', False)
+    return normalize_anti_sway_mode(mode, legacy_enabled=legacy)
+
+
+def _start_live_server(
+    *,
+    config: CraneConfig,
+    args: argparse.Namespace,
+    map_target_pos: tuple[float, float, float],
+    coordinate_transform: CoordinateTransform2D,
+    plc=None,
+    ros_source=None,
+    plc_actuator=None,
+    initial_pos=None,
+) -> None:
+    """Start HTTP UI with simulation replay (/ptp/sim) and optional PLC (/ptp/live)."""
+    from live_server import build_live_payload, serve_live_view
+
+    target_pos = config.validate_target(map_target_pos)
+    crane0 = CraneState(x0=0.0, y0=0.0, z0=0.0)
+    site = _load_site_settings(args)
+    history, arrival_events = run_simulation(
+        target_pos=target_pos,
+        initial_state=crane0,
+        config=config,
+        verbose=False,
+        enable_anti_sway=False,
+        site=site,
+    )
+    initial_pos_sim = (crane0.x.position, crane0.y.position, crane0.z.position)
+    payload = build_live_payload(
+        history=history,
+        phase_boundaries=arrival_events,
+        target_pos=target_pos,
+        initial_pos=initial_pos_sim,
+        config=config,
+        update_hz=args.hz,
+        speed=args.speed,
+    )
+    state = {"target": target_pos, "initial": initial_pos_sim}
+
+    def live_payload_for_query(query: dict[str, list[str]]):
+        if not query:
+            return payload
+        start_pos = state["target"]
+        requested_target = _target_from_query(query, state["target"])
+        anti_sway = _query_bool(query, 'anti_sway', False)
+        mode = _anti_sway_mode_from_query(query)
+        live_history, live_events = run_simulation(
+            target_pos=requested_target,
+            initial_state=CraneState(
+                x0=start_pos[0], y0=start_pos[1], z0=start_pos[2]
+            ),
+            config=config,
+            verbose=False,
+            enable_anti_sway=anti_sway,
+            anti_sway_mode=mode,
+            site=site,
+        )
+        state["initial"] = start_pos
+        state["target"] = requested_target
+        return build_live_payload(
+            history=live_history,
+            phase_boundaries=live_events,
+            target_pos=requested_target,
+            initial_pos=start_pos,
+            config=config,
+            update_hz=args.hz,
+            speed=args.speed,
+        )
+
+    sway_tol = float(site.get('hook_sway_angle_tol_deg', 0.3))
+
+    serve_live_view(
+        payload,
+        host=args.host,
+        port=args.port,
+        payload_factory=live_payload_for_query,
+        plc=plc,
+        ros_source=ros_source,
+        plc_actuator=plc_actuator,
+        config=config,
+        initial_pos=initial_pos,
+        update_hz=args.hz,
+        speed=args.speed,
+        coordinate_transform=coordinate_transform,
+        hook_sway_angle_tol_deg=sway_tol,
+    )
+
+
+def _effective_plc_ip(args) -> str | None:
+    if getattr(args, 'no_plc', False):
+        return None
+    raw = (args.plc_ip or '').strip()
+    if not raw or raw.lower() in ('none', 'off'):
+        return None
+    return raw
+
+
+def _load_site_settings(args) -> dict:
+    from site_config import DEFAULT_SITE_CONFIG_PATH, load_site_config
+
+    path = getattr(args, 'config', None) or str(DEFAULT_SITE_CONFIG_PATH)
+    return load_site_config(path)
+
+
+def _start_ros_bridge_from_site(args) -> None:
+    """Subscribe /localization_pose and /inclination/j1939_msg with site biases."""
+    from site_config import build_sway_axis_mapping
+
+    site = _load_site_settings(args)
+    mapping = build_sway_axis_mapping(site)
+    angle_deg = bool(site.get('anti_sway_angle_deg', True))
+    scale = math.pi / 180.0 if angle_deg else 1.0
+    rb_closed = site.get('anti_sway_roll_bias_closed')
+    pb_closed = site.get('anti_sway_pitch_bias_closed')
+    start_ros_bridge(
+        angle_scale=scale,
+        roll_bias=float(site.get('anti_sway_roll_bias', 0.0)),
+        pitch_bias=float(site.get('anti_sway_pitch_bias', 0.0)),
+        axis_mapping=mapping,
+        roll_bias_closed=float(rb_closed) if rb_closed is not None else None,
+        pitch_bias_closed=float(pb_closed) if pb_closed is not None else None,
+    )
+
+
+def _setup_plc_runtime(args, config, coordinate_transform, map_target_pos):
+    """Connect PLC + ROS bridge; return (plc, ros_source, plc_actuator, initial_pos)."""
+    plc = _connect_plc(args)
+    _start_ros_bridge_from_site(args)
+
+    print('Waiting for /localization_pose...')
+    waited = 0.0
+    while get_latest_pose() is None and waited < 5.0:
+        time.sleep(0.1)
+        waited += 0.1
+
+    hoist_z = plc.get_lift_height()
+    has_hoist_z = hoist_z is not None and math.isfinite(hoist_z)
+
+    target_pos = config.validate_target(
+        coordinate_transform.map_to_crane_target(
+            *map_target_pos, z_is_hoist_height=has_hoist_z,
+        )
+    )
+
+    crane0 = CraneState(x0=0.0, y0=0.0, z0=0.0)
+    pose = get_latest_pose()
+    if pose is not None:
+        px, py, pz = config.validate_position(
+            coordinate_transform.map_to_crane_position(
+                pose['x'], pose['y'], pose['z']
+            )
+        )
+        if has_hoist_z:
+            pz = float(hoist_z)
+        crane0 = CraneState(x0=px, y0=py, z0=pz)
+        print(
+            f'Localization received: map=({pose["x"]:.2f}, {pose["y"]:.2f}, {pz:.2f}), '
+            f'crane=({px:.2f}, {py:.2f}, {pz:.2f}), '
+            f'Z source={"hoist" if has_hoist_z else "slam"}'
+        )
+    else:
+        print('Warning: /localization_pose timeout, using default initial position')
+
+    fallback_map = coordinate_transform.crane_to_map_display(
+        crane0.x.position,
+        crane0.y.position,
+        crane0.z.position,
+        z_is_hoist_height=has_hoist_z,
+    )
+    initial_pos = (
+        pose['x'] if pose is not None else fallback_map[0],
+        pose['y'] if pose is not None else fallback_map[1],
+        fallback_map[2],
+    )
+    ros_source = RosPositionSource(
+        coordinate_transform=coordinate_transform,
+        use_native_z_velocity=args.use_native_z_velocity,
+        lift_height_provider=plc.get_lift_height,
+    )
+    plc_actuator = PlcActuator(
+        plc,
+        initial_z=crane0.z.position,
+        big_car_sign=-1.0 if args.invert_big_car else 1.0,
+        small_car_sign=-1.0 if args.invert_small_car else 1.0,
+        lift_sign=-1.0 if args.invert_lift else 1.0,
+        min_lift_height=args.min_lift_height,
+    )
+    return plc, ros_source, plc_actuator, initial_pos, target_pos, crane0
+
+
+def _run_live_mode(
+    args,
+    config: CraneConfig,
+    coordinate_transform: CoordinateTransform2D,
+    map_target_pos: tuple[float, float, float],
+) -> None:
+    """Browser UI with /ptp/sim always; /ptp/live when PLC connects."""
+    plc_ip = _effective_plc_ip(args)
+    plc = None
+    ros_source = None
+    plc_actuator = None
+    initial_pos = None
+
+    if plc_ip:
+        args.plc_ip = plc_ip
+        try:
+            plc, ros_source, plc_actuator, initial_pos, _, _ = _setup_plc_runtime(
+                args, config, coordinate_transform, map_target_pos,
+            )
+            print(f'PLC connected at {plc_ip}')
+        except Exception as exc:
+            print(f'Warning: PLC at {plc_ip} unavailable ({exc})')
+            print('Live UI will run; use /ptp/sim. /ptp/live needs a working PLC.')
+            plc = None
+            ros_source = None
+            plc_actuator = None
+            initial_pos = None
+            try:
+                _start_ros_bridge_from_site(args)
+                print('ROS bridge started for inclinometer (PLC not connected).')
+            except Exception as ros_exc:
+                print(f'Warning: ROS bridge not started ({ros_exc})')
+
+    try:
+        _start_live_server(
+            config=config,
+            args=args,
+            map_target_pos=map_target_pos,
+            coordinate_transform=coordinate_transform,
+            plc=plc,
+            ros_source=ros_source,
+            plc_actuator=plc_actuator,
+            initial_pos=initial_pos,
+        )
+    finally:
+        if plc is not None:
+            plc.disconnect()
+
+
 def main(argv=None):
     args = _build_arg_parser().parse_args(argv)
     config = _config_from_args(args)
@@ -213,118 +484,42 @@ def main(argv=None):
     crane0 = CraneState(x0=0.0, y0=0.0, z0=0.0)
     map_target_pos = (args.target_x, args.target_y, args.target_z)
 
-    # ---- PLC 模式 ----
-    if args.plc_ip:
-        plc = _connect_plc(args)
-        try:
-            start_ros_bridge()
-
-            # 等待首次定位数据 (超时 5s)
-            print('Waiting for /localization_pose...')
-            waited = 0.0
-            while get_latest_pose() is None and waited < 5.0:
-                time.sleep(0.1)
-                waited += 0.1
-            # Z 位置来自抓钩实测高度 (物理 Z), SLAM 只提供 X/Y。
-            hoist_z = plc.get_lift_height()
-            has_hoist_z = hoist_z is not None and math.isfinite(hoist_z)
-
-            # target_pos 的 Z 必须和 has_hoist_z 用同一个参考系: 有抓钩高度时
-            # --target-z 被当作直接输入的抓钩高度, 不经过 map↔crane 的 3D
-            # 旋转/平移——否则一旦标定了 origin_map_z 或 roll/pitch, 目标 Z
-            # 和反馈 Z 就会出现常数级偏差, 导致 PD 提前收敛到错误高度。
-            target_pos = config.validate_target(
-                coordinate_transform.map_to_crane_target(
-                    *map_target_pos, z_is_hoist_height=has_hoist_z,
-                )
-            )
-
-            pose = get_latest_pose()
-            if pose is not None:
-                px, py, pz = config.validate_position(
-                    coordinate_transform.map_to_crane_position(
-                        pose['x'], pose['y'], pose['z']
-                    )
-                )
-                # 有抓钩高度时用它作为初始 Z, 否则退回 SLAM Z。
-                if has_hoist_z:
-                    pz = float(hoist_z)
-                crane0 = CraneState(x0=px, y0=py, z0=pz)
-                print(
-                    f'Localization received: map=({pose["x"]:.2f}, {pose["y"]:.2f}, {pz:.2f}), '
-                    f'crane=({px:.2f}, {py:.2f}, {pz:.2f}), '
-                    f'Z source={"hoist" if has_hoist_z else "slam"}'
-                )
-            else:
-                print('Warning: /localization_pose timeout, using default initial position')
-
-            fallback_map = coordinate_transform.crane_to_map_display(
-                crane0.x.position,
-                crane0.y.position,
-                crane0.z.position,
-                z_is_hoist_height=has_hoist_z,
-            )
-            initial_pos = (
-                pose['x'] if pose is not None else fallback_map[0],
-                pose['y'] if pose is not None else fallback_map[1],
-                # Z 用抓钩高度 (物理量, 不经旋转/平移)；crane0.z 已优先取抓钩高度。
-                fallback_map[2],
-            )
-            ros_source = RosPositionSource(
-                coordinate_transform=coordinate_transform,
-                use_native_z_velocity=args.use_native_z_velocity,
-                lift_height_provider=plc.get_lift_height,
-            )
-            plc_actuator = PlcActuator(
-                plc,
-                initial_z=crane0.z.position,
-                big_car_sign=-1.0 if args.invert_big_car else 1.0,
-                small_car_sign=-1.0 if args.invert_small_car else 1.0,
-                lift_sign=-1.0 if args.invert_lift else 1.0,
-                min_lift_height=args.min_lift_height,
-            )
-
-            if args.live:
-                # PLC 实时控制模式: 开 UI, 等用户 Apply Target
-                print('Live view starting — set target in browser and click "Apply Target"')
-                serve_live_view(
-                    payload=None,  # PLC 模式不需要回放数据
-                    host=args.host,
-                    port=args.port,
-                    payload_factory=None,
-                    plc=plc,
-                    ros_source=ros_source,
-                    plc_actuator=plc_actuator,
-                    config=config,
-                    initial_pos=initial_pos,
-                    update_hz=args.hz,
-                    speed=args.speed,
-                    coordinate_transform=coordinate_transform,
-                )
-            else:
-                # PLC 模式非 live: 使用命令行 target 直接运行
-                history, arrival_events = run_pd_control(
-                    source=ros_source,
-                    actuator=plc_actuator,
-                    config=config,
-                    target_pos=target_pos,
-                    initial_state=crane0,
-                    verbose=True,
-                    is_simulation=False,
-                )
-                viz = CraneVisualizer(config)
-                viz.plot(history, arrival_events)
-                viz.plot_operation_diagram(
-                    history=history,
-                    phase_boundaries=arrival_events,
-                    target_pos=target_pos,
-                    initial_pos=initial_pos,
-                )
-        finally:
-            plc.disconnect()
+    if args.live:
+        _run_live_mode(args, config, coordinate_transform, map_target_pos)
         return
 
-    # ---- 仿真模式 ----
+    plc_ip = _effective_plc_ip(args)
+    # ---- PLC 模式 (batch) ----
+    if plc_ip:
+        args.plc_ip = plc_ip
+        plc = None
+        try:
+            plc, ros_source, plc_actuator, initial_pos, target_pos, crane0 = _setup_plc_runtime(
+                args, config, coordinate_transform, map_target_pos,
+            )
+            history, arrival_events = run_pd_control(
+                source=ros_source,
+                actuator=plc_actuator,
+                config=config,
+                target_pos=target_pos,
+                initial_state=crane0,
+                verbose=True,
+                is_simulation=False,
+            )
+            viz = CraneVisualizer(config)
+            viz.plot(history, arrival_events)
+            viz.plot_operation_diagram(
+                history=history,
+                phase_boundaries=arrival_events,
+                target_pos=target_pos,
+                initial_pos=initial_pos,
+            )
+        finally:
+            if plc is not None:
+                plc.disconnect()
+        return
+
+    # ---- 仿真模式 (batch) ----
     target_pos = config.validate_target(map_target_pos)
     history, arrival_events = run_simulation(
         target_pos=target_pos,
@@ -342,50 +537,6 @@ def main(argv=None):
         target_pos=target_pos,
         initial_pos=initial_pos,
     )
-
-    if args.live:
-        # 仿真回放模式: 直接回放已完成的仿真
-        _state = {'target': target_pos, 'initial': initial_pos}
-
-        def live_payload_for_query(query: dict[str, list[str]]):
-            if not query:
-                return payload
-            start_pos = _state['target']
-            requested_target = _target_from_query(query, _state['target'])
-            live_history, live_events = run_simulation(
-                target_pos=requested_target,
-                initial_state=CraneState(x0=start_pos[0], y0=start_pos[1], z0=start_pos[2]),
-                config=config,
-                verbose=False,
-            )
-            _state['initial'] = start_pos
-            _state['target'] = requested_target
-            return build_live_payload(
-                history=live_history,
-                phase_boundaries=live_events,
-                target_pos=requested_target,
-                initial_pos=start_pos,
-                config=config,
-                update_hz=args.hz,
-                speed=args.speed,
-            )
-
-        payload = build_live_payload(
-            history=history,
-            phase_boundaries=arrival_events,
-            target_pos=target_pos,
-            initial_pos=initial_pos,
-            config=config,
-            update_hz=args.hz,
-            speed=args.speed,
-        )
-        serve_live_view(
-            payload,
-            host=args.host,
-            port=args.port,
-            payload_factory=live_payload_for_query,
-            plc=None,
-        )
 
 
 if __name__ == '__main__':

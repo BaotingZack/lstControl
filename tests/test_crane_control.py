@@ -2,6 +2,7 @@ import pytest
 
 from crane_model import CraneConfig, CraneState
 from live_server import build_live_payload, render_live_html, _build_planned_route
+from live_ptp_html import render_ptp_html
 from main import run_simulation
 from pd_controller import PositionPDController
 from visualizer import CraneVisualizer
@@ -195,6 +196,23 @@ def test_browser_live_html_contains_canvas_bootstrap():
     assert "mapZByIndex" in html
     assert "drawZReferenceLines" in html
     assert "transportXYFrames" in html
+
+
+def test_browser_ptp_html_target_only():
+    html = render_ptp_html(plc_mode=True)
+
+    assert '/ptp/sim' in html or 'data-sub="sim"' in html
+    assert '/api/start-goto' in html
+    assert 'UI_MODE' not in html
+    assert 'Pick Position' not in html
+    assert 'id="targetX"' in html
+    assert 'id="targetY"' in html
+    assert 'id="targetZ"' in html
+    assert 'id="targetCoord"' not in html
+    assert 'function animate(ts)' in html
+    assert 'else if (els.targetX)' in html
+    assert 'Full Operation / 完整作业' not in html
+    assert 'Coordinate Calibration' not in html
 
 
 def test_build_planned_route_matches_scheduler_waypoints(default_config):

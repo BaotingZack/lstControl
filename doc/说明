@@ -1,0 +1,80 @@
+# 浏览器控制页启动说明
+
+## 最简启动
+
+```powershell
+cd d:\lstControl
+python main.py
+```
+
+默认会：
+
+- 打开浏览器控制页（终端里打印 `/ptp/sim`、`/ptp/live` 地址）
+- 尝试连接 PLC **`192.168.0.1`**；连不上仍可用 **仿真子页**
+- 根路径 `/` 会跳到 `/ptp/sim`
+
+仅仿真、不连 PLC：`python main.py --no-plc`  
+只跑命令行、不开网页：`python main.py --no-live`
+
+## 文件结构（已拆分）
+
+| 文件 | 作用 |
+|------|------|
+| `live_server.py` | HTTP 服务、`/api/start-control`、`/api/start-goto` 等 API |
+| `live_operation_html.py` | **完整作业页**（起始 + 卸货 + 调度） |
+| `live_ptp_html.py` | **点对点页**（仿真 / 真机两个子页） |
+| `live_view_shared.py` | 两页共用的 CSS + 画布绘制脚本 |
+
+## 1. 一次启动，两个点对点子页
+
+**同一条命令** 起 HTTP 服务；仿真回放与真机控制在**不同 URL**，可各开一个浏览器标签同时调。
+
+### 仅仿真
+
+```powershell
+cd d:\lstControl
+python main.py --live
+```
+
+### 仿真 + 真机（推荐联调）
+
+```powershell
+python main.py --plc-ip 192.168.0.1 --live --allow-mock-plc
+```
+
+把 IP 换成你的 PLC；真机请去掉 `--allow-mock-plc`。
+
+启动后终端会打印：
+
+| 页面 | URL | 说明 |
+|------|-----|------|
+| **点对点 · 仿真** | `http://127.0.0.1:8000/ptp/sim` | 本地 PD 回放，改 X/Y/Z 后点「移动到目标」 |
+| **点对点 · 真机** | `http://127.0.0.1:8000/ptp/live` | 定位 + `/api/start-goto`（需 `--plc-ip`） |
+| **完整作业** | `http://127.0.0.1:8000/operation` | Pick + Place 调度（真机需 PLC） |
+
+访问 `/` 会自动跳到 `/ptp/sim`。页顶 **Sim / 仿真**、**Live / 真机** 可切换子页。
+
+无 PLC 时仍可开 `/ptp/live` 看界面，但点开始会 API 报错；真机页需带 `--plc-ip` 启动。
+
+## 2. 常用参数
+
+- `--host 0.0.0.0` — 局域网其他电脑也能打开页面
+- `--port 8000` — 端口（占用时会自动换端口，以终端打印为准）
+- `--target-x / --target-y / --target-z` — 仿真子页默认目标（默认 8, 6, 1.5）
+
+## 3. 操作要点
+
+**`/ptp/sim`**
+
+1. 填目标 X / Y / Z
+2. 「Go to Target / 移动到目标」→ 重算轨迹并回放
+
+**`/ptp/live`**
+
+1. Localization 有数据后再动
+2. 填目标 X / Y / Z → 「移动到目标」→ `run_pd_control`
+3. 急停：Control 页 **STOP ALL**
+
+**`/operation`**
+
+1. 填 Pick + Place → 「Start Operation / 开始作业」

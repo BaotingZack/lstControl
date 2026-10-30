@@ -325,6 +325,50 @@ class CraneConfig:
     # 远离目标方向的速度指令（速度伺服型行车"刹车"=指令归零而非反向脉冲）。
     reverse_guard_tol: float = 0.10    # 原 0.05; 扩大以减少目标附近反向脉冲→抓钩摆动
 
+    # --- 摆角闭环防摇 (倾角仪 θ → Δv=+K·θ, 叠加在 PD 速度指令上) ---
+    # 参考 CraneRemote 的比例纠偏 + dev_incl 能量阻尼形式; PTP 页可切换开/关。
+    enable_anti_sway: bool = False
+    anti_sway_travel_damping: bool = False   # True=全程叠加 (易受加减速假倾角影响)
+    anti_sway_approach_damping: bool = True  # 目标 approach_pos 内叠加 (推荐)
+    anti_sway_approach_pos: float = 0.40     # [m]
+    anti_sway_sway_gain: float = 2.6         # [m/s per rad]
+    anti_sway_max_correction: float = 0.2    # [m/s] per axis
+    rope_length_sheave_height: float = 4.0
+    rope_length_grab_offset: float = 0.0
+    rope_length_cable_stretch: float = 0.0
+    rope_length_min: float = 0.5
+    anti_sway_gain_schedule: tuple = ()
+    # off | incl | gantry | overhead (LQR)
+    anti_sway_mode: str = 'off'
+    anti_sway_gantry_kp: float = 0.9
+    anti_sway_gantry_kd: float = 0.45
+    anti_sway_gantry_deadband_deg: float = 1.0
+    anti_sway_gantry_max_correction: float = 0.2
+    anti_sway_gantry_omega_tau: float = 0.03
+    # overhead | 单摆 LQR (OverheadCraneSwayControl)
+    anti_sway_overhead_load_mass: float = 5.0
+    anti_sway_overhead_trolley_mass: float = 250.0
+    anti_sway_overhead_q_pos: float = 1.0
+    anti_sway_overhead_q_vel: float = 1.0
+    anti_sway_overhead_q_theta: float = 1.0e7
+    anti_sway_overhead_q_omega: float = 1.0e7
+    anti_sway_overhead_r_force: float = 1.0
+    anti_sway_overhead_force_to_vel: float | None = None
+    anti_sway_overhead_deadband_deg: float = 1.0
+    anti_sway_overhead_max_correction: float = 0.2
+    anti_sway_overhead_omega_tau: float = 0.03
+    anti_sway_baseline_gain: float = 0.85
+    anti_sway_baseline_max_correction: float = 0.15
+    anti_sway_baseline_deadband_deg: float = 0.15
+    anti_sway_crane_remote_kp: float = 2.6
+    anti_sway_crane_remote_max_correction: float = 0.2
+    anti_sway_crane_remote_deadband_deg: float = 0.8
+    anti_sway_crane_remote_omega_tau: float = 0.03
+    anti_sway_crane_remote_zc_min_deg: float = 0.4
+    anti_sway_crane_remote_zc_step_velocity: float = 0.06
+    anti_sway_crane_remote_zc_release_ratio: float = 0.88
+    anti_sway_input_shape_zeta: float = 0.01
+
     # --- 可选机械工作区 ---
     # 现场行程因设备而异，X/Y 不提供虚假的默认范围；PLC 部署时应显式配置。
     # 坐标零点由现场约定；未配置 workspace_z_bounds 时不擅自限制 Z 的正负。
@@ -690,11 +734,17 @@ def run_pd_control(
     max_time: float | None = 180.0,
     verbose: bool = True,
     is_simulation: bool = True,
+    sway_source: object | None = None,
+    profile: str = 'goto',
+    settle_theta_tol_rad: float | None = None,
+    settle_hold_cycles: int = 25,
 ) -> tuple[list[dict], list[tuple[float, str]]]:
     """统一 PD 位置控制循环 — 仿真和 PLC 模式共用。
 
     控制律:
-      v_cmd = Kp * (target - measured) - Kd * filtered_velocity
+      v_cmd = Kp * (target - measured) - Kd * filtered_velocity [+ Δv 防摇]
+
+    防摇 (可选): v_xy += K(L)·θ, θ 来自 sway_source.get_sway() (倾角仪或仿真摆)。
 
     仿真模式: SimPositionSource (100 Hz 非阻塞) + PlantActuator
     PLC 模式: RosPositionSource (10 Hz 阻塞) + PlcActuator
@@ -858,9 +908,30 @@ def run_pd_control(
     if hasattr(actuator, 'set_z_target'):
         actuator.set_z_target(target_z)
 
+    from anti_sway import build_strategy
+    from anti_sway.base import AntiSwayStepContext
+    from anti_sway.registry import OPEN_LOOP_ANTI_SWAY_MODES
+
+    anti_sway_strategy = None
+    mode = getattr(config, 'anti_sway_mode', 'off')
+    open_loop = mode in OPEN_LOOP_ANTI_SWAY_MODES
+    if config.enable_anti_sway and (sway_source is not None or open_loop):
+        anti_sway_strategy = build_strategy(config)
+        if anti_sway_strategy is None:
+            if verbose:
+                print('[防摇] 模式已开但策略未构建 (增益为 0 或未知 mode), 按纯 PD 运行')
+        elif verbose:
+            anti_sway_strategy.log_startup(verbose=verbose)
+    elif config.enable_anti_sway and verbose:
+        print('[防摇] 无 sway_source, 按纯 PD 运行')
+
     completed = False
+    settle_profile = profile == 'settle'
+    settle_streak = 0
+    if settle_profile and settle_theta_tol_rad is None:
+        settle_theta_tol_rad = math.radians(0.3)
     try:
-        while not all(locked.values()):
+        while settle_profile or not all(locked.values()):
             # --- 检查钩子中断 ---
             if hooks is not None and hooks.should_stop():
                 raise ControlStoppedError(f'{mode_label} control stopped by external request')
@@ -955,6 +1026,35 @@ def run_pd_control(
             vy_cmd = 0.0 if locked['y'] else controllers['y'].update(target_y, y_measured, vy_damp, dt)
             vz_cmd = 0.0 if locked['z'] else controllers['z'].update(target_z, z_measured, vz_damp, dt)
 
+            antisway_dvx = antisway_dvy = 0.0
+            theta_x = theta_y = None
+            if sway_source is not None and hasattr(sway_source, 'get_sway'):
+                sway = sway_source.get_sway()
+                if sway is not None:
+                    theta_x = float(sway['theta_x'])
+                    theta_y = float(sway['theta_y'])
+            if anti_sway_strategy is not None:
+                needs_theta = getattr(
+                    anti_sway_strategy, 'requires_sway_feedback', True,
+                )
+                if needs_theta and (theta_x is None or theta_y is None):
+                    pass
+                else:
+                    dist_xy = math.hypot(target_x - x_measured, target_y - y_measured)
+                    ctx = AntiSwayStepContext(
+                        theta_x=float(theta_x or 0.0),
+                        theta_y=float(theta_y or 0.0),
+                        dt=dt,
+                        z_grab=z_measured,
+                        dist_xy=dist_xy,
+                        locked_x=locked['x'],
+                        locked_y=locked['y'],
+                        config=config,
+                    )
+                    corr = anti_sway_strategy.correct_xy(vx_cmd, vy_cmd, ctx)
+                    vx_cmd, vy_cmd = corr.vx_cmd, corr.vy_cmd
+                    antisway_dvx, antisway_dvy = corr.dvx, corr.dvy
+
             # Z 目标附近的微调门控 (仅 PLC 模式)。抓钩高度反馈带滞后 (S7 轮询/PLC
             # 扫描, 抖动期间还会沿用旧读数), 在最后几厘米里若继续按"仍在变化的读数"
             # 去修高度设定值, 等于追一个过时的误差: 误差符号来回翻, 设定值跟着来回
@@ -1007,33 +1107,43 @@ def run_pd_control(
                         getattr(crane, axis_name).velocity = filtered_velocity
                 disturbance_x = disturbance_y = disturbance_z = 0.0
 
-            # --- STEP 5: 到达检测 ---
-            axis_data = [
-                ('x', crane.x, target_x, vx_cmd),
-                ('y', crane.y, target_y, vy_cmd),
-                ('z', crane.z, target_z, vz_cmd),
-            ]
-            for name, axis, target, cmd in axis_data:
-                if locked[name]:
-                    continue
-                in_capture_window = abs(axis.position - target) < capture_pos_tol[name]
-                command_settled = abs(cmd) < config.arrival_cmd_tol
-                velocity_settled = abs(axis.velocity) < velocity_deadband[name]
-                arrived_now = (
-                    _axis_arrived(
-                        axis, target, config, arrival_vel_tol[name], arrival_pos_tol[name]
-                    )
-                    or (in_capture_window and command_settled and velocity_settled)
+            if (
+                sway_source is not None
+                and hasattr(sway_source, 'advance')
+                and is_simulation
+            ):
+                sway_source.advance(
+                    dt, crane.x.velocity, crane.y.velocity, z_measured,
                 )
-                # 去抖: 连续满足才累加, 一旦有一帧不满足立即清零。
-                arrival_streak[name] = arrival_streak[name] + 1 if arrived_now else 0
-                if arrival_streak[name] >= config.arrival_debounce_cycles:
-                    axis.position = target
-                    axis.velocity = 0.0
-                    locked[name] = True
-                    arrival_events.append((t, name))
-                    if hooks is not None:
-                        hooks.on_arrival(name, t)
+
+            # --- STEP 5: 到达检测 ---
+            if not settle_profile:
+                axis_data = [
+                    ('x', crane.x, target_x, vx_cmd),
+                    ('y', crane.y, target_y, vy_cmd),
+                    ('z', crane.z, target_z, vz_cmd),
+                ]
+                for name, axis, target, cmd in axis_data:
+                    if locked[name]:
+                        continue
+                    in_capture_window = abs(axis.position - target) < capture_pos_tol[name]
+                    command_settled = abs(cmd) < config.arrival_cmd_tol
+                    velocity_settled = abs(axis.velocity) < velocity_deadband[name]
+                    arrived_now = (
+                        _axis_arrived(
+                            axis, target, config, arrival_vel_tol[name], arrival_pos_tol[name]
+                        )
+                        or (in_capture_window and command_settled and velocity_settled)
+                    )
+                    # 去抖: 连续满足才累加, 一旦有一帧不满足立即清零。
+                    arrival_streak[name] = arrival_streak[name] + 1 if arrived_now else 0
+                    if arrival_streak[name] >= config.arrival_debounce_cycles:
+                        axis.position = target
+                        axis.velocity = 0.0
+                        locked[name] = True
+                        arrival_events.append((t, name))
+                        if hooks is not None:
+                            hooks.on_arrival(name, t)
 
             # --- STEP 6: 记录历史 ---
             step_data = {
@@ -1047,11 +1157,24 @@ def run_pd_control(
                 'vx_raw': vx_raw, 'vy_raw': vy_raw, 'vz_raw': vz_raw,
                 'vx_filtered': vx_filtered, 'vy_filtered': vy_filtered, 'vz_filtered': vz_filtered,
                 'disturbance_x': disturbance_x, 'disturbance_y': disturbance_y, 'disturbance_z': disturbance_z,
+                'antisway_dvx': antisway_dvx, 'antisway_dvy': antisway_dvy,
+                'anti_sway_mode': getattr(config, 'anti_sway_mode', 'off'),
+                'theta_x': theta_x, 'theta_y': theta_y,
             }
             history.append(step_data)
 
             if hooks is not None:
                 hooks.on_step(step_data)
+
+            if settle_profile and theta_x is not None and theta_y is not None:
+                peak = max(abs(theta_x), abs(theta_y))
+                if peak < settle_theta_tol_rad:
+                    settle_streak += 1
+                else:
+                    settle_streak = 0
+                if settle_streak >= settle_hold_cycles:
+                    completed = True
+                    break
 
         completed = True
         if verbose:

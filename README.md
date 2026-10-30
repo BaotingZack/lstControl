@@ -217,35 +217,41 @@ v_cmd = Kp * (target_position - measured_position) - Kd * damping_velocity
 
 ## 运行模式
 
-通过 `--plc-ip` 自动切换：
+| 命令 | 作用 |
+|------|------|
+| **`python3 main.py`** | **默认**：开浏览器（`/ptp/sim` + `/ptp/live`），并尝试连接 PLC **192.168.0.1** |
+| `python3 main.py --no-plc` | 只开浏览器仿真子页，不连 PLC |
+| `python3 main.py --no-live` | 不开网页，命令行跑完并保存曲线图 |
 
-| 命令 | 模式 | 位置来源 | 执行 | 交互 |
-|------|------|----------|------|------|
-| `python3 main.py` | 实验室仿真 | 仿真对象模型 (100Hz) | 仿真对象 | 命令行 target → 自动运行 → 回放 |
-| `python3 main.py --plc-ip 192.168.0.1 --live` | PLC 控制 | ROS `/localization_pose` (10Hz) | `ctypes` → Snap7 → 西门子 S7 PLC | 开 UI → 实时定位 → Apply Target → 实时控制 |
+浏览器地址见终端打印；`/ptp/sim` 为仿真回放，`/ptp/live` 为真机 PD（需 PLC 与定位正常）。点到点页可在 **纯 PD / 防摇 K·θ / 防摇 Gantry PD** 三种模式间切换对比摆角（说明见 [`doc/ptp_anti_sway.md`](doc/ptp_anti_sway.md)）。
 
-### 实验室仿真（默认）
-
-```bash
-python3 main.py --target-x 10 --target-y 5 --target-z 2 --live
-```
-
-不指定 `--plc-ip`，位置反馈来自仿真对象（含伺服滞后、扰动、测量噪声）。`--live` 时浏览器回放已完成的仿真。
-
-### 真实 PLC 控制
+### 日常联调（默认）
 
 ```bash
-python3 main.py --plc-ip 192.168.0.1 --live
+python3 main.py
 ```
 
-指定 `--plc-ip` 后：
-1. 连接 PLC → 启动心跳 → 订阅 ROS `/localization_pose`
-2. 等待首次定位数据获取初始位置
-3. 启动浏览器 UI，实时显示定位数据
-4. 用户输入 Target → 点击 **Apply Target** 开始 PD 控制
-5. 控制过程中浏览器以 10Hz 轮询位置/速度/指令（SSE 保留为诊断通道）
+### 仅仿真 UI、不连 PLC
 
-> ARM aarch64 + ROS Noetic 环境才能加载 `libsscarctrl.so`。加载失败时程序默认拒绝进入 PLC 控制；开发机只有显式传入 `--allow-mock-plc` 才会使用 MockPLC。
+```bash
+python3 main.py --no-plc
+```
+
+### 命令行批量仿真（不开网页）
+
+```bash
+python3 main.py --no-live --no-plc --target-x 10 --target-y 5 --target-z 2
+```
+
+### 真实 PLC 控制（旧写法仍可用）
+
+```bash
+python3 main.py --plc-ip 192.168.0.1
+```
+
+与默认 `python3 main.py` 相同（默认 IP 已是 192.168.0.1）。流程：连接 PLC → ROS 定位 → 浏览器 **`/ptp/live`** 填目标并「移动到目标」。
+
+> ARM aarch64 + ROS Noetic 环境才能加载 `libsscarctrl.so`。加载失败时 `/ptp/live` 不可用，仍可用 **`/ptp/sim`**；开发机可加 `--allow-mock-plc` 使用 MockPLC。
 
 ### 通信边界：ROS 反馈，Snap7 控制
 
@@ -275,12 +281,13 @@ ROS /localization_pose ──► RosPositionSource ──► PD 控制循环
 | `--target-x` | `8.0` | X 大车目标位置 (m)（仿真模式） |
 | `--target-y` | `6.0` | Y 小车目标位置 (m)（仿真模式） |
 | `--target-z` | `1.5` | Z 吊钩目标高度 (m)（仿真模式） |
-| `--live` | 关闭 | 启动浏览器实时回放（仿真）或实时控制（PLC） |
+| `--live` / `--no-live` | **开启** | 默认开浏览器；`--no-live` 仅命令行批量运行 |
 | `--hz` | `10.0` | 显示刷新率 (Hz) |
-| `--speed` | `1.0` | 回放速度倍率（仅仿真模式） |
+| `--speed` | `1.0` | 回放速度倍率（仿真子页） |
 | `--host` | `127.0.0.1` | Web 服务器地址 |
 | `--port` | `8000` | Web 服务器端口（占用时自动切换） |
-| `--plc-ip` | 空 | PLC IP 地址（空 = 仿真；指定 IP = PLC 模式） |
+| `--plc-ip` | **`192.168.0.1`** | PLC IP；`--no-plc` 或 `--plc-ip ""` 跳过连接 |
+| `--no-plc` | 关闭 | 不连接 PLC（仅 `/ptp/sim` 等仿真能力） |
 | `--plc-lib` | `plc_lib/lib/libsscarctrl.so` | PLC 库路径 |
 | `--allow-mock-plc` | 关闭 | 显式允许 PLC 库加载失败时使用 MockPLC |
 | `--map-to-crane-origin-x` | `0.0` | 起重机原点在 SLAM 地图中的 X 坐标 (m) |
@@ -416,27 +423,27 @@ PLC 模式下 Apply Target 启动 PD 后，画布会记录起点→目标的运�
 
 ## 代码结构
 
+目录规范见 **[doc/PROJECT_LAYOUT.md](doc/PROJECT_LAYOUT.md)**。摘要：
+
 ```text
-main.py                仿真入口、CLI 参数、工厂函数
-crane_model.py         三轴状态、配置、PositionSource/Actuator 接口、
-                       仿真实现、统一 run_pd_control()
-pd_controller.py       位置目标到速度指令的 PD 控制器
-velocity_filter.py     位置差分 + 低通滤波估计速度
-visualizer.py          静态控制曲线和作业示意图 (matplotlib)
-live_server.py         浏览器 live view (HTTP + SSE + 内嵌 HTML/JS)
-                       支持仿真回放、PLC 实时控制和坐标标定页
-coordinate_transform.py SLAM map ↔ 起重机坐标三维刚体变换
-calibration.py         根据两段三维轨道移动估计原点、roll/pitch/yaw 和质量指标
-plc_interface.py       PLC 接口 (MockPLC / RealPLC / PlcActuator)
-ros_bridge.py          ROS 桥接 (订阅 /localization_pose + RosPositionSource)
-plc_lib/               C++ PLC 控制库
-  demo.cpp              PLC 控制 demo
-  lib/
-    ss_car_control.h     PLC API 头文件
-    libsscarctrl.so      ARM 发布版
-    libsnap7.so          Snap7 (Siemens S7 协议)
-tests/                 pytest 回归测试
+main.py                仿真入口、CLI、Live 启动
+crane_model.py         三轴模型、run_pd_control()、CraneConfig
+settle_control.py      消摆测试封装 (profile=settle)
+anti_sway/             可插拔 PTP 防摇 + 消摆算法 (registry)
+web/                   Live HTTP 服务与 PTP/消摆/标定页面（推荐 import web.*）
+site_config.json       现场倾角仪与防摇参数
+plc_interface.py       MockPLC / RealPLC / PlcActuator
+ros_bridge.py          ROS 定位与倾角
+operation_scheduler.py 取放货调度
+coordinate_transform.py  地图 ↔ 起重机坐标
+calibration.py         标定 API
+doc/                   设计文档 (含 ptp_anti_sway.md)
+tests/                 pytest
+tools/                 一次性 HTML 维护脚本
+防摇方案/               外部参考工程（只读）
 ```
+
+根目录 `live_*.py`、`sway_*.py` 为**兼容 shim**，新代码请用 `web.*` / `anti_sway.*`。
 
 `motion_planner.py` 和 `s_curve.py` 是旧阶段式/S 曲线代码，主流程不再使用。
 

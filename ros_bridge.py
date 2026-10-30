@@ -16,6 +16,7 @@ import time
 from typing import Any, Callable
 
 from coordinate_transform import CoordinateTransform2D
+from anti_sway.estimator import InclinometerSwayEstimator, SwayAxisMapping
 
 
 # ---- raw pose accessor (thread-safe, non-blocking) ----
@@ -106,6 +107,128 @@ def is_gripper_clamped() -> bool | None:
     return None  # ambiguous value
 
 
+# ---- sway sensor: /inclination/j1939_msg (thread-safe) ----
+
+_latest_inclination: dict[str, Any] | None = None
+_sway_lock = threading.Lock()
+_sway_estimator: InclinometerSwayEstimator | None = None
+_sway_has_data = False
+_last_inclination_wall: float | None = None
+
+
+def _deserialize_any(msg: Any) -> Any | None:
+    """Deserialize rospy.AnyMsg using connection header type string."""
+    try:
+        from roslib.message import get_message_class
+    except ImportError:
+        return None
+    header = getattr(msg, '_connection_header', None) or {}
+    msg_type = header.get('type')
+    if not msg_type:
+        return None
+    klass = get_message_class(msg_type)
+    if klass is None and '/' in msg_type:
+        pkg, _, tname = msg_type.partition('/')
+        try:
+            mod = __import__(f'{pkg}.msg', fromlist=[tname])
+            klass = getattr(mod, tname, None)
+        except Exception:
+            klass = None
+    if klass is None:
+        return None
+    try:
+        real = klass()
+        real.deserialize(getattr(msg, '_buff', b''))
+        return real
+    except Exception:
+        return None
+
+
+def _inclination_callback(msg: Any) -> None:
+    global _latest_inclination, _sway_has_data, _last_inclination_wall
+    real = _deserialize_any(msg)
+    if real is None:
+        return
+    vec = getattr(real, 'vector', None)
+    roll = getattr(vec, 'x', None) if vec is not None else getattr(real, 'roll', None)
+    pitch = getattr(vec, 'y', None) if vec is not None else getattr(real, 'pitch', None)
+    if roll is None and pitch is None:
+        return
+    with _sway_lock:
+        _latest_inclination = {'roll': roll, 'pitch': pitch}
+        _last_inclination_wall = time.monotonic()
+        _sway_has_data = True
+
+
+def get_inclination_raw() -> dict[str, float] | None:
+    """Return latest inclinometer roll/pitch (same units as ROS message)."""
+    with _sway_lock:
+        if not _sway_has_data or _latest_inclination is None:
+            return None
+        return dict(_latest_inclination)
+
+
+def get_sway_state() -> dict[str, Any] | None:
+    """Return {theta_x, theta_y} in rad, or None if stale / unavailable."""
+    with _sway_lock:
+        if _sway_estimator is None or not _sway_has_data or _last_inclination_wall is None:
+            return None
+        if time.monotonic() - _last_inclination_wall > 1.0:
+            return None
+        inc = _latest_inclination or {}
+        gripper_closed = is_gripper_clamped()
+        return _sway_estimator.estimate(
+            inc.get('roll'), inc.get('pitch'), gripper_closed=gripper_closed,
+        )
+
+
+def get_sway_snapshot(*, stale_after_s: float = 1.0) -> dict[str, Any]:
+    """UI snapshot: raw roll/pitch + compensated sway angles in degrees."""
+    with _sway_lock:
+        if not _sway_has_data or _latest_inclination is None or _last_inclination_wall is None:
+            return {'valid': False, 'stale': True}
+        age_s = time.monotonic() - _last_inclination_wall
+        raw = dict(_latest_inclination)
+        stale = age_s > stale_after_s
+        sway = None
+        if _sway_estimator is not None and not stale:
+            gripper_closed = is_gripper_clamped()
+            sway = _sway_estimator.estimate(
+                raw.get('roll'), raw.get('pitch'), gripper_closed=gripper_closed,
+            )
+    if stale:
+        return {
+            'valid': False,
+            'stale': True,
+            'age_ms': round(age_s * 1000.0),
+            'roll': raw.get('roll'),
+            'pitch': raw.get('pitch'),
+        }
+    theta_x = float(sway['theta_x']) if sway else 0.0
+    theta_y = float(sway['theta_y']) if sway else 0.0
+    theta_x_deg = math.degrees(theta_x)
+    theta_y_deg = math.degrees(theta_y)
+    return {
+        'valid': True,
+        'stale': False,
+        'age_ms': round(age_s * 1000.0),
+        'roll': raw.get('roll'),
+        'pitch': raw.get('pitch'),
+        'theta_x': theta_x,
+        'theta_y': theta_y,
+        'theta_x_deg': theta_x_deg,
+        'theta_y_deg': theta_y_deg,
+        'theta_peak_deg': max(abs(theta_x_deg), abs(theta_y_deg)),
+    }
+
+
+class SwaySensorSource:
+    """Read inclinometer sway for run_pd_control (same interface as SimSwayFeedback)."""
+
+    def get_sway(self) -> dict[str, Any] | None:
+        return get_sway_state()
+
+
 def _ros_spin() -> None:
     """Blocking ROS 1 spin loop — runs in a daemon thread."""
     try:
@@ -146,15 +269,43 @@ def _ros_spin() -> None:
             print(f'[ros_bridge] Failed to subscribe to /crane/cmd_vel/anguler: {exc}')
             print('[ros_bridge] Gripper status via ROS will be unavailable')
 
+    try:
+        rospy.Subscriber('/inclination/j1939_msg', rospy.AnyMsg, _inclination_callback)
+        print('[ros_bridge] Subscribed to /inclination/j1939_msg (AnyMsg)')
+    except Exception as exc:
+        print(f'[ros_bridge] Failed to subscribe to /inclination/j1939_msg: {exc}')
+        print('[ros_bridge] Sway sensing will be unavailable')
+
     rospy.spin()
 
 
-def start_ros_bridge() -> None:
-    """Start the ROS 1 subscriber in a daemon thread. Safe to call multiple times."""
-    global _node_started
+def start_ros_bridge(
+    angle_scale: float = 1.0,
+    roll_bias: float = 0.0,
+    pitch_bias: float = 0.0,
+    axis_mapping: SwayAxisMapping | None = None,
+    *,
+    roll_bias_closed: float | None = None,
+    pitch_bias_closed: float | None = None,
+) -> None:
+    """Start ROS subscribers in a daemon thread (safe to call once).
+
+    angle_scale: raw inclinometer → rad (use math.pi/180 when values are degrees).
+    """
+    global _node_started, _sway_estimator
     if _node_started:
         return
     _node_started = True
+    with _sway_lock:
+        if _sway_estimator is None:
+            _sway_estimator = InclinometerSwayEstimator(
+                mapping=axis_mapping,
+                angle_scale=angle_scale,
+                roll_bias=roll_bias,
+                pitch_bias=pitch_bias,
+                roll_bias_closed=roll_bias_closed,
+                pitch_bias_closed=pitch_bias_closed,
+            )
     thread = threading.Thread(target=_ros_spin, name='ros-bridge', daemon=True)
     thread.start()
 
