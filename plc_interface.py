@@ -19,10 +19,45 @@ from __future__ import annotations
 
 import ctypes
 import math
+import os
+import sys
 import threading
 import time
+from pathlib import Path
 
 from crane_model import CraneState
+
+_DEFAULT_PLC_LIB_DIR = Path(__file__).resolve().parent / 'plc_lib' / 'lib'
+
+
+def _ld_library_path_entries() -> list[str]:
+    return [p for p in os.environ.get('LD_LIBRARY_PATH', '').split(':') if p]
+
+
+def ensure_plc_library_path() -> None:
+    """Prepend plc_lib/lib to LD_LIBRARY_PATH (Linux requires re-exec to take effect)."""
+    if not _DEFAULT_PLC_LIB_DIR.is_dir():
+        return
+    lib_dir = str(_DEFAULT_PLC_LIB_DIR)
+    if lib_dir in _ld_library_path_entries():
+        return
+    prev = os.environ.get('LD_LIBRARY_PATH', '')
+    os.environ['LD_LIBRARY_PATH'] = f'{lib_dir}:{prev}' if prev else lib_dir
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def _load_ctypes_library(lib_path: str) -> ctypes.CDLL:
+    """Load libsscarctrl.so; retry after fixing LD_LIBRARY_PATH for libsnap7.so."""
+    resolved = Path(lib_path).expanduser().resolve()
+    if not resolved.is_file():
+        raise OSError(f'Cannot load PLC library (not found): {resolved}')
+    try:
+        return ctypes.CDLL(str(resolved))
+    except OSError as exc:
+        if 'libsnap7' not in str(exc) and 'libsscarctrl' not in str(exc):
+            raise
+        ensure_plc_library_path()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +394,7 @@ class RealPLC(PLCInterface):
     """
 
     def __init__(self, lib_path: str = 'plc_lib/lib/libsscarctrl.so') -> None:
-        self._lib = ctypes.CDLL(lib_path)
+        self._lib = _load_ctypes_library(lib_path)
         self._ip = ctypes.c_char_p(None)
         self._ip_bytes: bytes = b'192.168.0.1'
         self._connected = False
@@ -655,7 +690,7 @@ class PlcActuator:
       高度与指令参考系差几厘米, 需要的修正方向可能与本段行程相反; 完全冻结会
       让实测始终差在到位容差之外, 作业卡到 PD 超时。带内往哪边修正都允许, 幅度
       上限固定; 真正抑制来回换向的是 PD 位置死区的滞环 (见 CraneConfig
-      .arrival_pos_tol_z), 带内修正因此也只会发生在确认性偏差 (>4cm) 上。
+      .arrival_pos_tol_z), 带内修正因此也只会发生在确认性偏差 (>2cm) 上。
     """
 
     _MIN_LIFT_HEIGHT_DEFAULT = 0.35  # [m] 抓钩离地最小安全高度

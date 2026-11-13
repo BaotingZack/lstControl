@@ -47,6 +47,9 @@ class CoordinateTransform2D:
     origin_map_z: float = 0.0
     crane_roll_rad: float = 0.0
     crane_pitch_rad: float = 0.0
+    # 定位反馈 X/Y 与行车/PLC 坐标系整体相反时, 在 map→crane 之后对 XY 取负
+    # (仅影响 /localization_pose 反馈与由此派生的目标/展示, 不替代逐轴 drive invert)。
+    localization_negate_xy: bool = False
 
     def __post_init__(self) -> None:
         values = (
@@ -142,6 +145,85 @@ class CoordinateTransform2D:
         )
         return self.map_to_crane_vector3(*delta)
 
+    def _localization_negate_crane_xy(
+        self,
+        crane_x: float,
+        crane_y: float,
+    ) -> tuple[float, float]:
+        if self.localization_negate_xy:
+            return -crane_x, -crane_y
+        return crane_x, crane_y
+
+    def localization_map_to_crane_position(
+        self,
+        map_x: float,
+        map_y: float,
+        map_z: float,
+    ) -> Vector3:
+        """Map→crane for /localization_pose feedback (optional XY sign fix)."""
+        crane_x, crane_y, crane_z = self.map_to_crane_position(map_x, map_y, map_z)
+        crane_x, crane_y = self._localization_negate_crane_xy(crane_x, crane_y)
+        return crane_x, crane_y, crane_z
+
+    def localization_map_to_crane_vector(
+        self,
+        map_vx: float,
+        map_vy: float,
+    ) -> tuple[float, float]:
+        crane_vx, crane_vy = self.map_to_crane_vector(map_vx, map_vy)
+        return self._localization_negate_crane_xy(crane_vx, crane_vy)
+
+    def localization_map_to_crane_vector3(
+        self,
+        map_vx: float,
+        map_vy: float,
+        map_vz: float,
+    ) -> Vector3:
+        crane_vx, crane_vy, crane_vz = self.map_to_crane_vector3(map_vx, map_vy, map_vz)
+        crane_vx, crane_vy = self._localization_negate_crane_xy(crane_vx, crane_vy)
+        return crane_vx, crane_vy, crane_vz
+
+    def localization_crane_to_map_point(
+        self,
+        crane_x: float,
+        crane_y: float,
+    ) -> tuple[float, float]:
+        """Inverse of localization_map_to_crane for XY (control loop → map UI)."""
+        crane_x, crane_y = self._localization_negate_crane_xy(crane_x, crane_y)
+        return self.crane_to_map_point(crane_x, crane_y)
+
+    def localization_crane_to_map_vector(
+        self,
+        crane_vx: float,
+        crane_vy: float,
+    ) -> tuple[float, float]:
+        crane_vx, crane_vy = self._localization_negate_crane_xy(crane_vx, crane_vy)
+        return self.crane_to_map_vector(crane_vx, crane_vy)
+
+    def localization_pose_dict_for_display(self, pose: dict) -> dict:
+        """Map-frame /localization_pose → X Bridge / Y Trolley 读数 (与控制环一致)。"""
+        out = dict(pose)
+        map_z = float(pose['z'])
+        crane_x, crane_y, crane_z = self.localization_map_to_crane_position(
+            float(pose['x']),
+            float(pose['y']),
+            map_z,
+        )
+        out['x'] = crane_x
+        out['y'] = crane_y
+        # Z 常为抓钩实测高度, 不参与 XY 符号修正
+        out['z'] = map_z
+        map_vx = pose.get('vx')
+        map_vy = pose.get('vy')
+        if map_vx is not None and map_vy is not None:
+            crane_vx, crane_vy = self.localization_map_to_crane_vector(
+                float(map_vx),
+                float(map_vy),
+            )
+            out['vx'] = crane_vx
+            out['vy'] = crane_vy
+        return out
+
     def crane_to_map_position(
         self,
         crane_x: float,
@@ -218,11 +300,34 @@ class CoordinateTransform2D:
         z_is_hoist_height=True 时, z_value 就是抓钩离地高度 (物理量), 直接
         原样返回, 不参与旋转/平移; X/Y 仍走标定变换 (假定目标与标定原点
         位于同一地面高度, 与 is_planar 场景下的行为一致)。
+
+        localization_negate_xy=True 时, 对已按 map 表示的目标 XY 做与反馈相同的取负。
         """
         if z_is_hoist_height:
             crane_x, crane_y = self.map_to_crane_point(map_x, map_y)
-            return (crane_x, crane_y, z_value)
-        return self.map_to_crane_position(map_x, map_y, z_value)
+            crane_x, crane_y = self._localization_negate_crane_xy(crane_x, crane_y)
+            return (crane_x, crane_y, float(z_value))
+        crane_x, crane_y, crane_z = self.map_to_crane_position(map_x, map_y, z_value)
+        crane_x, crane_y = self._localization_negate_crane_xy(crane_x, crane_y)
+        return (crane_x, crane_y, crane_z)
+
+    def ui_bridge_target_to_crane(
+        self,
+        bridge_x: float,
+        bridge_y: float,
+        z_value: float,
+        *,
+        z_is_hoist_height: bool = False,
+    ) -> Vector3:
+        """网页 Apply Target: X/Y 与侧栏 Bridge/Trolley 读数同系 (非 SLAM map)。"""
+        if not self.localization_negate_xy:
+            return self.map_to_crane_target(
+                bridge_x, bridge_y, z_value, z_is_hoist_height=z_is_hoist_height,
+            )
+        if z_is_hoist_height:
+            return (float(bridge_x), float(bridge_y), float(z_value))
+        _, _, crane_z = self.map_to_crane_position(bridge_x, bridge_y, z_value)
+        return (float(bridge_x), float(bridge_y), crane_z)
 
     def crane_to_map_display(
         self,
@@ -234,8 +339,9 @@ class CoordinateTransform2D:
     ) -> Vector3:
         """把 crane 坐标转换回网页展示用的坐标 (map_to_crane_target 的逆操作)。"""
         if z_is_hoist_height:
-            map_x, map_y = self.crane_to_map_point(crane_x, crane_y)
+            map_x, map_y = self.localization_crane_to_map_point(crane_x, crane_y)
             return (map_x, map_y, z_value)
+        crane_x, crane_y = self._localization_negate_crane_xy(crane_x, crane_y)
         return self.crane_to_map_position(crane_x, crane_y, z_value)
 
     def control_step_to_map(
@@ -257,20 +363,23 @@ class CoordinateTransform2D:
         ):
             if all(key in crane_step for key in (x_key, y_key, z_key)):
                 if z_is_hoist_height:
-                    map_step[x_key], map_step[y_key] = self.crane_to_map_point(
+                    map_step[x_key], map_step[y_key] = self.localization_crane_to_map_point(
                         crane_step[x_key],
                         crane_step[y_key],
                     )
                 else:
+                    cx, cy = self._localization_negate_crane_xy(
+                        crane_step[x_key], crane_step[y_key],
+                    )
                     map_step[x_key], map_step[y_key], map_step[z_key] = (
                         self.crane_to_map_position(
-                            crane_step[x_key],
-                            crane_step[y_key],
+                            cx,
+                            cy,
                             crane_step[z_key],
                         )
                     )
             elif x_key in crane_step and y_key in crane_step:
-                map_step[x_key], map_step[y_key] = self.crane_to_map_point(
+                map_step[x_key], map_step[y_key] = self.localization_crane_to_map_point(
                     crane_step[x_key],
                     crane_step[y_key],
                 )
@@ -285,7 +394,7 @@ class CoordinateTransform2D:
         ):
             if all(key in crane_step for key in (x_key, y_key, z_key)):
                 if z_is_hoist_height:
-                    map_step[x_key], map_step[y_key] = self.crane_to_map_vector(
+                    map_step[x_key], map_step[y_key] = self.localization_crane_to_map_vector(
                         crane_step[x_key],
                         crane_step[y_key],
                     )

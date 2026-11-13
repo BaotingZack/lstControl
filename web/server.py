@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -47,6 +48,7 @@ from anti_sway.registry import SETTLE_ALGORITHM_IDS
 from site_config import load_site_config
 from web.run_log import (
     MAX_RECORDED_STEPS,
+    auto_save_run_log,
     build_run_log_document,
     default_log_dir,
     save_run_log_file,
@@ -731,7 +733,7 @@ def _parse_control_target(
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f'target_x, target_y, and target_z are required numbers: {exc}') from exc
     transform = coordinate_transform or CoordinateTransform2D.identity()
-    crane_target = transform.map_to_crane_target(
+    crane_target = transform.ui_bridge_target_to_crane(
         map_target_x, map_target_y, map_target_z,
         z_is_hoist_height=z_is_hoist_height,
     )
@@ -769,7 +771,7 @@ def _parse_operation_positions(
                 f'{key_prefix}_x, {key_prefix}_y, and {key_prefix}_z '
                 f'are required numbers: {exc}'
             ) from exc
-        crane_pos = transform.map_to_crane_target(
+        crane_pos = transform.ui_bridge_target_to_crane(
             x, y, z, z_is_hoist_height=z_is_hoist_height,
         )
         return config.validate_target(crane_pos)
@@ -977,6 +979,13 @@ class LiveControlHooks(ControlHooks):
         display_step = self._coordinate_transform.control_step_to_map(
             step_data, z_is_hoist_height=self._z_is_hoist_height,
         )
+        # 侧边栏 X Bridge / Y Trolley 与控制环共用行车坐标 (含 localization 取负)
+        display_step['crane_x'] = step_data['x']
+        display_step['crane_y'] = step_data['y']
+        display_step['crane_z'] = step_data['z']
+        if step_data.get('vx') is not None:
+            display_step['crane_vx'] = step_data['vx']
+            display_step['crane_vy'] = step_data['vy']
         # 写入轮询状态 (主要数据通道)
         if self._control_state is not None:
             self._control_state.set_step(display_step)
@@ -1234,6 +1243,12 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                             pose['z'] = hoist_z
                             last_hoist_z = hoist_z
                             last_hoist_wall = now
+                    transform = getattr(
+                        server,
+                        'coordinate_transform',
+                        None,
+                    ) or CoordinateTransform2D.identity()
+                    pose = transform.localization_pose_dict_for_display(pose)
                     data = json.dumps(pose, ensure_ascii=False)
                     self.wfile.write(f'data: {data}\n\n'.encode('utf-8'))
                     self.wfile.flush()
@@ -1340,7 +1355,7 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             pose_x, pose_y, pose_z = server.config.validate_position(
-                server.coordinate_transform.map_to_crane_position(
+                server.coordinate_transform.localization_map_to_crane_position(
                     pose['x'], pose['y'], pose['z']
                 )
             )
@@ -1457,6 +1472,7 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                 cs.set_error(str(exc))
                 hooks.send_error(str(exc))
             finally:
+                server.persist_run_log(cs)
                 server.release_control_run()
                 print('[Scheduler] Thread exiting')
 
@@ -1548,7 +1564,7 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             pose_x, pose_y, pose_z = server.config.validate_position(
-                server.coordinate_transform.map_to_crane_position(
+                server.coordinate_transform.localization_map_to_crane_position(
                     pose['x'], pose['y'], pose['z']
                 )
             )
@@ -1661,6 +1677,7 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                 cs.set_error(str(exc))
                 hooks.send_error(str(exc))
             finally:
+                server.persist_run_log(cs)
                 server.release_control_run()
                 print('[PD goto] Thread exiting')
 
@@ -1791,6 +1808,7 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                 cs.set_error(str(exc))
                 hooks.send_error(str(exc))
             finally:
+                server.persist_run_log(cs)
                 server.release_control_run()
 
         def _run_live():
@@ -1801,16 +1819,18 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             pose = get_latest_pose()
             if pose is None or ros_source is None or plc_actuator is None:
                 cs.set_error('No localization / PLC for live settle')
+                server.persist_run_log(cs)
                 server.release_control_run()
                 return
             try:
                 px, py, pz = base_config.validate_position(
-                    server.coordinate_transform.map_to_crane_position(
+                    server.coordinate_transform.localization_map_to_crane_position(
                         pose['x'], pose['y'], pose['z']
                     )
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 cs.set_error(f'Invalid localization: {exc}')
+                server.persist_run_log(cs)
                 server.release_control_run()
                 return
             map_pose = dict(pose)
@@ -1847,6 +1867,7 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                 cs.set_error(str(exc))
                 hooks.send_error(str(exc))
             finally:
+                server.persist_run_log(cs)
                 server.release_control_run()
 
         target_fn = _run_sim if use_sim else _run_live
@@ -2247,6 +2268,14 @@ class CraneLiveServer(ThreadingHTTPServer):
         with self._control_run_lock:
             self.control_thread = None
             self._control_run_reserved = False
+
+    def persist_run_log(self, cs: ControlState | None) -> Path | None:
+        """Save completed run JSON under project logs/ (done, stopped, or error)."""
+        return auto_save_run_log(
+            cs,
+            server=self,
+            site=load_site_config(),
+        )
 
 
 def _find_available_port(host: str, preferred_port: int) -> int:

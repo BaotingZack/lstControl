@@ -97,8 +97,14 @@ def _build_arg_parser():
     parser.add_argument('--target-x', type=float, default=8.0, help='target X bridge position')
     parser.add_argument('--target-y', type=float, default=6.0, help='target Y trolley position')
     parser.add_argument('--target-z', type=float, default=1.5, help='target Z hoist position')
-    parser.add_argument('--live', action=argparse.BooleanOptionalAction, default=True,
-                        help='open browser UI (default: on; --no-live for batch-only)')
+    parser.add_argument(
+        '--live', dest='live', action='store_true', default=True,
+        help='open browser UI (default: on)',
+    )
+    parser.add_argument(
+        '--no-live', dest='live', action='store_false',
+        help='batch-only: no browser UI',
+    )
     parser.add_argument('--hz', type=float, default=10.0, help='live display refresh rate in Hz')
     parser.add_argument('--speed', type=float, default=1.0, help='live replay speed multiplier')
     parser.add_argument('--host', default='127.0.0.1', help='live web server host')
@@ -173,7 +179,10 @@ def _config_from_args(args) -> CraneConfig:
 
 
 def _coordinate_transform_from_args(args) -> CoordinateTransform2D:
-    return CoordinateTransform2D.from_degrees(
+    from dataclasses import replace
+
+    site = _load_site_settings(args)
+    transform = CoordinateTransform2D.from_degrees(
         origin_map_x=args.map_to_crane_origin_x,
         origin_map_y=args.map_to_crane_origin_y,
         origin_map_z=args.map_to_crane_origin_z,
@@ -181,6 +190,10 @@ def _coordinate_transform_from_args(args) -> CoordinateTransform2D:
         crane_pitch_deg=args.map_to_crane_pitch_deg,
         crane_x_axis_yaw_deg=args.map_to_crane_yaw_deg,
     )
+    if bool(site.get('localization_negate_xy', False)):
+        transform = replace(transform, localization_negate_xy=True)
+        print('[PLC] Localization feedback: negate XY after map→crane (site_config)')
+    return transform
 
 
 def _connect_plc(args):
@@ -362,10 +375,18 @@ def _start_ros_bridge_from_site(args) -> None:
     )
 
 
+def _plc_axis_sign(*, cli_invert: bool, site: dict, site_key: str) -> float:
+    """+1 normal, -1 when CLI --invert-* or site_config plc_invert_* is true."""
+    if cli_invert or bool(site.get(site_key, False)):
+        return -1.0
+    return 1.0
+
+
 def _setup_plc_runtime(args, config, coordinate_transform, map_target_pos):
     """Connect PLC + ROS bridge; return (plc, ros_source, plc_actuator, initial_pos)."""
     plc = _connect_plc(args)
     _start_ros_bridge_from_site(args)
+    site = _load_site_settings(args)
 
     print('Waiting for /localization_pose...')
     waited = 0.0
@@ -386,7 +407,7 @@ def _setup_plc_runtime(args, config, coordinate_transform, map_target_pos):
     pose = get_latest_pose()
     if pose is not None:
         px, py, pz = config.validate_position(
-            coordinate_transform.map_to_crane_position(
+            coordinate_transform.localization_map_to_crane_position(
                 pose['x'], pose['y'], pose['z']
             )
         )
@@ -417,12 +438,20 @@ def _setup_plc_runtime(args, config, coordinate_transform, map_target_pos):
         use_native_z_velocity=args.use_native_z_velocity,
         lift_height_provider=plc.get_lift_height,
     )
+    big_sign = _plc_axis_sign(cli_invert=args.invert_big_car, site=site, site_key='plc_invert_big_car')
+    small_sign = _plc_axis_sign(cli_invert=args.invert_small_car, site=site, site_key='plc_invert_small_car')
+    lift_sign = _plc_axis_sign(cli_invert=args.invert_lift, site=site, site_key='plc_invert_lift')
+    if big_sign < 0 or small_sign < 0 or lift_sign < 0:
+        print(
+            f'[PLC] Axis sign flip: X={big_sign:+.0f} Y={small_sign:+.0f} Z={lift_sign:+.0f} '
+            f'(CLI invert-* and/or site_config plc_invert_*)'
+        )
     plc_actuator = PlcActuator(
         plc,
         initial_z=crane0.z.position,
-        big_car_sign=-1.0 if args.invert_big_car else 1.0,
-        small_car_sign=-1.0 if args.invert_small_car else 1.0,
-        lift_sign=-1.0 if args.invert_lift else 1.0,
+        big_car_sign=big_sign,
+        small_car_sign=small_sign,
+        lift_sign=lift_sign,
         min_lift_height=args.min_lift_height,
     )
     return plc, ros_source, plc_actuator, initial_pos, target_pos, crane0
@@ -478,6 +507,9 @@ def _run_live_mode(
 
 
 def main(argv=None):
+    from plc_interface import ensure_plc_library_path
+
+    ensure_plc_library_path()
     args = _build_arg_parser().parse_args(argv)
     config = _config_from_args(args)
     coordinate_transform = _coordinate_transform_from_args(args)

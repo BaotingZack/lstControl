@@ -343,6 +343,27 @@ def test_parse_control_target_treats_target_z_as_hoist_height_when_flagged():
     assert unflagged_target[2] != pytest.approx(1.75)
 
 
+def test_localization_negate_xy_flips_feedback_and_target():
+    from dataclasses import replace
+
+    transform = replace(
+        CoordinateTransform2D.from_degrees(),
+        localization_negate_xy=True,
+    )
+    crane = transform.localization_map_to_crane_position(3.0, -2.0, 5.0)
+    assert crane == pytest.approx((-3.0, 2.0, 5.0))
+    target = transform.map_to_crane_target(1.0, 2.0, 1.5, z_is_hoist_height=True)
+    assert target == pytest.approx((-1.0, -2.0, 1.5))
+    slam = (-1.43, -0.71, 1.026)
+    feedback = transform.localization_map_to_crane_position(*slam)
+    ui_target = transform.ui_bridge_target_to_crane(
+        feedback[0], feedback[1], 1.026, z_is_hoist_height=True,
+    )
+    assert ui_target == pytest.approx(feedback)
+    back = transform.crane_to_map_display(*ui_target, z_is_hoist_height=True)
+    assert back[:2] == pytest.approx(slam[:2])
+
+
 def test_control_step_to_map_keeps_hoist_height_z_unrotated():
     transform = CoordinateTransform2D.from_degrees(
         10.0,

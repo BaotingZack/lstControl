@@ -1,5 +1,11 @@
 {
   "_description": "现场倾角仪标定 — 空载抓钩完全张开, 5点静态采集 (见 doc/倾角仪初值)",
+  "_localization_negate_xy_note": "SLAM /localization_pose 的 X/Y 与行车坐标相反时置 true (map→crane 后对反馈 XY 取负); 与 plc_invert 勿叠用",
+  "localization_negate_xy": true,
+  "_plc_invert_note": "驱动正方向与定位轴相反时置 true; 若已开 localization_negate_xy 一般保持 false",
+  "plc_invert_big_car": false,
+  "plc_invert_small_car": false,
+  "plc_invert_lift": false,
   "_calibrated_at": "2026-09-16",
   "_axis_calibration": "保留现场轴映射: θy←roll(vector.x), sign=+1; θx←pitch(vector.y), sign=-1。倾角仪固定在抓具黄色框架顶面，不直接测绳摆角；安装方向和历史相关性不构成框架角→绳摆角动态传递的证明。末端反馈先按轴检验自然运动下的模型一致性，不自动翻符号。零偏在原始 roll/pitch 通道先扣除再映射。详见 doc/site_context.md。",
   "_hoist_hardware": "现场电子葫芦: 出绳点离地 H=4m; PLC GetActualLiftHeight=抓钩离地 Z; 抓钩工作点到钢丝绳连接处 h=1.5m。钢丝绳长 L_rope=H−Z−h; 摆长 L_eff=H−Z=L_rope+h。禁止 L=4−Z+1.5 (h 加了两次)。详见 .cursor/rules/hoist-rope-geometry.mdc",

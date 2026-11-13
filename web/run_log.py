@@ -125,6 +125,32 @@ def default_log_dir(project_root: Path | None = None) -> Path:
     return root / 'logs'
 
 
+def auto_save_run_log(
+    cs,
+    *,
+    server: Any | None = None,
+    site: dict[str, Any] | None = None,
+    log_dir: Path | None = None,
+) -> Path | None:
+    """Write a finished run to logs/ (no-op if run never started or still active)."""
+    if cs is None:
+        return None
+    with cs.lock:
+        if not cs.run_kind or cs.finished_at_iso is None:
+            return None
+        if cs.running:
+            return None
+    try:
+        document = build_run_log_document(cs, server=server, site=site)
+        directory = log_dir or default_log_dir()
+        path = save_run_log_file(document, directory)
+        print(f'[run_log] Auto-saved → {path}')
+        return path
+    except OSError as exc:
+        print(f'[run_log] Auto-save failed: {exc}')
+        return None
+
+
 def save_run_log_file(document: dict[str, Any], directory: Path) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     kind = (document.get('run') or {}).get('kind') or 'run'

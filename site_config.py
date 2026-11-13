@@ -81,6 +81,10 @@ SITE_CONFIG_FIELDS = frozenset({
     'rope_length_min',
     'stabilize_delay',
     'gripper_settle_max_wait',
+    'localization_negate_xy',
+    'plc_invert_big_car',
+    'plc_invert_small_car',
+    'plc_invert_lift',
 })
 
 _VALID_SWAY_SOURCES = frozenset({'roll', 'pitch'})

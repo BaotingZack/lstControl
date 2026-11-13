@@ -383,7 +383,7 @@ class RosPositionSource:
             self._last_wall = now
 
             crane_x, crane_y, crane_z = (
-                self._coordinate_transform.map_to_crane_position(
+                self._coordinate_transform.localization_map_to_crane_position(
                     pose['x'], pose['y'], pose['z']
                 )
             )
@@ -408,7 +408,7 @@ class RosPositionSource:
                     and self._use_native_z_velocity
                     and map_vz is not None
                 ):
-                    vx, vy, vz = self._coordinate_transform.map_to_crane_vector3(
+                    vx, vy, vz = self._coordinate_transform.localization_map_to_crane_vector3(
                         map_vx,
                         map_vy,
                         map_vz,
@@ -418,7 +418,7 @@ class RosPositionSource:
                     and map_vy is not None
                     and self._coordinate_transform.is_planar
                 ):
-                    vx, vy = self._coordinate_transform.map_to_crane_vector(
+                    vx, vy = self._coordinate_transform.localization_map_to_crane_vector(
                         map_vx,
                         map_vy,
                     )

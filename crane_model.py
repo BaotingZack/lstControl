@@ -294,14 +294,10 @@ class CraneConfig:
     arrival_vel_tol_z: float = 0.02         # [m/s] Z 到达判断速度容差 (PLC 模式)
     velocity_deadband_z: float = 0.025      # [m/s] Z 到位捕获零速阈值 (PLC 模式)
 
-    # Z 位置死区的滞环退出阈值 / 到达判断位置容差 (PLC 模式)。进入死区仍用
-    # arrival_pos_tol (0.02m, 仍然按 2cm 精度去瞄), 但要重新给速度指令必须误差
-    # 超过这个更大的阈值。没有滞环时, 粗分辨率 + 带滞后的高度读数会在 2cm 容差
-    # 边界上抖进抖出, 每出去一次就给一次方向不定的速度脉冲, 而 Z 的速度指令会被
-    # 积分成绝对高度设定值, 每个脉冲都变成一段真实行程 → 抓钩在目标附近来回换向。
-    # 到达判定用同一个阈值: 抓钩高度的可达精度本来就受读数分辨率与受载绳伸长
-    # 限制, 判定窗口比死区滞环还严就会出现"停在原地却永远不锁轴", 只能等 PD 超时。
-    arrival_pos_tol_z: float = 0.04          # [m] Z 死区滞环退出阈值 / 到达位置容差 (PLC 模式)
+    # Z 位置死区的滞环退出阈值 / 到达判断位置容差 (PLC 模式)。与 X/Y 同为 2cm 时
+    # 滞环进入/退出同阈 (无加宽带); 若 Z 在目标附近因粗读数抖动换向, 可酌情略大于
+    # arrival_pos_tol 仅作滞环退出, 到位判定仍与此字段一致。
+    arrival_pos_tol_z: float = 0.02          # [m] Z 死区滞环退出阈值 / 到达位置容差 (PLC 模式)
     arrival_capture_pos_tol: float = 0.02  # [m] 到位捕获位置窗口 (原 0.04, 需配合 ki_pos>0 一起
                                             # 使用, 否则在持续扰动下可能出现收敛时间异常拖长)
     arrival_cmd_tol: float = 0.018         # [m/s] 到位捕获速度指令窗口 (原 0.025, 理由同上)
@@ -324,6 +320,9 @@ class CraneConfig:
     # 防反向抽动保护带 [m]: 在尚未越过目标且 |误差| 小于该值时，禁止 PD 给出
     # 远离目标方向的速度指令（速度伺服型行车"刹车"=指令归零而非反向脉冲）。
     reverse_guard_tol: float = 0.10    # 原 0.05; 扩大以减少目标附近反向脉冲→抓钩摆动
+    # PLC 跑飞保护: 距目标比起步时更远且较历史最优也更远, 连续若干周期仍有一定速度指令。
+    target_divergence_min_excess_m: float = 0.35
+    target_divergence_streak_cycles: int = 12
 
     # --- 摆角闭环防摇 (倾角仪 θ → Δv=+K·θ, 叠加在 PD 速度指令上) ---
     # 参考 CraneRemote 的比例纠偏 + dev_incl 能量阻尼形式; PTP 页可切换开/关。
@@ -677,6 +676,10 @@ class PositionFeedbackError(ControlRunError):
     """Raised when a position measurement is unsafe or malformed."""
 
 
+class ControlDivergenceError(ControlRunError):
+    """Raised when XY keeps moving away from the target (e.g. inverted drive axis)."""
+
+
 def _validate_position_feedback(position: dict, config: CraneConfig) -> dict:
     """Return normalized feedback or fail before it reaches the controller."""
     try:
@@ -930,6 +933,9 @@ def run_pd_control(
     settle_streak = 0
     if settle_profile and settle_theta_tol_rad is None:
         settle_theta_tol_rad = math.radians(0.3)
+    start_dist_xy = math.hypot(target_x - crane.x.position, target_y - crane.y.position)
+    best_dist_xy = start_dist_xy
+    xy_diverge_streak = 0
     try:
         while settle_profile or not all(locked.values()):
             # --- 检查钩子中断 ---
@@ -1025,6 +1031,26 @@ def run_pd_control(
             vx_cmd = 0.0 if locked['x'] else controllers['x'].update(target_x, x_measured, vx_damp, dt)
             vy_cmd = 0.0 if locked['y'] else controllers['y'].update(target_y, y_measured, vy_damp, dt)
             vz_cmd = 0.0 if locked['z'] else controllers['z'].update(target_z, z_measured, vz_damp, dt)
+
+            if not is_simulation and not settle_profile:
+                dist_xy = math.hypot(target_x - x_measured, target_y - y_measured)
+                best_dist_xy = min(best_dist_xy, dist_xy)
+                moving_cmd = abs(vx_cmd) > 0.03 or abs(vy_cmd) > 0.03
+                worse_than_start = (
+                    dist_xy > start_dist_xy + config.target_divergence_min_excess_m
+                )
+                worse_than_best = dist_xy > best_dist_xy + 0.08
+                xy_active = not (locked['x'] and locked['y'])
+                if moving_cmd and worse_than_start and worse_than_best and xy_active:
+                    xy_diverge_streak += 1
+                else:
+                    xy_diverge_streak = 0
+                if xy_diverge_streak >= config.target_divergence_streak_cycles:
+                    raise ControlDivergenceError(
+                        'XY 距离目标持续增大（疑似大车/小车驱动方向与定位相反）。'
+                        '请 STOP，并使用 --invert-big-car / --invert-small-car 重启，'
+                        '或在 site_config.json 设置 plc_invert_big_car / plc_invert_small_car。'
+                    )
 
             antisway_dvx = antisway_dvy = 0.0
             theta_x = theta_y = None

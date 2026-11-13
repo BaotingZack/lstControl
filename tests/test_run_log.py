@@ -9,6 +9,7 @@ import pytest
 
 from live_server import ControlState, CraneLiveServer
 from web.run_log import (
+    auto_save_run_log,
     build_run_log_document,
     run_status,
     save_run_log_file,
@@ -62,6 +63,18 @@ def test_build_run_log_client_only_when_no_control_state():
     assert doc['status'] == 'idle'
     assert doc['client']['sim_replay'] is True
     assert doc['run']['steps'] == []
+
+
+def test_auto_save_run_log_after_terminal_state(tmp_path: Path):
+    cs = ControlState()
+    cs.begin_run(kind='ptp_goto', anti_sway_mode='off', sim=False)
+    cs.set_step({'t': 0.1, 'x': 1.0, 'vx_cmd': 0.1})
+    assert auto_save_run_log(cs, log_dir=tmp_path) is None
+    cs.set_done()
+    path = auto_save_run_log(cs, log_dir=tmp_path)
+    assert path is not None
+    assert path.parent == tmp_path
+    assert path.name.startswith('run_log_ptp_goto_')
 
 
 def test_save_run_log_file_writes_json(tmp_path: Path):
