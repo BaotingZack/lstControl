@@ -7,12 +7,14 @@ from typing import Any
 from anti_sway import (
     baseline,
     crane_remote,
+    deepseek_anti,
     gantry,
     gantry_settle,
     incl,
     input_shape,
     overhead,
     overhead_settle,
+    quad_settle,
 )
 from anti_sway.base import AntiSwayStrategy
 
@@ -20,6 +22,8 @@ from anti_sway.base import AntiSwayStrategy
 _ALGORITHM_MODULES = (
     baseline,
     crane_remote,
+    deepseek_anti,
+    quad_settle,
     gantry_settle,
     overhead_settle,
     incl,
@@ -28,7 +32,15 @@ _ALGORITHM_MODULES = (
     overhead,
 )
 PTP_ALGORITHM_MODULES = (incl, gantry, overhead, input_shape)
-SETTLE_ALGORITHM_MODULES = (crane_remote, gantry_settle, overhead_settle, baseline)
+# deepseek_anti / quad_settle 只做消摆测试；crane_remote 保持第一项（页面/测试默认值）
+SETTLE_ALGORITHM_MODULES = (
+    crane_remote,
+    quad_settle,
+    deepseek_anti,
+    gantry_settle,
+    overhead_settle,
+    baseline,
+)
 
 OPEN_LOOP_ANTI_SWAY_MODES = frozenset({input_shape.MODE_ID})
 

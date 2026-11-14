@@ -74,12 +74,12 @@ class BaselineSettleStrategy:
 def config_fields_from_site(site: dict[str, Any] | None) -> dict[str, Any]:
     site = site or {}
     return {
-        'anti_sway_baseline_gain': float(site.get('anti_sway_baseline_gain', 0.85)),
+        'anti_sway_baseline_gain': float(site.get('anti_sway_baseline_gain', 2.6)),
         'anti_sway_baseline_max_correction': float(
-            site.get('anti_sway_baseline_max_correction', 0.15)
+            site.get('anti_sway_baseline_max_correction', 0.35)
         ),
         'anti_sway_baseline_deadband_deg': float(
-            site.get('anti_sway_baseline_deadband_deg', 0.15)
+            site.get('anti_sway_baseline_deadband_deg', 0.08)
         ),
     }
 
@@ -95,10 +95,10 @@ def build_strategy(config) -> BaselineSettleStrategy | None:
     ctrl = BaselineDampingController(
         gain=gain,
         max_correction=float(
-            getattr(config, 'anti_sway_baseline_max_correction', 0.15)
+            getattr(config, 'anti_sway_baseline_max_correction', 0.35)
         ),
         deadband_rad=math.radians(
-            float(getattr(config, 'anti_sway_baseline_deadband_deg', 0.15))
+            float(getattr(config, 'anti_sway_baseline_deadband_deg', 0.08))
         ),
     )
     return BaselineSettleStrategy(ctrl, config)

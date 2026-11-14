@@ -52,6 +52,8 @@ from web.run_log import (
     build_run_log_document,
     default_log_dir,
     save_run_log_file,
+    settle_step_worth_recording,
+    slim_settle_step,
     suggested_download_name,
 )
 from ros_bridge import get_latest_pose, get_sway_snapshot, RosPositionSource
@@ -2101,6 +2103,8 @@ class ControlState:
         self.steps: list[dict] = []
         self.events: list[dict] = []
         self.steps_truncated: bool = False
+        self._settle_last_log_t: float | None = None
+        self._settle_pending: dict | None = None
 
     def begin_run(
         self,
@@ -2120,8 +2124,20 @@ class ControlState:
             self.steps = []
             self.events = []
             self.steps_truncated = False
+            self._settle_last_log_t = None
+            self._settle_pending = None
+
+    def _flush_settle_pending_step(self) -> None:
+        if self.run_kind != 'settle' or self._settle_pending is None:
+            return
+        if self.steps and self.steps[-1].get('t') == self._settle_pending.get('t'):
+            return
+        if self.steps_truncated or len(self.steps) >= MAX_RECORDED_STEPS:
+            return
+        self.steps.append(dict(self._settle_pending))
 
     def _finalize_run(self) -> None:
+        self._flush_settle_pending_step()
         if self.finished_at_iso is None:
             self.finished_at_iso = datetime.now(timezone.utc).replace(
                 microsecond=0,
@@ -2147,11 +2163,20 @@ class ControlState:
         with self.lock:
             self.latest = dict(step_data)
             self.step_count += 1
-            if not self.steps_truncated:
-                if len(self.steps) < MAX_RECORDED_STEPS:
-                    self.steps.append(dict(step_data))
-                else:
+            if self.steps_truncated or len(self.steps) >= MAX_RECORDED_STEPS:
+                if not self.steps_truncated and len(self.steps) >= MAX_RECORDED_STEPS:
                     self.steps_truncated = True
+                return
+            if self.run_kind == 'settle':
+                slim = slim_settle_step(step_data)
+                self._settle_pending = slim
+                if settle_step_worth_recording(
+                    step_data, last_log_t=self._settle_last_log_t,
+                ):
+                    self.steps.append(slim)
+                    self._settle_last_log_t = float(step_data.get('t') or 0.0)
+            else:
+                self.steps.append(dict(step_data))
 
     def set_arrival(self, axis: str, t: float):
         with self.lock:

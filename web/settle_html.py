@@ -15,7 +15,14 @@ _SETTLE_PAGE_BODY = """<body>
     <section class="stage">
       <canvas id="scene"></canvas>
       <div class="topbar">
-        <h1>消摆测试</h1>
+        <div class="topbar-left">
+          <h1>消摆测试</h1>
+          <div class="deepseek-card" id="staticAngleCard" hidden>
+            <span class="deepseek-card-title">静态角 θ*</span>
+            <span class="deepseek-stat"><i>θx*</i><b id="staticThetaX">--</b></span>
+            <span class="deepseek-stat"><i>θy*</i><b id="staticThetaY">--</b></span>
+          </div>
+        </div>
         <div class="top-actions platform-nav">
           __PLATFORM_NAV__
           <div class="badge" id="rate">—</div>
@@ -26,6 +33,8 @@ _SETTLE_PAGE_BODY = """<body>
       <section class="status">
         <div class="metric"><div class="label">Mode</div><div class="value" id="modeLabel">—</div></div>
         <div class="metric"><div class="label">Session</div><div class="value" id="sessionState">Idle</div></div>
+        <div class="metric"><div class="label">消摆计时</div><div class="value" id="settleElapsed">—</div></div>
+        <div class="metric"><div class="label">初始最大峰</div><div class="value" id="settleInitialPeak">—</div></div>
         <div class="metric"><div class="label">Algorithm</div><div class="value" id="algoLabel">—</div></div>
       </section>
       <section class="readout">
@@ -97,6 +106,52 @@ _SETTLE_PAGE_BODY = """<body>
   </main>
 """
 
+_SETTLE_EXTRA_CSS = """
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+      flex: 0 1 auto;
+      pointer-events: none;
+    }
+    .topbar-left h1 {
+      flex: 0 0 auto;
+      white-space: nowrap;   /* 不能被静态角卡片挤成竖排 */
+    }
+    .deepseek-card {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      padding: 5px 10px;
+      border: 1px solid #3f6f9c;
+      border-radius: 5px;
+      background: rgba(23, 33, 43, 0.92);
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      flex: 0 0 auto;   /* 不许被 platform-nav / h1 挤压没 */
+    }
+    @media (max-width: 1280px) {
+      .deepseek-card .deepseek-card-title { display: none; }
+    }
+    .deepseek-card[hidden] { display: none; }
+    .deepseek-card-title { color: #8fd3ff; font-weight: 700; }
+    .deepseek-stat { color: #8a9bab; }
+    .deepseek-stat i { font-style: normal; margin-right: 4px; }
+    .deepseek-stat b {
+      color: #dce7ee;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-weight: 700;
+    }
+    .deepseek-card-meta {
+      color: #6b7c8c;
+      font-size: 11px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+"""
+
+
 _SETTLE_CANVAS_HELPERS = """
     function drawPanel(box, title) {
       ctx.fillStyle = '#121c25';
@@ -129,17 +184,218 @@ _SETTLE_CANVAS_HELPERS = """
 """
 
 _SETTLE_DRAW = """
+    /** 与 drawHookSway() 内部布局保持一致，用于把 θ* 标到同一个十字靶标上。 */
+    function swayCrossGeometry(box) {
+      var pad = 8;
+      var infoH = 40 + 6 + 3 * 14 + 10;
+      var area = {
+        x: box.x + pad,
+        y: box.y + pad,
+        w: Math.max(60, box.w - pad * 2),
+        h: Math.max(60, box.h - pad * 2 - infoH),
+      };
+      var leftGutter = Math.min(40, Math.max(30, area.w * 0.14));
+      var topGutter = 16;
+      var rightGutter = 22;
+      var bottomGutter = Math.min(22, Math.max(16, area.h * 0.12));
+      var plotW = Math.max(40, area.w - leftGutter - rightGutter);
+      var plotH = Math.max(40, area.h - topGutter - bottomGutter);
+      return {
+        area: area,
+        cx: area.x + leftGutter + plotW / 2,
+        cy: area.y + topGutter + plotH / 2,
+        span: Math.max(18, Math.min(plotW, plotH) / 2 - 8),
+      };
+    }
+
+    /** deepseek-anti：把估算的静态姿态 θ* 画在左侧摆角靶标上 + 数值卡片。 */
+    function drawStaticPoseOverlay(box) {
+      if (typeof getAntiSwayMode !== 'function') return;
+      if (getAntiSwayMode() !== 'deepseek_anti') return;
+      var g = swayCrossGeometry(box);
+      var d = (typeof _staticAngleDebug !== 'undefined') ? _staticAngleDebug : null;
+      var accent = '#6fe3b4';
+
+      if (d) {
+        var sxDeg = d.theta_static_y_deg || 0;
+        var syDeg = d.theta_static_x_deg || 0;
+        var tx = Math.max(-1, Math.min(1, sxDeg));
+        var ty = Math.max(-1, Math.min(1, syDeg));
+        var px = g.cx + tx * g.span;
+        var py = g.cy - ty * g.span;
+
+        ctx.save();
+        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = 'rgba(111, 227, 180, 0.75)';
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.moveTo(g.cx, g.cy);
+        ctx.lineTo(px, py);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        var r = 7;
+        ctx.beginPath();
+        ctx.moveTo(px, py - r);
+        ctx.lineTo(px + r, py);
+        ctx.lineTo(px, py + r);
+        ctx.lineTo(px - r, py);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(111, 227, 180, 0.22)';
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = accent;
+        ctx.stroke();
+
+        ctx.font = '700 11px system-ui, sans-serif';
+        ctx.fillStyle = accent;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('θ*', px + 11, py - 10);
+        ctx.restore();
+      }
+
+      var cw = 252;
+      var ch = 112;
+      var cx0 = g.area.x + g.area.w - cw - 8;
+      if (cx0 < g.area.x + 8) cx0 = g.area.x + 8;
+      var cy0 = g.area.y + 8;
+
+      ctx.save();
+      ctx.fillStyle = 'rgba(6, 14, 20, 0.9)';
+      ctx.strokeStyle = '#2f5f80';
+      ctx.lineWidth = 1;
+      ctx.fillRect(cx0, cy0, cw, ch);
+      ctx.strokeRect(cx0 + 0.5, cy0 + 0.5, cw - 1, ch - 1);
+
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.font = '700 11px system-ui, sans-serif';
+      ctx.fillStyle = '#8fd3ff';
+      ctx.fillText('静态姿态 θ* · deepseek-anti', cx0 + 9, cy0 + 15);
+
+      var colW = (cw - 18) / 2;
+      var x1 = cx0 + 9;
+      var x2 = cx0 + 9 + colW;
+      function cell(label, value, x, y, color) {
+        ctx.font = '600 10px system-ui, sans-serif';
+        ctx.fillStyle = '#8a9bab';
+        ctx.fillText(label, x, y);
+        ctx.font = '700 12px ui-monospace, SFMono-Regular, Menlo, monospace';
+        ctx.fillStyle = color || '#dce7ee';
+        ctx.fillText(value, x + 40, y);
+      }
+
+      if (!d) {
+        ctx.font = '700 11px system-ui, sans-serif';
+        ctx.fillStyle = '#91a3b3';
+        ctx.fillText('开始消摆后估计', x1, cy0 + 38);
+      } else {
+        var ready = !!(d.ready_x && d.ready_y);
+        var amp = Math.max(d.amp_x_deg || 0, d.amp_y_deg || 0);
+        var cov = Math.min(1, Math.max(d.coverage_x || 0, d.coverage_y || 0));
+        cell('θx*', fmtSignedDeg(d.theta_static_x_deg), x1, cy0 + 34);
+        cell('θy*', fmtSignedDeg(d.theta_static_y_deg), x2, cy0 + 34);
+        cell('ωx', fmtSignedNum(d.rate_x_deg_s, 1) + '°/s', x1, cy0 + 54, '#59a7e8');
+        cell('Δvx', fmtSignedNum(d.dv_x, 3), x2, cy0 + 54, '#f0a83b');
+        cell('ωy', fmtSignedNum(d.rate_y_deg_s, 1) + '°/s', x1, cy0 + 74, '#59a7e8');
+        cell('Δvy', fmtSignedNum(d.dv_y, 3), x2, cy0 + 74, '#f0a83b');
+        var status;
+        var statusColor;
+        if (d.budget_blocked) {
+          status = '位移预算暂停 (' + (d.dist_xy || 0).toFixed(2) + ' m)';
+          statusColor = '#e05a47';
+        } else if (d.guard_x || d.guard_y) {
+          status = '增长保护暂停';
+          statusColor = '#e05a47';
+        } else if (ready) {
+          status = '已收敛 · 摆幅 ' + amp.toFixed(2) + '° · K ' + (d.gain_eff || 0).toFixed(2)
+            + ' · lead ' + (d.lead_s || 0).toFixed(1) + 's';
+          statusColor = '#5ebd72';
+        } else {
+          status = '估计中 ' + Math.round(cov * 100) + '% · 周期 ' + (d.period_s || 0).toFixed(1) + 's';
+          statusColor = '#f0a83b';
+        }
+        ctx.font = '700 10px system-ui, sans-serif';
+        ctx.fillStyle = statusColor;
+        ctx.fillText(truncateText(status, cw - 18), x1, cy0 + 98);
+      }
+      ctx.restore();
+    }
+
     function draw() {
       var rect = canvas.getBoundingClientRect();
       ctx.clearRect(0, 0, rect.width, rect.height);
       ctx.fillStyle = '#060a0e';
       ctx.fillRect(0, 0, rect.width, rect.height);
+      // 顶部留出 topbar（标题 + 静态角卡片）的高度，避免标题叠在一起
       var box = {
-        x: 14, y: 62,
+        x: 14, y: 78,
         w: Math.max(200, rect.width - 28),
-        h: Math.max(280, rect.height - 76),
+        h: Math.max(280, rect.height - 92),
       };
       drawHookSway(box);
+      drawSettleBaselineOverlay(box);
+      drawStaticPoseOverlay(box);
+    }
+
+    /** 消摆开始头几秒锁定的初始最大摆角：靶心上画参考圈 + 峰值时刻的方向点。 */
+    function drawSettleBaselineOverlay(box) {
+      var b = (typeof _settleBaseline !== 'undefined') ? _settleBaseline : null;
+      if (!b || !b.peakDeg || b.peakDeg <= 0) return;
+      var g = swayCrossGeometry(box);
+      var pxPerDeg = g.span;
+      var r = Math.min(g.span, b.peakDeg * pxPerDeg);
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(g.area.x, g.area.y, g.area.w, g.area.h);
+      ctx.clip();
+
+      ctx.setLineDash([7, 5]);
+      ctx.strokeStyle = 'rgba(198, 130, 255, 0.92)';
+      ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      ctx.arc(g.cx, g.cy, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      if (b.thetaXDeg != null && b.thetaYDeg != null) {
+        var ty = Math.max(-1, Math.min(1, b.thetaYDeg));
+        var tx = Math.max(-1, Math.min(1, b.thetaXDeg));
+        var px = g.cx + ty * g.span;
+        var py = g.cy - tx * g.span;
+        ctx.beginPath();
+        ctx.arc(px, py, 10, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(198, 130, 255, 0.55)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(px, py, 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(198, 130, 255, 0.35)';
+        ctx.fill();
+      }
+
+      var label = '初始最大 ' + b.peakDeg.toFixed(2) + '°';
+      ctx.font = '700 10px system-ui, sans-serif';
+      ctx.fillStyle = '#c878ff';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'bottom';
+      var ly = g.cy - r - 5;
+      if (ly < g.area.y + 4) ly = g.cy + r + 12;
+      ctx.fillText(label, Math.max(g.area.x + 6, g.cx - r), ly);
+
+      if (_settleActive && _settleElapsedS != null) {
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'top';
+        ctx.fillStyle = '#8fd3ff';
+        ctx.fillText(
+          '消摆 ' + _settleElapsedS.toFixed(1) + ' s',
+          g.area.x + g.area.w - 6,
+          g.area.y + 4,
+        );
+      }
+      ctx.restore();
     }
 """
 
@@ -151,11 +407,18 @@ _SETTLE_BOOT = """
     let _liveSwayState = null;
     let _swayFrames = [];
     let _settleActive = false;
+    /** 开始后约 2s 内采样的初始最大峰 [deg]，锁定后用于靶标参考圈。 */
+    const SETTLE_BASELINE_CAPTURE_S = 2.0;
+    let _settleT0Ms = null;
+    let _settleElapsedS = null;
+    let _settleBaseline = null;
 
     const els = {
       rate: document.getElementById('rate'),
       modeLabel: document.getElementById('modeLabel'),
       sessionState: document.getElementById('sessionState'),
+      settleElapsed: document.getElementById('settleElapsed'),
+      settleInitialPeak: document.getElementById('settleInitialPeak'),
       algoLabel: document.getElementById('algoLabel'),
       phase: document.getElementById('phase'),
       commandMsg: document.getElementById('commandMsg'),
@@ -181,7 +444,50 @@ _SETTLE_BOOT = """
       ctrlGrip: document.getElementById('ctrlGrip'),
       btnStop: document.getElementById('btnStop'),
       btnReset: document.getElementById('btnReset'),
+      staticAngleCard: document.getElementById('staticAngleCard'),
+      staticThetaX: document.getElementById('staticThetaX'),
+      staticThetaY: document.getElementById('staticThetaY'),
     };
+
+    let _staticAngleDebug = null;
+
+    function fmtSignedNum(v, digits) {
+      if (v == null || !isFinite(v)) return '--';
+      var d = (digits == null) ? 3 : digits;
+      return (v >= 0 ? '+' : '') + v.toFixed(d);
+    }
+
+    function fmtSignedDeg(v) {
+      return fmtSignedNum(v, 3) + '°';
+    }
+
+    /** deepseek-anti 的静态倾角估计 → 左侧顶栏卡片。其它算法隐藏。 */
+    function updateStaticAngleCard() {
+      var card = els.staticAngleCard;
+      if (!card) return;
+      var isDeepseek = getAntiSwayMode() === 'deepseek_anti';
+      card.hidden = !isDeepseek;
+      if (!isDeepseek) return;
+      var d = _staticAngleDebug;
+      if (!d) {
+        els.staticThetaX.textContent = '--';
+        els.staticThetaY.textContent = '--';
+        card.title = _settleActive
+          ? '估计中…（需要累积约 1 个摆周期的数据）'
+          : 'θ* 需要先点「开始消摆」，运行中实时估计';
+        return;
+      }
+      els.staticThetaX.textContent = fmtSignedDeg(d.theta_static_x_deg);
+      els.staticThetaY.textContent = fmtSignedDeg(d.theta_static_y_deg);
+      var ready = !!(d.ready_x && d.ready_y);
+      var cov = Math.min(1, Math.max(d.coverage_x || 0, d.coverage_y || 0));
+      var amp = Math.max(d.amp_x_deg || 0, d.amp_y_deg || 0);
+      var rms = Math.max(d.rms_x_deg || 0, d.rms_y_deg || 0);
+      var period = d.period_s ? d.period_s.toFixed(1) + 's' : '--';
+      card.title = ready
+        ? ('已收敛 · 摆幅 ' + amp.toFixed(2) + '° · 残差 ' + rms.toFixed(2) + '°')
+        : ('估计中 ' + Math.round(cov * 100) + '% · 周期 ' + period);
+    }
 
     function updateAntiSwayHint() {
       if (!els.antiSwayHint || !els.antiSwayMode) return;
@@ -211,9 +517,11 @@ _SETTLE_BOOT = """
     if (els.antiSwayMode) {
       els.antiSwayMode.addEventListener('change', function() {
         updateAntiSwayHint();
+        updateStaticAngleCard();
         syncQueryAntiSwayMode();
       });
       updateAntiSwayHint();
+      updateStaticAngleCard();
     }
 
     function syncQueryAntiSwayMode() {
@@ -229,6 +537,7 @@ _SETTLE_BOOT = """
       const asm = params.get('anti_sway_mode');
       if (asm) setAntiSwayMode(asm);
       else syncQueryAntiSwayMode();
+      updateStaticAngleCard();   // 模式可能来自 URL query，需在设置后刷新一次
     })();
 
     function showCommandMsg(text, color) {
@@ -239,10 +548,80 @@ _SETTLE_BOOT = """
       }
     }
 
+    function resetSettleMetrics() {
+      _settleT0Ms = performance.now();
+      _settleElapsedS = 0;
+      _settleBaseline = {
+        peakDeg: 0,
+        thetaXDeg: null,
+        thetaYDeg: null,
+        locked: false,
+        captureT0Ms: performance.now(),
+      };
+      updateSettleMetricsUi();
+    }
+
+    function updateSettleBaselineFromSway(sway) {
+      if (!_settleActive || !sway || !sway.valid || !_settleBaseline) return;
+      if (_settleBaseline.locked) return;
+      var elapsed = (performance.now() - _settleBaseline.captureT0Ms) / 1000;
+      var peak = sway.theta_peak_deg;
+      if (peak != null && isFinite(peak) && peak >= _settleBaseline.peakDeg) {
+        _settleBaseline.peakDeg = peak;
+        _settleBaseline.thetaXDeg = sway.theta_x_deg;
+        _settleBaseline.thetaYDeg = sway.theta_y_deg;
+      }
+      if (elapsed >= SETTLE_BASELINE_CAPTURE_S) {
+        _settleBaseline.locked = true;
+        if (_settleBaseline.peakDeg <= 0 && peak != null && isFinite(peak)) {
+          _settleBaseline.peakDeg = peak;
+          _settleBaseline.thetaXDeg = sway.theta_x_deg;
+          _settleBaseline.thetaYDeg = sway.theta_y_deg;
+        }
+      }
+      updateSettleMetricsUi();
+    }
+
+    function updateSettleMetricsUi() {
+      if (els.settleElapsed) {
+        if (_settleElapsedS != null && (_settleActive || _settleT0Ms != null)) {
+          els.settleElapsed.textContent = _settleElapsedS.toFixed(1) + ' s';
+          els.settleElapsed.style.color = _settleActive ? '#59a7e8' : '#5ebd72';
+        } else {
+          els.settleElapsed.textContent = '—';
+          els.settleElapsed.style.color = '';
+        }
+      }
+      if (els.settleInitialPeak) {
+        var p = _settleBaseline && _settleBaseline.peakDeg;
+        if (p != null && p > 0) {
+          els.settleInitialPeak.textContent = p.toFixed(3) + '°';
+          els.settleInitialPeak.style.color = '#c878ff';
+        } else {
+          els.settleInitialPeak.textContent = _settleActive ? '采样中…' : '—';
+          els.settleInitialPeak.style.color = '';
+        }
+      }
+    }
+
+    function syncSettleElapsedFromControl(s) {
+      if (s && s.running) {
+        if (s.latest && s.latest.t != null && isFinite(s.latest.t)) {
+          _settleElapsedS = s.latest.t;
+        } else if (_settleT0Ms != null) {
+          _settleElapsedS = (performance.now() - _settleT0Ms) / 1000;
+        }
+      } else if (s && (s.done || s.stopped) && s.latest && s.latest.t != null) {
+        _settleElapsedS = s.latest.t;
+      }
+      updateSettleMetricsUi();
+    }
+
     function syncSwayFromSnapshot(s) {
       if (s && s.tol_deg != null) SWAY_TOL_DEG = s.tol_deg;
       _liveSwayState = s;
       if (s && s.valid) recordSwaySample(s);
+      updateSettleBaselineFromSway(s);
       if (s && s.valid) {
         els.swayStatus.textContent = s.stale ? '倾角仪断流' : '倾角仪已连接';
         els.swayStatus.style.color = s.stale ? '#e05a47' : '#5ebd72';
@@ -276,6 +655,7 @@ _SETTLE_BOOT = """
       fetch('/api/control-state')
         .then(function(r) { return r.json(); })
         .then(function(s) {
+          syncSettleElapsedFromControl(s);
           if (s.running) {
             setSettleUiActive(true);
             if (s.scheduler_phase_label) {
@@ -302,6 +682,12 @@ _SETTLE_BOOT = """
             if (typeof markRunLogReady === 'function') markRunLogReady();
           }
           var d = s.latest;
+          if (d && d.anti_sway_debug) {
+            _staticAngleDebug = d.anti_sway_debug;
+          } else if (!s.running) {
+            _staticAngleDebug = null;
+          }
+          updateStaticAngleCard();
           if (!PLC_MODE && d && d.theta_x != null && d.theta_y != null) {
             var k = 180 / Math.PI;
             syncSwayFromSnapshot({
@@ -321,9 +707,14 @@ _SETTLE_BOOT = """
     }
 
     setInterval(pollSettleControl, 100);
+    pollSettleControl();   // 首屏立即拉一次，避免等 100ms 空白
 
     function setSettleUiActive(active) {
+      var was = _settleActive;
       _settleActive = active;
+      if (active && !was) {
+        if (!_settleT0Ms) resetSettleMetrics();
+      }
       els.sessionState.textContent = active ? 'Damping' : 'Idle';
       els.sessionState.style.color = active ? '#5ebd72' : '';
       if (els.btnStartSettle) els.btnStartSettle.disabled = active;
@@ -333,6 +724,10 @@ _SETTLE_BOOT = """
     els.btnStartSettle.addEventListener('click', function() {
       var mode = getAntiSwayMode();
       if (typeof resetRunLogReady === 'function') resetRunLogReady();
+      _staticAngleDebug = null;
+      updateStaticAngleCard();
+      resetSettleMetrics();
+      _swayFrames.length = 0;
       showCommandMsg('启动中...', '#91a3b3');
       fetch('/api/start-settle', {
         method: 'POST',
@@ -458,7 +853,8 @@ def render_settle_html(plc_mode: bool = False) -> str:
         '  <meta charset="utf-8">\n'
         '  <meta name="viewport" content="width=device-width, initial-scale=1">\n'
         f'  <title>消摆测试 — {mode_label}</title>\n'
-        f'  <style>{LIVE_VIEW_BASE_CSS}{PTP_EXTRA_CSS}{RUN_LOG_EXTRA_CSS}</style>\n'
+        f'  <style>{LIVE_VIEW_BASE_CSS}{PTP_EXTRA_CSS}{RUN_LOG_EXTRA_CSS}'
+        f'{_SETTLE_EXTRA_CSS}</style>\n'
         '</head>\n'
         + page_body
         + '  <script>\n'

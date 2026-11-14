@@ -10,6 +10,10 @@ def test_settle_sim_page():
     assert '/settle/sim' in html
     assert 'settle-sim' in html and 'aria-current="page"' in html
     assert 'btnStartSettle' in html
+    assert 'settleElapsed' in html
+    assert 'settleInitialPeak' in html
+    assert 'drawSettleBaselineOverlay' in html
+    assert '初始最大' in html
     assert 'value="crane_remote"' in html
     assert 'value="baseline"' in html
     assert 'value="gantry_settle"' in html

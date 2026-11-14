@@ -356,9 +356,9 @@ class CraneConfig:
     anti_sway_overhead_deadband_deg: float = 1.0
     anti_sway_overhead_max_correction: float = 0.2
     anti_sway_overhead_omega_tau: float = 0.03
-    anti_sway_baseline_gain: float = 0.85
-    anti_sway_baseline_max_correction: float = 0.15
-    anti_sway_baseline_deadband_deg: float = 0.15
+    anti_sway_baseline_gain: float = 2.6
+    anti_sway_baseline_max_correction: float = 0.35
+    anti_sway_baseline_deadband_deg: float = 0.08
     anti_sway_crane_remote_kp: float = 2.6
     anti_sway_crane_remote_max_correction: float = 0.2
     anti_sway_crane_remote_deadband_deg: float = 0.8
@@ -367,6 +367,43 @@ class CraneConfig:
     anti_sway_crane_remote_zc_step_velocity: float = 0.06
     anti_sway_crane_remote_zc_release_ratio: float = 0.88
     anti_sway_input_shape_zeta: float = 0.01
+    # deepseek-anti（仅消摆测试）：实时拟合静态倾角 θ*，只对 θ−θ* 施加阻尼。
+    anti_sway_deepseek_gain: float = 2.6
+    anti_sway_deepseek_max_correction: float = 0.2
+    anti_sway_deepseek_deadband_deg: float = 0.10
+    # 拟合窗口（摆周期数）：>=1 才能把 θ* 和摆动分量分开；更长更稳但对
+    # 快速衰减的摆动会滞后。仿真 A/B（执行器 τ=1.5s）1.25 周期收敛最快。
+    anti_sway_deepseek_window_periods: float = 1.25
+    anti_sway_deepseek_sign: float = 1.0
+    # 逐轴符号：倾角仪轴映射（pitch→X, roll→Y）只有一个轴的极性错时，
+    # 表现是"一轴消得掉、另一轴越消越大"，用这两个单独翻转。
+    anti_sway_deepseek_sign_x: float = 1.0
+    anti_sway_deepseek_sign_y: float = 1.0
+    # 相位超前时间常数 [s]：取 ≈ PLC 速度回路一阶滞后时间。仿真分支自动改用
+    # servo_time_constant_xy，所以这里填现场值即可。
+    anti_sway_deepseek_lead_s: float = 1.5
+    # 绳长增益调度：K_eff = min(K, 2·ζ_ref·√(gL))，只下调不上调；0=关闭调度。
+    # 默认关闭：实测 L=1.5m 时 ζ_ref=0.24 会把 K 从 2.6 压到 1.84，消摆收敛
+    # 从 3.4s 拖到 8.5s，得不偿失。需要恒定阻尼比做实验时再打开。
+    anti_sway_deepseek_zeta_ref: float = 0.0
+    # 相对锚点的位移预算 [m]；超过后本周期不再施加修正（0=不限制）。
+    # 默认不限制：6cm 会在摆幅 >4° 时频繁触发，修正被切成一段段，5s 残余
+    # 反而从 0 涨到 3.8°；需要卡死横移时再按现场间隙设 0.10~0.12。
+    anti_sway_deepseek_max_shift_m: float = 0.0
+    # 摆幅增长保护（1=开）：持续变大就暂停该轴修正
+    anti_sway_deepseek_guard: float = 1.0
+    # quad_settle（仅消摆测试）：四象限超前 + 斜坡逆模型补偿，字段与默认值
+    # 与 anti_sway/quad_settle.py 保持一致。
+    anti_sway_quad_kv: float = 2.2
+    anti_sway_quad_tau_lead: float = 0.45
+    anti_sway_quad_max_correction: float = 0.30
+    anti_sway_quad_drive_accel: float = 0.20
+    anti_sway_quad_deadband_deg: float = 0.10
+    anti_sway_quad_omega_tau: float = 0.06
+    anti_sway_quad_dc_tau: float = 5.0
+    anti_sway_quad_recenter_gain: float = 0.12
+    anti_sway_quad_sign_x: float = -1.0
+    anti_sway_quad_sign_y: float = -1.0
 
     # --- 可选机械工作区 ---
     # 现场行程因设备而异，X/Y 不提供虚假的默认范围；PLC 部署时应显式配置。
@@ -388,6 +425,7 @@ class CraneConfig:
             'servo_time_constant_z': self.servo_time_constant_z,
             'velocity_filter_tau': self.velocity_filter_tau,
             'velocity_filter_tau_plc': self.velocity_filter_tau_plc,
+            'anti_sway_deepseek_window_periods': self.anti_sway_deepseek_window_periods,
         }
         for name, value in positive_fields.items():
             if not math.isfinite(value) or value <= 0:
@@ -396,6 +434,21 @@ class CraneConfig:
         non_negative_fields = {
             'kp_pos': self.kp_pos,
             'kd_pos': self.kd_pos,
+            'anti_sway_deepseek_gain': self.anti_sway_deepseek_gain,
+            'anti_sway_deepseek_max_correction': self.anti_sway_deepseek_max_correction,
+            'anti_sway_deepseek_deadband_deg': self.anti_sway_deepseek_deadband_deg,
+            'anti_sway_deepseek_lead_s': self.anti_sway_deepseek_lead_s,
+            'anti_sway_deepseek_zeta_ref': self.anti_sway_deepseek_zeta_ref,
+            'anti_sway_deepseek_max_shift_m': self.anti_sway_deepseek_max_shift_m,
+            'anti_sway_deepseek_guard': self.anti_sway_deepseek_guard,
+            'anti_sway_quad_kv': self.anti_sway_quad_kv,
+            'anti_sway_quad_tau_lead': self.anti_sway_quad_tau_lead,
+            'anti_sway_quad_max_correction': self.anti_sway_quad_max_correction,
+            'anti_sway_quad_drive_accel': self.anti_sway_quad_drive_accel,
+            'anti_sway_quad_deadband_deg': self.anti_sway_quad_deadband_deg,
+            'anti_sway_quad_omega_tau': self.anti_sway_quad_omega_tau,
+            'anti_sway_quad_dc_tau': self.anti_sway_quad_dc_tau,
+            'anti_sway_quad_recenter_gain': self.anti_sway_quad_recenter_gain,
             'safe_height_offset': self.safe_height_offset,
             'grab_delay': self.grab_delay,
             'release_delay': self.release_delay,
@@ -1053,6 +1106,7 @@ def run_pd_control(
                     )
 
             antisway_dvx = antisway_dvy = 0.0
+            anti_sway_debug = None
             theta_x = theta_y = None
             if sway_source is not None and hasattr(sway_source, 'get_sway'):
                 sway = sway_source.get_sway()
@@ -1076,10 +1130,19 @@ def run_pd_control(
                         locked_x=locked['x'],
                         locked_y=locked['y'],
                         config=config,
+                        is_simulation=is_simulation,
                     )
                     corr = anti_sway_strategy.correct_xy(vx_cmd, vy_cmd, ctx)
                     vx_cmd, vy_cmd = corr.vx_cmd, corr.vy_cmd
                     antisway_dvx, antisway_dvy = corr.dvx, corr.dvy
+                    # 可选诊断通道: 只有提供 debug_snapshot() 的算法才会产生该字段，
+                    # 其它算法 step_data 与之前完全一致。
+                    snapshot_fn = getattr(anti_sway_strategy, 'debug_snapshot', None)
+                    if callable(snapshot_fn):
+                        try:
+                            anti_sway_debug = snapshot_fn()
+                        except Exception:
+                            anti_sway_debug = None
 
             # Z 目标附近的微调门控 (仅 PLC 模式)。抓钩高度反馈带滞后 (S7 轮询/PLC
             # 扫描, 抖动期间还会沿用旧读数), 在最后几厘米里若继续按"仍在变化的读数"
@@ -1102,7 +1165,7 @@ def run_pd_control(
                     disturbance_x = plant.update_axis('x', crane.x, vx_cmd, target_x, locked['x'], dt, t)
                     disturbance_y = plant.update_axis('y', crane.y, vy_cmd, target_y, locked['y'], dt, t)
                     disturbance_z = plant.update_axis('z', crane.z, vz_cmd, target_z, locked['z'], dt, t)
-            else:
+            if not is_simulation:
                 # PLC 模式: 发送指令到真实 PLC。连接/心跳的瞬时抖动 (已在
                 # PlcActuator/心跳线程做了容忍与背后自愈) 不应让这一次瞬时
                 # 失败直接终止整段作业——否则表现为"距离目标还很远时 PD 就
@@ -1172,6 +1235,16 @@ def run_pd_control(
                             hooks.on_arrival(name, t)
 
             # --- STEP 6: 记录历史 ---
+            roll = pitch = None
+            if not is_simulation:
+                try:
+                    from ros_bridge import get_inclination_raw
+                    inc = get_inclination_raw()
+                    if inc:
+                        roll = inc.get('roll')
+                        pitch = inc.get('pitch')
+                except ImportError:
+                    pass
             step_data = {
                 't': t,
                 'x': crane.x.position, 'y': crane.y.position, 'z': crane.z.position,
@@ -1186,7 +1259,12 @@ def run_pd_control(
                 'antisway_dvx': antisway_dvx, 'antisway_dvy': antisway_dvy,
                 'anti_sway_mode': getattr(config, 'anti_sway_mode', 'off'),
                 'theta_x': theta_x, 'theta_y': theta_y,
+                'sway_valid': theta_x is not None and theta_y is not None,
+                'roll': roll,
+                'pitch': pitch,
             }
+            if anti_sway_debug is not None:
+                step_data['anti_sway_debug'] = anti_sway_debug
             history.append(step_data)
 
             if hooks is not None:

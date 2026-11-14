@@ -18,6 +18,8 @@ class AntiSwayStepContext:
     locked_x: bool
     locked_y: bool
     config: Any
+    # True=仿真对象（一阶伺服 τ 已知）, False=真实 PLC 回路
+    is_simulation: bool = True
 
 
 @dataclass(frozen=True)

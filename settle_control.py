@@ -42,7 +42,7 @@ def run_settle_control(
     hooks=None,
     sway_source=None,
     is_simulation: bool = False,
-    max_time: float = 120.0,
+    max_time: float | None = None,
     verbose: bool = True,
     initial_theta: tuple[float, float] | None = None,
     settle_theta_tol_rad: float | None = None,
