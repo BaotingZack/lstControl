@@ -403,7 +403,7 @@ _SETTLE_BOOT = """
     const canvas = document.getElementById('scene');
     const ctx = canvas.getContext('2d');
     const ANTI_SWAY = true;
-    let SWAY_TOL_DEG = 0.3;
+    let SWAY_TOL_DEG = 0.05;
     let _liveSwayState = null;
     let _swayFrames = [];
     let _settleActive = false;
@@ -667,7 +667,10 @@ _SETTLE_BOOT = """
             setSettleUiActive(false);
             els.phase.textContent = '消摆完成';
             els.phase.style.color = '#5ebd72';
-            showCommandMsg('摆角已判稳，消摆结束', '#5ebd72');
+            var doneMsg = (getAntiSwayMode() === 'deepseek_anti')
+              ? '抓钩已贴近静态姿态 θ*（靶标圆点接近绿菱形），消摆结束'
+              : '摆角已判稳，消摆结束';
+            showCommandMsg(doneMsg, '#5ebd72');
             if (typeof markRunLogReady === 'function') markRunLogReady();
           }
           if (s.stopped) {

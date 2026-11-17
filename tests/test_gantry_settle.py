@@ -58,7 +58,7 @@ def test_sim_settle_gantry_converges():
         verbose=False,
         initial_theta=(0.08, 0.05),
         settle_theta_tol_rad=math.radians(1.0),
-        settle_hold_cycles=10,
+        settle_hold_sec=0.05,
         max_time=45.0,
     )
     assert len(history) > 10

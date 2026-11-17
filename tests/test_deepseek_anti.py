@@ -12,7 +12,14 @@ from anti_sway.deepseek_anti import (
 )
 from anti_sway.registry import list_algorithm_options
 from anti_sway.rope import RopeLengthModel
-from crane_model import CraneConfig, CranePlant, CraneState, PlantActuator, SimPositionSource
+from crane_model import (
+    CraneConfig,
+    CranePlant,
+    CraneState,
+    PlantActuator,
+    SimPositionSource,
+    settle_angle_peak_rad,
+)
 from settle_control import apply_settle_anti_sway_mode, run_settle_control
 
 G = 9.81
@@ -58,6 +65,48 @@ def test_estimator_not_ready_before_half_period():
     for _ in range(5):
         est.update(0.02, 0.08, omega)
     assert not est.ready
+
+
+def test_settle_peak_uses_residual_ac_when_ready():
+    """大静态倾角时 |θ| 可能很大，但圆点贴近 θ* 后仍应能判稳。"""
+    tol = math.radians(0.3)
+    debug = {
+        'mode': 'deepseek_anti',
+        'ready': True,
+        'theta_ac_x_deg': 0.12,
+        'theta_ac_y_deg': -0.08,
+    }
+    theta_x = math.radians(2.0)
+    theta_y = math.radians(-1.5)
+    peak = settle_angle_peak_rad(
+        theta_x=theta_x,
+        theta_y=theta_y,
+        anti_sway_mode='deepseek_anti',
+        anti_sway_debug=debug,
+    )
+    assert peak is not None and peak < tol
+    raw_peak = max(abs(theta_x), abs(theta_y))
+    assert raw_peak > tol
+
+
+def test_settle_peak_not_ready_blocks_completion_metric():
+    peak = settle_angle_peak_rad(
+        theta_x=0.01,
+        theta_y=0.01,
+        anti_sway_mode='deepseek_anti',
+        anti_sway_debug={'mode': 'deepseek_anti', 'ready': False},
+    )
+    assert peak is None
+
+
+def test_settle_peak_baseline_uses_raw_theta():
+    peak = settle_angle_peak_rad(
+        theta_x=math.radians(0.2),
+        theta_y=math.radians(0.1),
+        anti_sway_mode='baseline',
+        anti_sway_debug=None,
+    )
+    assert peak == math.radians(0.2)
 
 
 def test_registered_for_settle_only():
@@ -183,6 +232,25 @@ def test_growth_guard_isolates_the_growing_axis():
     assert tripped_y
 
 
+def test_control_ready_before_settle_ready():
+    omega = math.sqrt(G / 3.0)
+    est = _AxisStaticEstimator(window_periods=1.1)
+    amp = math.radians(3.0)
+    dt = 0.08
+    period = 2 * math.pi / omega
+    t_ctrl = None
+    t_ready = None
+    for i in range(int(12.0 / dt)):
+        est.update(amp * math.cos(omega * (i * dt)), dt, omega)
+        if t_ctrl is None and est.control_ready():
+            t_ctrl = i * dt
+        if t_ready is None and est.ready:
+            t_ready = i * dt
+    assert t_ctrl is not None and t_ready is not None
+    assert t_ctrl < t_ready
+    assert t_ctrl < period * 0.75
+
+
 def test_model_rate_is_analytic_derivative():
     omega = math.sqrt(G / 3.0)
     est = _AxisStaticEstimator(window_periods=2.0)
@@ -259,7 +327,7 @@ def test_sim_settle_run_emits_debug():
         source=source, actuator=actuator, config=cfg, anchor_pos=anchor,
         initial_state=initial, sway_source=sway, is_simulation=True,
         verbose=False, initial_theta=(0.05, 0.03),
-        settle_theta_tol_rad=math.radians(0.5), settle_hold_cycles=5,
+        settle_theta_tol_rad=math.radians(0.5), settle_hold_sec=0.15,
         max_time=30.0,
     )
     assert len(history) > 0

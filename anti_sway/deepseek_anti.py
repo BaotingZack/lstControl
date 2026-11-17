@@ -56,6 +56,8 @@ _MIN_SAMPLES = 8
 # 至少覆盖一个完整摆周期，直流分量与摆动项才分得开。实测 0.6 个周期时后
 # 估计出的 θ* 仍带 ~0.7° 偏差；满一个周期后残差降到 <0.1°。
 _MIN_FIT_PERIODS = 1.0
+# 判稳/展示仍用 _MIN_FIT_PERIODS；控制可更早切到 θ−θ*，缩短大摆角初期的等窗时间。
+_CONTROL_MIN_PERIODS = 0.65
 
 
 def _solve3(matrix: list[list[float]], rhs: list[float]) -> list[float] | None:
@@ -89,7 +91,7 @@ class _AxisStaticEstimator:
     def __init__(
         self,
         *,
-        window_periods: float = 1.25,
+        window_periods: float = 1.1,
         min_window_s: float = 2.0,
         max_window_s: float = 12.0,
     ):
@@ -191,9 +193,15 @@ class _AxisStaticEstimator:
         self._omega = omega
         return self.static
 
+    def control_ready(self) -> bool:
+        """拟合可用于阻尼（θ_ac / 解析 θ̇），比 ``ready`` 更早，不参与判稳。"""
+        if len(self._samples) < _MIN_SAMPLES or self._omega <= 0.0:
+            return False
+        return self.coverage >= _CONTROL_MIN_PERIODS
+
     def model_rate(self) -> float:
         """摆动分量在最新采样时刻的解析导数 θ̇_ac [rad/s]（未收敛时返回 0）。"""
-        if not self.ready or self._omega <= 0.0:
+        if not self.control_ready() or self._omega <= 0.0:
             return 0.0
         w = self._omega
         tl = self._t_last
@@ -298,13 +306,13 @@ class DeepseekAntiController:
         self,
         rope_model: RopeLengthModel,
         *,
-        gain: float = 2.6,
-        max_correction: float = 0.2,
-        deadband_rad: float = math.radians(0.10),
+        gain: float = 3.2,
+        max_correction: float = 0.35,
+        deadband_rad: float = math.radians(0.08),
         sign: float = 1.0,
         sign_x: float = 1.0,
         sign_y: float = 1.0,
-        window_periods: float = 1.25,
+        window_periods: float = 1.1,
         min_window_s: float = 2.0,
         max_window_s: float = 12.0,
         lead_s: float = 1.5,
@@ -419,8 +427,8 @@ class DeepseekAntiController:
         ty = float(theta_y)
         static_x = self._est_x.update(tx, dt, omega)
         static_y = self._est_y.update(ty, dt, omega)
-        ac_x = tx - static_x if self._est_x.ready else tx
-        ac_y = ty - static_y if self._est_y.ready else ty
+        ac_x = tx - static_x if self._est_x.control_ready() else tx
+        ac_y = ty - static_y if self._est_y.control_ready() else ty
         rate_x = self._est_x.model_rate()
         rate_y = self._est_y.model_rate()
 
@@ -441,12 +449,12 @@ class DeepseekAntiController:
         allow_x = self._guard_x.update(
             t=self._est_x.t, amp_rad=self._est_x.amplitude,
             period_s=period,
-            active=(not blocked) and abs(u_x) > 0.0 and self._est_x.ready,
+            active=(not blocked) and abs(u_x) > 0.0 and self._est_x.control_ready(),
         )
         allow_y = self._guard_y.update(
             t=self._est_y.t, amp_rad=self._est_y.amplitude,
             period_s=period,
-            active=(not blocked) and abs(u_y) > 0.0 and self._est_y.ready,
+            active=(not blocked) and abs(u_y) > 0.0 and self._est_y.control_ready(),
         )
         if not allow_x:
             u_x = 0.0
@@ -563,16 +571,16 @@ def config_fields_from_site(site: dict[str, Any] | None) -> dict[str, Any]:
     site = site or {}
     return {
         'anti_sway_deepseek_gain': float(
-            site.get('anti_sway_deepseek_gain', 2.6)
+            site.get('anti_sway_deepseek_gain', 3.2)
         ),
         'anti_sway_deepseek_max_correction': float(
-            site.get('anti_sway_deepseek_max_correction', 0.2)
+            site.get('anti_sway_deepseek_max_correction', 0.35)
         ),
         'anti_sway_deepseek_deadband_deg': float(
-            site.get('anti_sway_deepseek_deadband_deg', 0.10)
+            site.get('anti_sway_deepseek_deadband_deg', 0.08)
         ),
         'anti_sway_deepseek_window_periods': float(
-            site.get('anti_sway_deepseek_window_periods', 1.25)
+            site.get('anti_sway_deepseek_window_periods', 1.1)
         ),
         'anti_sway_deepseek_sign': float(
             site.get('anti_sway_deepseek_sign', 1.0)
@@ -618,7 +626,7 @@ def build_strategy(config) -> DeepseekAntiStrategy | None:
         rope,
         gain=gain,
         max_correction=float(
-            getattr(config, 'anti_sway_deepseek_max_correction', 0.2)
+            getattr(config, 'anti_sway_deepseek_max_correction', 0.35)
         ),
         deadband_rad=math.radians(
             float(getattr(config, 'anti_sway_deepseek_deadband_deg', 0.10))
@@ -627,7 +635,7 @@ def build_strategy(config) -> DeepseekAntiStrategy | None:
         sign_x=float(getattr(config, 'anti_sway_deepseek_sign_x', 1.0)),
         sign_y=float(getattr(config, 'anti_sway_deepseek_sign_y', 1.0)),
         window_periods=float(
-            getattr(config, 'anti_sway_deepseek_window_periods', 1.25)
+            getattr(config, 'anti_sway_deepseek_window_periods', 1.1)
         ),
         lead_s=float(getattr(config, 'anti_sway_deepseek_lead_s', 1.5)),
         sim_lead_s=float(getattr(config, 'servo_time_constant_xy', 0.2)),

@@ -46,7 +46,8 @@ def run_settle_control(
     verbose: bool = True,
     initial_theta: tuple[float, float] | None = None,
     settle_theta_tol_rad: float | None = None,
-    settle_hold_cycles: int = 25,
+    settle_hold_sec: float | None = 3.5,
+    settle_hold_cycles: int | None = None,
 ) -> tuple[list[dict], list[tuple[float, str]]]:
     if initial_theta and sway_source is not None and hasattr(sway_source, 'theta_x'):
         sway_source.theta_x = float(initial_theta[0])
@@ -67,6 +68,7 @@ def run_settle_control(
         sway_source=sway_source,
         profile='settle',
         settle_theta_tol_rad=settle_theta_tol_rad,
+        settle_hold_sec=settle_hold_sec,
         settle_hold_cycles=settle_hold_cycles,
     )
     if verbose and history:

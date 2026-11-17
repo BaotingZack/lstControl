@@ -368,12 +368,12 @@ class CraneConfig:
     anti_sway_crane_remote_zc_release_ratio: float = 0.88
     anti_sway_input_shape_zeta: float = 0.01
     # deepseek-anti（仅消摆测试）：实时拟合静态倾角 θ*，只对 θ−θ* 施加阻尼。
-    anti_sway_deepseek_gain: float = 2.6
-    anti_sway_deepseek_max_correction: float = 0.2
-    anti_sway_deepseek_deadband_deg: float = 0.10
+    anti_sway_deepseek_gain: float = 3.2
+    anti_sway_deepseek_max_correction: float = 0.35
+    anti_sway_deepseek_deadband_deg: float = 0.08
     # 拟合窗口（摆周期数）：>=1 才能把 θ* 和摆动分量分开；更长更稳但对
     # 快速衰减的摆动会滞后。仿真 A/B（执行器 τ=1.5s）1.25 周期收敛最快。
-    anti_sway_deepseek_window_periods: float = 1.25
+    anti_sway_deepseek_window_periods: float = 1.1
     anti_sway_deepseek_sign: float = 1.0
     # 逐轴符号：倾角仪轴映射（pitch→X, roll→Y）只有一个轴的极性错时，
     # 表现是"一轴消得掉、另一轴越消越大"，用这两个单独翻转。
@@ -780,6 +780,33 @@ def _axis_arrived(
     return pos_ok and vel_ok
 
 
+def settle_angle_peak_rad(
+    *,
+    theta_x: float | None,
+    theta_y: float | None,
+    anti_sway_mode: str,
+    anti_sway_debug: dict | None,
+) -> float | None:
+    """消摆 profile 判稳用的峰值角 [rad]。
+
+    ``deepseek_anti``：与消摆页十字靶一致——彩色圆点是当前 θ，绿色菱形是 θ*；
+    二者接近即 ``max(|θ_ac|)`` 小，且须估计 ``ready`` 后才参与判稳（避免 θ* 未分时误判）。
+    其它算法：相对原点的 ``max(|θ_x|, |θ_y|)``。
+    """
+    if anti_sway_mode == 'deepseek_anti' and anti_sway_debug is not None:
+        if anti_sway_debug.get('mode') != 'deepseek_anti':
+            pass
+        else:
+            if not anti_sway_debug.get('ready'):
+                return None
+            ac_x = float(anti_sway_debug.get('theta_ac_x_deg') or 0.0)
+            ac_y = float(anti_sway_debug.get('theta_ac_y_deg') or 0.0)
+            return math.radians(max(abs(ac_x), abs(ac_y)))
+    if theta_x is None or theta_y is None:
+        return None
+    return max(abs(theta_x), abs(theta_y))
+
+
 def run_pd_control(
     source: PositionSource,
     actuator: Actuator,
@@ -793,7 +820,8 @@ def run_pd_control(
     sway_source: object | None = None,
     profile: str = 'goto',
     settle_theta_tol_rad: float | None = None,
-    settle_hold_cycles: int = 25,
+    settle_hold_sec: float | None = None,
+    settle_hold_cycles: int | None = None,
 ) -> tuple[list[dict], list[tuple[float, str]]]:
     """统一 PD 位置控制循环 — 仿真和 PLC 模式共用。
 
@@ -983,9 +1011,16 @@ def run_pd_control(
 
     completed = False
     settle_profile = profile == 'settle'
-    settle_streak = 0
+    settle_hold_accum_s = 0.0
     if settle_profile and settle_theta_tol_rad is None:
-        settle_theta_tol_rad = math.radians(0.3)
+        settle_theta_tol_rad = math.radians(0.05)
+    if settle_profile:
+        if settle_hold_sec is None:
+            if settle_hold_cycles is not None:
+                settle_hold_sec = settle_hold_cycles * 0.1
+            else:
+                settle_hold_sec = 3.5
+        settle_hold_sec = max(0.0, float(settle_hold_sec))
     start_dist_xy = math.hypot(target_x - crane.x.position, target_y - crane.y.position)
     best_dist_xy = start_dist_xy
     xy_diverge_streak = 0
@@ -1270,13 +1305,19 @@ def run_pd_control(
             if hooks is not None:
                 hooks.on_step(step_data)
 
-            if settle_profile and theta_x is not None and theta_y is not None:
-                peak = max(abs(theta_x), abs(theta_y))
-                if peak < settle_theta_tol_rad:
-                    settle_streak += 1
+            if settle_profile:
+                mode = getattr(config, 'anti_sway_mode', 'off')
+                peak = settle_angle_peak_rad(
+                    theta_x=theta_x,
+                    theta_y=theta_y,
+                    anti_sway_mode=mode,
+                    anti_sway_debug=anti_sway_debug,
+                )
+                if peak is not None and peak < settle_theta_tol_rad:
+                    settle_hold_accum_s += dt
                 else:
-                    settle_streak = 0
-                if settle_streak >= settle_hold_cycles:
+                    settle_hold_accum_s = 0.0
+                if settle_hold_sec > 0.0 and settle_hold_accum_s >= settle_hold_sec:
                     completed = True
                     break
 

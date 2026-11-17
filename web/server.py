@@ -937,7 +937,7 @@ def build_live_payload(
             for t, axis in phase_boundaries
         ],
         'frames': frames,
-        'swayTolDeg': default_sway_tol_deg(site_cfg) if simulate_inclinometer else 0.3,
+        'swayTolDeg': default_sway_tol_deg(site_cfg) if simulate_inclinometer else 0.05,
         'inclinometerSimulated': bool(simulate_inclinometer),
     }
     if pick_pos is not None:
@@ -1741,7 +1741,7 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         from settle_control import apply_settle_anti_sway_mode, run_settle_control
 
         run_config = apply_settle_anti_sway_mode(base_config, anti_sway_mode, site)
-        tol_rad = math.radians(getattr(server, 'hook_sway_angle_tol_deg', 0.3))
+        tol_rad = math.radians(getattr(server, 'hook_sway_angle_tol_deg', 0.05))
 
         if use_sim or (server.plc_actuator is None and not server.ros_source):
             use_sim = True
@@ -1801,6 +1801,9 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                     verbose=True,
                     initial_theta=(0.055, 0.035),
                     settle_theta_tol_rad=tol_rad,
+                    settle_hold_sec=getattr(
+                        server, 'hook_sway_settle_hold_sec', 3.5,
+                    ),
                 )
                 cs.set_done()
                 hooks.done()
@@ -1858,6 +1861,9 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
                     is_simulation=False,
                     verbose=True,
                     settle_theta_tol_rad=tol_rad,
+                    settle_hold_sec=getattr(
+                        server, 'hook_sway_settle_hold_sec', 3.5,
+                    ),
                 )
                 cs.set_done()
                 hooks.done()
@@ -2062,7 +2068,7 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
     def _handle_sway_snapshot(self):
         """Return inclinometer / sway angles for PTP live UI."""
         snap = dict(get_sway_snapshot())
-        snap['tol_deg'] = getattr(self.server, 'hook_sway_angle_tol_deg', 0.3)
+        snap['tol_deg'] = getattr(self.server, 'hook_sway_angle_tol_deg', 0.05)
         body = json.dumps(snap, ensure_ascii=False).encode('utf-8')
         self._write(200, 'application/json; charset=utf-8', body)
 
@@ -2248,12 +2254,14 @@ class CraneLiveServer(ThreadingHTTPServer):
     def __init__(self, server_address, payload, payload_factory=None, plc=None,
                  ros_source=None, plc_actuator=None, config=None,
                  initial_pos=None, update_hz=10.0, speed=1.0,
-                 coordinate_transform=None, hook_sway_angle_tol_deg=0.3):
+                 coordinate_transform=None, hook_sway_angle_tol_deg=0.05,
+                 hook_sway_settle_hold_sec: float = 3.5):
         super().__init__(server_address, _LiveRequestHandler)
         self.payload = payload
         self.payload_factory = payload_factory
         self.plc = plc  # PLC instance for interactive control (stop/reset)
         self.hook_sway_angle_tol_deg = hook_sway_angle_tol_deg
+        self.hook_sway_settle_hold_sec = float(hook_sway_settle_hold_sec)
         # PLC real-time control mode
         self.ros_source: RosPositionSource | None = ros_source
         self.plc_actuator: PlcActuator | None = plc_actuator
@@ -2325,7 +2333,8 @@ def serve_live_view(
     update_hz: float = 10.0,
     speed: float = 1.0,
     coordinate_transform: CoordinateTransform2D | None = None,
-    hook_sway_angle_tol_deg: float = 0.3,
+    hook_sway_angle_tol_deg: float = 0.05,
+    hook_sway_settle_hold_sec: float = 3.5,
 ):
     """Start a blocking browser live-view server.
 
@@ -2345,6 +2354,7 @@ def serve_live_view(
         update_hz=update_hz, speed=speed,
         coordinate_transform=coordinate_transform,
         hook_sway_angle_tol_deg=hook_sway_angle_tol_deg,
+        hook_sway_settle_hold_sec=hook_sway_settle_hold_sec,
     )
     actual_host, actual_port = server.server_address
     url = f'http://{actual_host}:{actual_port}'

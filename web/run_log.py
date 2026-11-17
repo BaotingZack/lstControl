@@ -58,6 +58,7 @@ def site_config_debug_subset(site: dict[str, Any] | None) -> dict[str, Any]:
         'rope_length_sheave_height',
         'rope_length_grab_offset',
         'hook_sway_angle_tol_deg',
+        'hook_sway_settle_hold_sec',
     )
     out: dict[str, Any] = {}
     for key in keys:

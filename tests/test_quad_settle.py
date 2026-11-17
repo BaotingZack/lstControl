@@ -93,7 +93,7 @@ def test_sim_settle_quad_converges_fast():
         verbose=False,
         initial_theta=(0.09, 0.06),
         settle_theta_tol_rad=math.radians(0.35),
-        settle_hold_cycles=15,
+        settle_hold_sec=0.05,
         max_time=25.0,
     )
     assert len(history) > 10

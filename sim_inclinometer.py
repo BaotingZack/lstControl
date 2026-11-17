@@ -120,4 +120,4 @@ def inclinometer_fields_for_sway(
 
 def default_sway_tol_deg(site: dict[str, Any] | None = None) -> float:
     site = site if site is not None else load_site_config()
-    return float(site.get('hook_sway_angle_tol_deg', 0.3))
+    return float(site.get('hook_sway_angle_tol_deg', 0.05))

@@ -39,6 +39,7 @@ SITE_CONFIG_FIELDS = frozenset({
     'anti_sway_theta_x_sign',
     'anti_sway_theta_y_sign',
     'hook_sway_angle_tol_deg',
+    'hook_sway_settle_hold_sec',
     'hook_sway_angle_tol_approach_deg',
     'anti_sway_locked_max_shift',
     'anti_sway_hold_recenter_gain',

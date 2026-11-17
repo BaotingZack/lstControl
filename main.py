@@ -320,7 +320,8 @@ def _start_live_server(
             speed=args.speed,
         )
 
-    sway_tol = float(site.get('hook_sway_angle_tol_deg', 0.3))
+    sway_tol = float(site.get('hook_sway_angle_tol_deg', 0.05))
+    sway_hold_sec = float(site.get('hook_sway_settle_hold_sec', 3.5))
 
     serve_live_view(
         payload,
@@ -336,6 +337,7 @@ def _start_live_server(
         speed=args.speed,
         coordinate_transform=coordinate_transform,
         hook_sway_angle_tol_deg=sway_tol,
+        hook_sway_settle_hold_sec=sway_hold_sec,
     )
 
 
