@@ -787,6 +787,62 @@ def _point_tuple(point: tuple[float, float, float]) -> dict[str, float]:
     return {'x': point[0], 'y': point[1], 'z': point[2]}
 
 
+def _parse_settle_sim_anchor(
+    req: dict[str, Any] | None,
+    config: CraneConfig,
+    default: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """仿真消摆锚点：默认 initial_pos；请求里可带 anchor 或 anchor_z。"""
+    if not isinstance(req, dict):
+        return default
+    anchor = req.get('anchor')
+    if isinstance(anchor, dict):
+        try:
+            return config.validate_position((
+                float(anchor['x']),
+                float(anchor['y']),
+                float(anchor['z']),
+            ))
+        except (KeyError, TypeError, ValueError):
+            pass
+    if 'anchor_z' in req:
+        try:
+            z = float(req['anchor_z'])
+            return config.validate_position((default[0], default[1], z))
+        except (TypeError, ValueError):
+            pass
+    return default
+
+
+def _live_settle_crane_pose(
+    server,
+    config: CraneConfig,
+) -> tuple[float, float, float, float, float, float, bool]:
+    """当前行车锚点 (px,py,pz) 与地图显示坐标；Z 优先 PLC 抓钩高度。"""
+    pose = get_latest_pose()
+    if pose is None:
+        raise ValueError('no localization pose')
+    px, py, pz = config.validate_position(
+        server.coordinate_transform.localization_map_to_crane_position(
+            pose['x'], pose['y'], pose['z']
+        )
+    )
+    z_is_hoist = False
+    plc = server.plc
+    if plc is not None:
+        try:
+            hoist_z = plc.get_lift_height()
+        except Exception:
+            hoist_z = None
+        if hoist_z is not None and math.isfinite(hoist_z):
+            pz = float(hoist_z)
+            z_is_hoist = True
+    map_x, map_y, map_z = server.coordinate_transform.crane_to_map_display(
+        px, py, pz, z_is_hoist_height=z_is_hoist,
+    )
+    return px, py, pz, map_x, map_y, map_z, z_is_hoist
+
+
 def _build_ptp_planned_route(
     initial: tuple[float, float, float],
     target: tuple[float, float, float],
@@ -1759,10 +1815,11 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
 
         cs = ControlState()
         cs.begin_run(kind='settle', anti_sway_mode=anti_sway_mode, sim=use_sim)
+        sim_default_anchor = server.initial_pos or (2.0, 2.0, 3.0)
         hooks = LiveControlHooks(
             control_state=cs,
             coordinate_transform=server.coordinate_transform,
-            z_is_hoist_height=False,
+            z_is_hoist_height=not use_sim,
         )
         server.control_state = cs
         server.control_hooks = hooks
@@ -1772,7 +1829,11 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
             from anti_sway.sim_feedback import SimSwayFeedback
             from crane_model import CranePlant, PlantActuator, SimPositionSource
 
-            anchor = server.initial_pos or (2.0, 2.0, 3.0)
+            anchor = _parse_settle_sim_anchor(
+                req if isinstance(req, dict) else None,
+                run_config,
+                sim_default_anchor,
+            )
             initial = CraneState(x0=anchor[0], y0=anchor[1], z0=anchor[2])
             plant = CranePlant(run_config)
             source = SimPositionSource(plant, initial, run_config)
@@ -1821,27 +1882,29 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
 
             ros_source = server.ros_source
             plc_actuator = server.plc_actuator
-            pose = get_latest_pose()
-            if pose is None or ros_source is None or plc_actuator is None:
+            if ros_source is None or plc_actuator is None:
                 cs.set_error('No localization / PLC for live settle')
                 server.persist_run_log(cs)
                 server.release_control_run()
                 return
             try:
-                px, py, pz = base_config.validate_position(
-                    server.coordinate_transform.localization_map_to_crane_position(
-                        pose['x'], pose['y'], pose['z']
-                    )
+                px, py, pz, map_x, map_y, map_z, z_is_hoist = _live_settle_crane_pose(
+                    server, base_config,
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 cs.set_error(f'Invalid localization: {exc}')
                 server.persist_run_log(cs)
                 server.release_control_run()
                 return
-            map_pose = dict(pose)
+            except ValueError as exc:
+                cs.set_error(str(exc) if str(exc) else 'No localization / PLC for live settle')
+                server.persist_run_log(cs)
+                server.release_control_run()
+                return
+            hooks._z_is_hoist_height = z_is_hoist
             cs.set_start(
-                pos={'x': map_pose['x'], 'y': map_pose['y'], 'z': map_pose['z']},
-                target={'x': map_pose['x'], 'y': map_pose['y'], 'z': map_pose['z']},
+                pos={'x': map_x, 'y': map_y, 'z': map_z},
+                target={'x': map_x, 'y': map_y, 'z': map_z},
             )
             with cs.lock:
                 cs.scheduler_phase_label = '消摆真机 / Live settle — 请手动晃钩'
