@@ -93,7 +93,12 @@ class _AxisStaticEstimator:
         *,
         window_periods: float = 1.1,
         min_window_s: float = 2.0,
+        min_window_periods: float = 0.85,
+        min_window_floor_s: float = 0.55,
         max_window_s: float = 12.0,
+        static_slew_amp_rad: float = math.radians(0.12),
+        static_slew_rad_per_s: float = math.radians(1.1),
+        static_freeze_amp_rad: float = math.radians(0.22),
     ):
         if window_periods <= 0:
             raise ValueError('window_periods must be positive')
@@ -101,7 +106,12 @@ class _AxisStaticEstimator:
             raise ValueError('invalid window bounds')
         self.window_periods = float(window_periods)
         self.min_window_s = float(min_window_s)
+        self.min_window_periods = float(min_window_periods)
+        self.min_window_floor_s = float(min_window_floor_s)
         self.max_window_s = float(max_window_s)
+        self.static_slew_amp_rad = max(0.0, float(static_slew_amp_rad))
+        self.static_slew_rad_per_s = max(0.0, float(static_slew_rad_per_s))
+        self.static_freeze_amp_rad = max(0.0, float(static_freeze_amp_rad))
         self.reset()
 
     def reset(self) -> None:
@@ -118,6 +128,7 @@ class _AxisStaticEstimator:
         self._a_sin = 0.0
         self._omega = 0.0
         self._t_last = 0.0
+        self._static_frozen = False
 
     def update(self, theta: float, dt: float, omega: float) -> float:
         """Feed one sample; returns the current static angle estimate [rad]."""
@@ -129,9 +140,14 @@ class _AxisStaticEstimator:
         self._t_last = t_now
 
         period = _TWO_PI / omega
+        min_by_period = max(
+            self.min_window_floor_s,
+            self.min_window_periods * period,
+        )
+        eff_min = min(self.min_window_s, min_by_period)
         self.window_s = min(
             self.max_window_s,
-            max(self.min_window_s, self.window_periods * period),
+            max(eff_min, self.window_periods * period),
         )
         while self._samples and (self.t - self._samples[0][0]) > self.window_s:
             self._samples.popleft()
@@ -184,6 +200,29 @@ class _AxisStaticEstimator:
             fit = bias + a_cos * math.cos(omega * t) + a_sin * math.sin(omega * t)
             err += (y - fit) ** 2
 
+        amp_now = math.hypot(a_cos, a_sin)
+        unfreeze = (
+            self.static_freeze_amp_rad > 0.0
+            and amp_now > self.static_freeze_amp_rad * 1.75
+        )
+        if unfreeze:
+            self._static_frozen = False
+        freeze = (
+            self.ready
+            and self.static_freeze_amp_rad > 0.0
+            and amp_now < self.static_freeze_amp_rad
+        )
+        if freeze:
+            self._static_frozen = True
+        elif (
+            self.static_slew_rad_per_s > 0.0
+            and amp_now < self.static_slew_amp_rad
+        ):
+            slew = self.static_slew_rad_per_s * dt
+            bias = self.static + max(-slew, min(slew, bias - self.static))
+        if self._static_frozen:
+            bias = self.static
+
         self.static = bias
         self.amplitude = math.hypot(a_cos, a_sin)
         self.rms = math.sqrt(err / n)
@@ -217,6 +256,7 @@ class _AxisStaticEstimator:
             'window_s': self.window_s,
             'ready': self.ready,
             'samples': len(self._samples),
+            'static_frozen': self._static_frozen,
         }
 
 
@@ -314,9 +354,28 @@ class DeepseekAntiController:
         sign_y: float = 1.0,
         window_periods: float = 1.1,
         min_window_s: float = 2.0,
+        min_window_periods: float = 0.85,
+        min_window_floor_s: float = 0.55,
         max_window_s: float = 12.0,
         lead_s: float = 1.5,
         sim_lead_s: float = 0.2,
+        lead_ac_cap_ratio: float = 1.05,
+        lead_ac_cap_min_deg: float = 0.35,
+        lead_rope_ref_m: float = 3.5,
+        lead_rope_exp: float = 1.25,
+        lead_short_min_ratio: float = 0.35,
+        tail_recenter_gain: float = 0.0,
+        lead_taper_ac_deg: float = 0.35,
+        static_slew_amp_deg: float = 0.35,
+        static_slew_deg_per_s: float = 0.55,
+        static_freeze_amp_deg: float = 0.22,
+        tail_ema_tau_s: float = 2.8,
+        tail_ema_amp_deg: float = 0.30,
+        lead_off_ac_deg: float = 0.12,
+        tail_deadband_deg: float = 0.025,
+        rope_short_m: float = 2.35,
+        rope_gain_ref_m: float = 2.5,
+        rope_gain_max_scale: float = 1.22,
         zeta_ref: float = 0.0,
         max_shift_m: float = 0.0,
         guard_enabled: bool = True,
@@ -338,18 +397,39 @@ class DeepseekAntiController:
         self.sign_y = self.sign * (1.0 if float(sign_y) >= 0 else -1.0)
         self.lead_s = max(0.0, float(lead_s))
         self.sim_lead_s = max(0.0, float(sim_lead_s))
+        self.lead_ac_cap_ratio = max(0.0, float(lead_ac_cap_ratio))
+        self.lead_ac_cap_min_rad = math.radians(
+            max(0.0, float(lead_ac_cap_min_deg))
+        )
+        self.lead_rope_ref_m = max(0.5, float(lead_rope_ref_m))
+        self.lead_rope_exp = max(0.0, float(lead_rope_exp))
+        self.lead_short_min_ratio = min(1.0, max(0.0, float(lead_short_min_ratio)))
+        self.tail_recenter_gain = min(1.0, max(0.0, float(tail_recenter_gain)))
+        self.lead_taper_ac_rad = math.radians(max(0.0, float(lead_taper_ac_deg)))
+        slew_amp = math.radians(max(0.0, float(static_slew_amp_deg)))
+        slew_rate = math.radians(max(0.0, float(static_slew_deg_per_s)))
+        freeze_amp = math.radians(max(0.0, float(static_freeze_amp_deg)))
+        self.tail_ema_tau_s = max(0.2, float(tail_ema_tau_s))
+        self.tail_ema_amp_rad = math.radians(max(0.0, float(tail_ema_amp_deg)))
+        self.lead_off_ac_rad = math.radians(max(0.0, float(lead_off_ac_deg)))
+        self.tail_deadband_rad = math.radians(max(0.0, float(tail_deadband_deg)))
+        self.rope_short_m = max(0.5, float(rope_short_m))
+        self.rope_gain_ref_m = max(0.5, float(rope_gain_ref_m))
+        self.rope_gain_max_scale = max(1.0, float(rope_gain_max_scale))
         self.zeta_ref = max(0.0, float(zeta_ref))
         self.max_shift_m = max(0.0, float(max_shift_m))
-        self._est_x = _AxisStaticEstimator(
+        est_kw = dict(
             window_periods=window_periods,
             min_window_s=min_window_s,
+            min_window_periods=min_window_periods,
+            min_window_floor_s=min_window_floor_s,
             max_window_s=max_window_s,
+            static_slew_amp_rad=slew_amp,
+            static_slew_rad_per_s=slew_rate,
+            static_freeze_amp_rad=freeze_amp,
         )
-        self._est_y = _AxisStaticEstimator(
-            window_periods=window_periods,
-            min_window_s=min_window_s,
-            max_window_s=max_window_s,
-        )
+        self._est_x = _AxisStaticEstimator(**est_kw)
+        self._est_y = _AxisStaticEstimator(**est_kw)
         self._guard_x = _AxisGuard(
             enabled=guard_enabled, ratio=guard_ratio,
             min_amp_deg=guard_min_amp_deg,
@@ -376,6 +456,14 @@ class DeepseekAntiController:
         self._last_sign_x = self.sign
         self._last_sign_y = self.sign
         self._budget_blocked = False
+        self._last_recenter_x = False
+        self._last_recenter_y = False
+        self._theta_ema_x = 0.0
+        self._theta_ema_y = 0.0
+        self._tail_ema_x = False
+        self._tail_ema_y = False
+        self._last_lead_x = 0.0
+        self._last_lead_y = 0.0
 
     def reset(self) -> None:
         self._est_x.reset()
@@ -387,12 +475,108 @@ class DeepseekAntiController:
         self._last_rate_x = self._last_rate_y = 0.0
         self._last_u_x = self._last_u_y = 0.0
         self._budget_blocked = False
+        self._last_recenter_x = self._last_recenter_y = False
+        self._theta_ema_x = self._theta_ema_y = 0.0
+        self._tail_ema_x = self._tail_ema_y = False
+
+    def _axis_ac(
+        self,
+        est: _AxisStaticEstimator,
+        theta: float,
+        dt: float,
+        ema_state: str,
+    ) -> tuple[float, bool]:
+        """θ_ac；尾段 LS 摆幅很小时用慢 EMA 作基准（避免 θ*≈θ 导致无输出）。"""
+        if not est.control_ready():
+            return float(theta), False
+        tail = bool(
+            est.ready
+            and self.tail_ema_amp_rad > 0.0
+            and est.amplitude < self.tail_ema_amp_rad
+        )
+        if tail:
+            alpha = dt / (self.tail_ema_tau_s + dt)
+            if ema_state == 'x':
+                self._theta_ema_x += alpha * (float(theta) - self._theta_ema_x)
+                base = self._theta_ema_x
+                self._tail_ema_x = True
+            else:
+                self._theta_ema_y += alpha * (float(theta) - self._theta_ema_y)
+                base = self._theta_ema_y
+                self._tail_ema_y = True
+            return float(theta) - base, True
+        if ema_state == 'x':
+            self._tail_ema_x = False
+            self._theta_ema_x += 0.1 * (est.static - self._theta_ema_x)
+        else:
+            self._tail_ema_y = False
+            self._theta_ema_y += 0.1 * (est.static - self._theta_ema_y)
+        return float(theta) - est.static, False
+
+    def _lead_taper(self, lead_s: float, ac: float) -> float:
+        if lead_s <= 0.0:
+            return 0.0
+        if self.lead_off_ac_rad > 0.0 and abs(ac) < self.lead_off_ac_rad:
+            return 0.0
+        if self.lead_taper_ac_rad <= 0.0:
+            return lead_s
+        return lead_s * min(1.0, abs(ac) / self.lead_taper_ac_rad)
 
     def _effective_gain(self, rope_m: float) -> float:
+        rope_m = max(rope_m, 1e-6)
         if self.zeta_ref <= 0.0:
-            return self.gain
-        k_rope = 2.0 * self.zeta_ref * math.sqrt(GRAVITY * max(rope_m, 1e-6))
+            k = float(self.gain)
+            ref = self.rope_gain_ref_m
+            # 仅短绳抬 K；长绳保持配置 gain，避免长绳变弱。
+            if ref > 0.0 and rope_m < ref:
+                scale = math.sqrt(ref / rope_m)
+                scale = min(self.rope_gain_max_scale, max(1.0, scale))
+                k *= scale
+            return k
+        k_rope = 2.0 * self.zeta_ref * math.sqrt(GRAVITY * rope_m)
         return min(self.gain, k_rope)
+
+    def _effective_lead(
+        self,
+        lead_s: float,
+        rope_m: float,
+        is_simulation: bool,
+    ) -> float:
+        """现场 T_lead 按长绳标定；绳变短后 ω↑，固定 1.5s 易过补相位并在尾段与 θ_ac 相消。"""
+        if is_simulation or lead_s <= 0.0:
+            return lead_s
+        ref = self.lead_rope_ref_m
+        if rope_m >= ref:
+            return lead_s
+        ratio = max(1e-6, rope_m / ref)
+        scale = max(self.lead_short_min_ratio, ratio ** self.lead_rope_exp)
+        return lead_s * scale
+
+    def _combined_ac(
+        self,
+        ac: float,
+        rate: float,
+        omega: float,
+        lead_s: float,
+        rope_m: float,
+    ) -> float:
+        if lead_s <= 0.0:
+            return ac
+        lead_add = lead_s * rate
+        # 长绳：保留完整 T_lead·θ̇（现场 1.5s 补偿 PLC 滞后）。短绳才限幅防过补偿。
+        if rope_m >= self.rope_short_m:
+            return ac + lead_add
+        if (
+            self.lead_ac_cap_ratio > 0.0
+            and abs(ac) >= self.lead_ac_cap_min_rad
+        ):
+            cap = abs(ac) * self.lead_ac_cap_ratio
+            if cap > 0.0 and abs(lead_add) > cap:
+                lead_add = math.copysign(cap, lead_add)
+        wtau = lead_s * max(omega, 0.0)
+        if wtau > 3.0 and abs(ac) >= self.lead_ac_cap_min_rad:
+            lead_add *= 1.0 / (1.0 + (wtau - 3.0) ** 2)
+        return ac + lead_add
 
     def _law(
         self,
@@ -401,10 +585,23 @@ class DeepseekAntiController:
         k_eff: float,
         lead_s: float,
         sign: float,
+        omega: float,
+        rope_m: float,
+        *,
+        deadband_rad: float | None = None,
     ) -> float:
-        eff = ac + lead_s * rate
-        if abs(eff) < self.deadband_rad:
-            return 0.0
+        db = self.deadband_rad if deadband_rad is None else max(0.0, deadband_rad)
+        eff = self._combined_ac(ac, rate, omega, lead_s, rope_m)
+        if abs(eff) < db:
+            # 近平衡：T_lead·θ̇ 与 θ_ac 易相消，combined 掉进死区；保留 P 或 D 单独作用。
+            if abs(ac) >= db:
+                eff = ac
+            elif lead_s > 0.0 and abs(lead_s * rate) >= db:
+                eff = lead_s * rate
+            elif abs(ac) * k_eff >= 0.5 * db:
+                eff = ac
+            else:
+                return 0.0
         u = sign * k_eff * eff
         return max(-self.max_correction, min(self.max_correction, u))
 
@@ -421,16 +618,25 @@ class DeepseekAntiController:
         omega = math.sqrt(GRAVITY / max(L, 1e-6))
         period = _TWO_PI / omega
         k_eff = self._effective_gain(L)
-        lead_s = self.sim_lead_s if is_simulation else self.lead_s
+        lead_base = self.sim_lead_s if is_simulation else self.lead_s
+        lead_s = self._effective_lead(lead_base, L, is_simulation)
 
         tx = float(theta_x)
         ty = float(theta_y)
         static_x = self._est_x.update(tx, dt, omega)
         static_y = self._est_y.update(ty, dt, omega)
-        ac_x = tx - static_x if self._est_x.control_ready() else tx
-        ac_y = ty - static_y if self._est_y.control_ready() else ty
-        rate_x = self._est_x.model_rate()
-        rate_y = self._est_y.model_rate()
+        ac_x, ema_x = self._axis_ac(self._est_x, tx, dt, 'x')
+        ac_y, ema_y = self._axis_ac(self._est_y, ty, dt, 'y')
+        self._last_recenter_x = False
+        self._last_recenter_y = False
+        lead_x = self._lead_taper(lead_s, ac_x)
+        lead_y = self._lead_taper(lead_s, ac_y)
+        self._last_lead_x = lead_x
+        self._last_lead_y = lead_y
+        rate_x = self._est_x.model_rate() if not ema_x else 0.0
+        rate_y = self._est_y.model_rate() if not ema_y else 0.0
+        db_x = self.tail_deadband_rad if ema_x else self.deadband_rad
+        db_y = self.tail_deadband_rad if ema_y else self.deadband_rad
 
         # 逐轴符号修的是"现场倾角仪轴映射"的极性：仿真摆角是按物理定义直接
         # 生成的，不存在映射误差，所以仿真里只用总符号 sign。
@@ -443,8 +649,12 @@ class DeepseekAntiController:
         if blocked:
             u_x = u_y = 0.0
         else:
-            u_x = self._law(ac_x, rate_x, k_eff, lead_s, sign_x)
-            u_y = self._law(ac_y, rate_y, k_eff, lead_s, sign_y)
+            u_x = self._law(
+                ac_x, rate_x, k_eff, lead_x, sign_x, omega, L, deadband_rad=db_x,
+            )
+            u_y = self._law(
+                ac_y, rate_y, k_eff, lead_y, sign_y, omega, L, deadband_rad=db_y,
+            )
 
         allow_x = self._guard_x.update(
             t=self._est_x.t, amp_rad=self._est_x.amplitude,
@@ -474,7 +684,7 @@ class DeepseekAntiController:
         self._last_gain_eff = k_eff
         self._last_sign_x = sign_x
         self._last_sign_y = sign_y
-        self._last_lead_s = lead_s
+        self._last_lead_s = max(lead_x, lead_y)
         self._last_dist_xy = float(dist_xy)
         self._budget_blocked = blocked
         return u_x, u_y
@@ -520,6 +730,14 @@ class DeepseekAntiController:
             'guard_x': self._guard_x.suspended,
             'guard_y': self._guard_y.suspended,
             'guard_trips': self._guard_x.trips + self._guard_y.trips,
+            'tail_recenter_x': self._last_recenter_x,
+            'tail_recenter_y': self._last_recenter_y,
+            'static_frozen_x': ex.get('static_frozen'),
+            'static_frozen_y': ey.get('static_frozen'),
+            'tail_ema_x': self._tail_ema_x,
+            'tail_ema_y': self._tail_ema_y,
+            'lead_s_x': self._last_lead_x,
+            'lead_s_y': self._last_lead_y,
         }
 
 class DeepseekAntiStrategy:
@@ -596,6 +814,57 @@ def config_fields_from_site(site: dict[str, Any] | None) -> dict[str, Any]:
         'anti_sway_deepseek_lead_s': float(
             site.get('anti_sway_deepseek_lead_s', 1.5)
         ),
+        'anti_sway_deepseek_lead_ac_cap_ratio': float(
+            site.get('anti_sway_deepseek_lead_ac_cap_ratio', 1.05)
+        ),
+        'anti_sway_deepseek_lead_ac_cap_min_deg': float(
+            site.get('anti_sway_deepseek_lead_ac_cap_min_deg', 0.35)
+        ),
+        'anti_sway_deepseek_lead_rope_ref_m': float(
+            site.get('anti_sway_deepseek_lead_rope_ref_m', 3.5)
+        ),
+        'anti_sway_deepseek_lead_rope_exp': float(
+            site.get('anti_sway_deepseek_lead_rope_exp', 1.25)
+        ),
+        'anti_sway_deepseek_lead_short_min_ratio': float(
+            site.get('anti_sway_deepseek_lead_short_min_ratio', 0.35)
+        ),
+        'anti_sway_deepseek_tail_recenter_gain': float(
+            site.get('anti_sway_deepseek_tail_recenter_gain', 0.0)
+        ),
+        'anti_sway_deepseek_lead_taper_ac_deg': float(
+            site.get('anti_sway_deepseek_lead_taper_ac_deg', 0.35)
+        ),
+        'anti_sway_deepseek_static_slew_deg_per_s': float(
+            site.get('anti_sway_deepseek_static_slew_deg_per_s', 0.55)
+        ),
+        'anti_sway_deepseek_static_freeze_amp_deg': float(
+            site.get('anti_sway_deepseek_static_freeze_amp_deg', 0.22)
+        ),
+        'anti_sway_deepseek_tail_ema_tau_s': float(
+            site.get('anti_sway_deepseek_tail_ema_tau_s', 2.8)
+        ),
+        'anti_sway_deepseek_tail_ema_amp_deg': float(
+            site.get('anti_sway_deepseek_tail_ema_amp_deg', 0.30)
+        ),
+        'anti_sway_deepseek_lead_off_ac_deg': float(
+            site.get('anti_sway_deepseek_lead_off_ac_deg', 0.12)
+        ),
+        'anti_sway_deepseek_tail_deadband_deg': float(
+            site.get('anti_sway_deepseek_tail_deadband_deg', 0.025)
+        ),
+        'anti_sway_deepseek_min_window_periods': float(
+            site.get('anti_sway_deepseek_min_window_periods', 0.85)
+        ),
+        'anti_sway_deepseek_rope_short_m': float(
+            site.get('anti_sway_deepseek_rope_short_m', 2.35)
+        ),
+        'anti_sway_deepseek_rope_gain_ref_m': float(
+            site.get('anti_sway_deepseek_rope_gain_ref_m', 2.5)
+        ),
+        'anti_sway_deepseek_rope_gain_max_scale': float(
+            site.get('anti_sway_deepseek_rope_gain_max_scale', 1.22)
+        ),
         'anti_sway_deepseek_zeta_ref': float(
             site.get('anti_sway_deepseek_zeta_ref', 0.0)
         ),
@@ -637,8 +906,59 @@ def build_strategy(config) -> DeepseekAntiStrategy | None:
         window_periods=float(
             getattr(config, 'anti_sway_deepseek_window_periods', 1.1)
         ),
+        min_window_periods=float(
+            getattr(config, 'anti_sway_deepseek_min_window_periods', 0.85)
+        ),
         lead_s=float(getattr(config, 'anti_sway_deepseek_lead_s', 1.5)),
         sim_lead_s=float(getattr(config, 'servo_time_constant_xy', 0.2)),
+        lead_ac_cap_ratio=float(
+            getattr(config, 'anti_sway_deepseek_lead_ac_cap_ratio', 1.05)
+        ),
+        lead_ac_cap_min_deg=float(
+            getattr(config, 'anti_sway_deepseek_lead_ac_cap_min_deg', 0.35)
+        ),
+        lead_rope_ref_m=float(
+            getattr(config, 'anti_sway_deepseek_lead_rope_ref_m', 3.5)
+        ),
+        lead_rope_exp=float(
+            getattr(config, 'anti_sway_deepseek_lead_rope_exp', 1.25)
+        ),
+        lead_short_min_ratio=float(
+            getattr(config, 'anti_sway_deepseek_lead_short_min_ratio', 0.35)
+        ),
+        tail_recenter_gain=float(
+            getattr(config, 'anti_sway_deepseek_tail_recenter_gain', 0.0)
+        ),
+        lead_taper_ac_deg=float(
+            getattr(config, 'anti_sway_deepseek_lead_taper_ac_deg', 0.35)
+        ),
+        static_slew_deg_per_s=float(
+            getattr(config, 'anti_sway_deepseek_static_slew_deg_per_s', 0.55)
+        ),
+        static_freeze_amp_deg=float(
+            getattr(config, 'anti_sway_deepseek_static_freeze_amp_deg', 0.22)
+        ),
+        tail_ema_tau_s=float(
+            getattr(config, 'anti_sway_deepseek_tail_ema_tau_s', 2.8)
+        ),
+        tail_ema_amp_deg=float(
+            getattr(config, 'anti_sway_deepseek_tail_ema_amp_deg', 0.30)
+        ),
+        lead_off_ac_deg=float(
+            getattr(config, 'anti_sway_deepseek_lead_off_ac_deg', 0.12)
+        ),
+        tail_deadband_deg=float(
+            getattr(config, 'anti_sway_deepseek_tail_deadband_deg', 0.025)
+        ),
+        rope_short_m=float(
+            getattr(config, 'anti_sway_deepseek_rope_short_m', 2.35)
+        ),
+        rope_gain_ref_m=float(
+            getattr(config, 'anti_sway_deepseek_rope_gain_ref_m', 2.5)
+        ),
+        rope_gain_max_scale=float(
+            getattr(config, 'anti_sway_deepseek_rope_gain_max_scale', 1.22)
+        ),
         zeta_ref=float(getattr(config, 'anti_sway_deepseek_zeta_ref', 0.0)),
         max_shift_m=float(
             getattr(config, 'anti_sway_deepseek_max_shift_m', 0.06)

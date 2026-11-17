@@ -382,6 +382,23 @@ class CraneConfig:
     # 相位超前时间常数 [s]：取 ≈ PLC 速度回路一阶滞后时间。仿真分支自动改用
     # servo_time_constant_xy，所以这里填现场值即可。
     anti_sway_deepseek_lead_s: float = 1.5
+    anti_sway_deepseek_lead_ac_cap_ratio: float = 1.05
+    anti_sway_deepseek_lead_ac_cap_min_deg: float = 0.35
+    anti_sway_deepseek_lead_rope_ref_m: float = 3.5
+    anti_sway_deepseek_lead_rope_exp: float = 1.25
+    anti_sway_deepseek_lead_short_min_ratio: float = 0.35
+    anti_sway_deepseek_tail_recenter_gain: float = 0.0
+    anti_sway_deepseek_lead_taper_ac_deg: float = 0.35
+    anti_sway_deepseek_static_slew_deg_per_s: float = 0.55
+    anti_sway_deepseek_static_freeze_amp_deg: float = 0.22
+    anti_sway_deepseek_tail_ema_tau_s: float = 2.8
+    anti_sway_deepseek_tail_ema_amp_deg: float = 0.30
+    anti_sway_deepseek_lead_off_ac_deg: float = 0.12
+    anti_sway_deepseek_tail_deadband_deg: float = 0.025
+    anti_sway_deepseek_min_window_periods: float = 0.85
+    anti_sway_deepseek_rope_short_m: float = 2.35
+    anti_sway_deepseek_rope_gain_ref_m: float = 2.5
+    anti_sway_deepseek_rope_gain_max_scale: float = 1.22
     # 绳长增益调度：K_eff = min(K, 2·ζ_ref·√(gL))，只下调不上调；0=关闭调度。
     # 默认关闭：实测 L=1.5m 时 ζ_ref=0.24 会把 K 从 2.6 压到 1.84，消摆收敛
     # 从 3.4s 拖到 8.5s，得不偿失。需要恒定阻尼比做实验时再打开。
@@ -789,8 +806,8 @@ def settle_angle_peak_rad(
 ) -> float | None:
     """消摆 profile 判稳用的峰值角 [rad]。
 
-    ``deepseek_anti``：与消摆页十字靶一致——彩色圆点是当前 θ，绿色菱形是 θ*；
-    二者接近即 ``max(|θ_ac|)`` 小，且须估计 ``ready`` 后才参与判稳（避免 θ* 未分时误判）。
+    ``deepseek_anti``：``ready`` 后用 ``max(|θ_ac|, 拟合摆幅)``，避免 θ* 吃掉包络后
+    |θ_ac| 假小；大静态平衡角且摆动已很小时仍只看残余（见 amp）。
     其它算法：相对原点的 ``max(|θ_x|, |θ_y|)``。
     """
     if anti_sway_mode == 'deepseek_anti' and anti_sway_debug is not None:
@@ -801,7 +818,10 @@ def settle_angle_peak_rad(
                 return None
             ac_x = float(anti_sway_debug.get('theta_ac_x_deg') or 0.0)
             ac_y = float(anti_sway_debug.get('theta_ac_y_deg') or 0.0)
-            return math.radians(max(abs(ac_x), abs(ac_y)))
+            amp_x = float(anti_sway_debug.get('amp_x_deg') or 0.0)
+            amp_y = float(anti_sway_debug.get('amp_y_deg') or 0.0)
+            peak_deg = max(abs(ac_x), abs(ac_y), amp_x, amp_y)
+            return math.radians(peak_deg)
     if theta_x is None or theta_y is None:
         return None
     return max(abs(theta_x), abs(theta_y))

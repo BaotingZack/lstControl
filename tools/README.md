@@ -15,5 +15,6 @@ python tools/_check_ptp_els.py
 | `_gen_ptp_sway_js.py` | 生成 Hook Sway 画布 JS |
 | `_patch_render_target_controls.py` | 修补 `view_shared`（路径现为 `web/view_shared.py`） |
 | `_dump_ptp_boot.py` / `_check_ptp_els.py` | 调试 PTP 页元素 |
+| `analyze_deepseek_settle.py` | 分析 `logs/run_log_settle_*.json`（deepseek 尾段/lead 诊断） |
 
 修改 Live 页时优先直接编辑 **`web/`** 下源文件；只有大规模重构时才考虑这些脚本。

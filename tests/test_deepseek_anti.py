@@ -75,6 +75,8 @@ def test_settle_peak_uses_residual_ac_when_ready():
         'ready': True,
         'theta_ac_x_deg': 0.12,
         'theta_ac_y_deg': -0.08,
+        'amp_x_deg': 0.06,
+        'amp_y_deg': 0.04,
     }
     theta_x = math.radians(2.0)
     theta_y = math.radians(-1.5)
@@ -87,6 +89,77 @@ def test_settle_peak_uses_residual_ac_when_ready():
     assert peak is not None and peak < tol
     raw_peak = max(abs(theta_x), abs(theta_y))
     assert raw_peak > tol
+
+
+def test_settle_peak_includes_fitted_amplitude():
+    peak = settle_angle_peak_rad(
+        theta_x=0.01,
+        theta_y=0.01,
+        anti_sway_mode='deepseek_anti',
+        anti_sway_debug={
+            'mode': 'deepseek_anti',
+            'ready': True,
+            'theta_ac_x_deg': 0.03,
+            'theta_ac_y_deg': 0.02,
+            'amp_x_deg': 0.18,
+            'amp_y_deg': 0.05,
+        },
+    )
+    assert peak is not None
+    assert abs(math.degrees(peak) - 0.18) < 1e-9
+
+
+def test_static_freeze_holds_theta_star_when_amp_small():
+    est = _AxisStaticEstimator(
+        window_periods=1.1,
+        static_freeze_amp_rad=math.radians(0.22),
+    )
+    omega = math.sqrt(G / 3.57)
+    dt = 0.1
+    bias = math.radians(0.2)
+    small = math.radians(0.08)
+    for i in range(120):
+        t = i * dt
+        y = bias + small * math.sin(omega * t)
+        est.update(y, dt, omega)
+    assert est.ready
+    assert est._static_frozen
+    frozen = est.static
+    est.update(bias + small, dt, omega)
+    assert est.static == frozen
+
+
+def test_lead_taper_reduces_small_residual():
+    ctrl = DeepseekAntiController(
+        RopeLengthModel(4.0), lead_s=1.5, lead_taper_ac_deg=0.35, lead_off_ac_deg=0.12,
+    )
+    full = ctrl._lead_taper(1.5, math.radians(0.4))
+    small = ctrl._lead_taper(1.5, math.radians(0.05))
+    assert abs(full - 1.5) < 1e-9
+    assert small == 0.0
+
+
+def test_tail_ema_raises_ac_when_ls_flat():
+    ctrl = DeepseekAntiController(
+        RopeLengthModel(sheave_height=4.0), tail_ema_amp_deg=0.35, tail_ema_tau_s=1.0,
+    )
+    est = ctrl._est_x
+    omega = math.sqrt(G / 3.57)
+    bias = math.radians(0.5)
+    for i in range(150):
+        t = i * 0.08
+        est.update(bias + math.radians(0.04) * math.sin(omega * t), 0.08, omega)
+    est.static = bias
+    est.ready = True
+    theta_hi = bias + math.radians(0.04)
+    est.amplitude = math.radians(0.5)
+    ac_ls, _ = ctrl._axis_ac(est, theta_hi, 0.08, 'x')
+    assert abs(ac_ls) < math.radians(0.06)
+    est.amplitude = math.radians(0.03)
+    for _ in range(25):
+        ac_ema, ema_on = ctrl._axis_ac(est, theta_hi, 0.08, 'x')
+    assert ema_on
+    assert abs(ac_ema) > abs(ac_ls)
 
 
 def test_settle_peak_not_ready_blocks_completion_metric():
@@ -265,10 +338,12 @@ def test_model_rate_is_analytic_derivative():
 def test_lead_term_adds_derivative_action():
     rope = RopeLengthModel(sheave_height=4.0)
     ctrl = DeepseekAntiController(rope, gain=2.6)
-    u_p = ctrl._law(0.01, 0.05, 2.6, 0.0, 1.0)
-    u_lead = ctrl._law(0.01, 0.05, 2.6, 1.5, 1.0)
+    omega = math.sqrt(G / 3.0)
+    L_long = 3.0
+    u_p = ctrl._law(0.01, 0.05, 2.6, 0.0, 1.0, omega, L_long)
+    u_lead = ctrl._law(0.01, 0.05, 2.6, 1.5, 1.0, omega, L_long)
     assert u_lead > u_p
-    u_neg = ctrl._law(0.01, -0.05, 2.6, 1.5, 1.0)
+    u_neg = ctrl._law(0.01, -0.05, 2.6, 1.5, 1.0, omega, L_long)
     assert u_neg < u_p
 
 
@@ -278,7 +353,67 @@ def test_gain_schedule_only_lowers_for_short_rope():
     assert abs(ctrl._effective_gain(3.65) - 2.6) < 1e-9      # 2.87 > 2.6，不上调
     assert ctrl._effective_gain(1.5) < 2.6                   # 短绳下调
     off = DeepseekAntiController(rope, gain=2.6, zeta_ref=0.0)
-    assert off._effective_gain(1.5) == 2.6
+    assert off._effective_gain(3.0) == 2.6
+    assert off._effective_gain(2.6) == 2.6                    # 长绳不调
+    assert off._effective_gain(1.5) > 2.6                    # 仅短绳上调
+
+
+def test_short_rope_ready_earlier_than_fixed_min_window():
+    omega_short = math.sqrt(G / 1.2)
+    est_short = _AxisStaticEstimator(
+        window_periods=1.1, min_window_s=2.0, min_window_periods=0.85,
+    )
+    est_long = _AxisStaticEstimator(
+        window_periods=1.1, min_window_s=2.0, min_window_periods=0.85,
+    )
+    omega_long = math.sqrt(G / 3.5)
+    dt = 0.1
+    t_short = t_long = None
+    amp = math.radians(4.0)
+    for i in range(400):
+        if t_short is None and est_short.control_ready():
+            t_short = i * dt
+        if t_long is None and est_long.control_ready():
+            t_long = i * dt
+        est_short.update(amp * math.cos(omega_short * i * dt), dt, omega_short)
+        est_long.update(amp * math.cos(omega_long * i * dt), dt, omega_long)
+    assert t_short is not None and t_long is not None
+    assert t_short < t_long
+
+
+def test_effective_lead_scales_down_for_shorter_rope():
+    rope = RopeLengthModel(sheave_height=4.0)
+    ctrl = DeepseekAntiController(
+        rope, lead_s=1.5, lead_rope_ref_m=3.5, lead_rope_exp=1.25,
+    )
+    assert abs(ctrl._effective_lead(1.5, 3.6, False) - 1.5) < 1e-9
+    short = ctrl._effective_lead(1.5, 2.48, False)
+    assert 0.8 <= short <= 1.05
+    assert short < 1.5
+
+
+def test_lead_cap_only_on_short_rope():
+    rope = RopeLengthModel(sheave_height=4.0)
+    L_short = 1.2
+    L_long = 3.2
+    rate_hi = 0.12
+    ctrl = DeepseekAntiController(
+        rope, lead_ac_cap_ratio=1.0, rope_short_m=2.35, gain=1.0, guard_enabled=False,
+    )
+    ac = 0.02
+    eff_long = ctrl._combined_ac(
+        ac, rate_hi, math.sqrt(G / L_long), 1.5, L_long,
+    )
+    eff_short_big = ctrl._combined_ac(
+        ac, rate_hi, math.sqrt(G / L_short), 1.5, L_short,
+    )
+    ac_small = math.radians(0.1)
+    eff_short_tail = ctrl._combined_ac(
+        ac_small, rate_hi, math.sqrt(G / L_short), 1.5, L_short,
+    )
+    assert abs(eff_long - (ac + 1.5 * rate_hi)) < 1e-9
+    assert abs(eff_short_big) < abs(eff_long)
+    assert abs(eff_short_tail - (ac_small + 1.5 * rate_hi)) < 1e-9
 
 
 def test_shift_budget_blocks_correction():

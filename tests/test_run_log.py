@@ -11,6 +11,8 @@ from live_server import ControlState, CraneLiveServer
 from web.run_log import (
     SETTLE_LOG_INTERVAL_S,
     SETTLE_STEPS_SCHEMA,
+    SETTLE_TAIL_LOG_INTERVAL_S,
+    analyze_deepseek_settle_steps,
     auto_save_run_log,
     build_run_log_document,
     run_status,
@@ -109,6 +111,117 @@ def test_settle_step_worth_recording_interval():
     assert settle_step_worth_recording(
         {'t': SETTLE_LOG_INTERVAL_S}, last_log_t=0.0,
     ) is True
+
+
+def test_slim_settle_deepseek_debug_fields():
+    slim = slim_settle_step({
+        't': 2.0,
+        'theta_x': 0.01,
+        'theta_y': 0.0,
+        'z_measured': 1.52,
+        'antisway_dvx': 0.02,
+        'anti_sway_debug': {
+            'mode': 'deepseek_anti',
+            'theta_ac_x_deg': 0.3,
+            'theta_ac_y_deg': -0.1,
+            'ready': True,
+            'lead_s': 0.95,
+            'rope_m': 2.48,
+            'rate_x_deg_s': 1.2,
+            'guard_trips': 0,
+        },
+    })
+    assert slim['z_grab'] == 1.52
+    assert slim['theta_ac_peak_deg'] == 0.3
+    assert slim['lead_s_eff'] == 0.95
+
+
+def test_settle_tail_burst_recording_deepseek():
+    base = {
+        'theta_x': 0.001,
+        'theta_y': 0.0,
+        'anti_sway_debug': {
+            'mode': 'deepseek_anti',
+            'ready': True,
+            'theta_ac_x_deg': 0.4,
+            'theta_ac_y_deg': 0.2,
+        },
+    }
+    assert settle_step_worth_recording(
+        {**base, 't': 0.8 + SETTLE_TAIL_LOG_INTERVAL_S},
+        last_log_t=0.8,
+    ) is True
+    assert settle_step_worth_recording(
+        {**base, 't': 0.9}, last_log_t=0.8,
+    ) is False
+    assert settle_step_worth_recording({**base, 't': 0.85}, last_log_t=0.8) is False
+
+
+def test_analyze_deepseek_settle_steps_emits_hints():
+    steps = [
+        {
+            't': 0.0,
+            'theta_peak_deg': 5.0,
+            'theta_ac_peak_deg': 4.8,
+            'rope_m': 2.4,
+            'lead_s_eff': 1.45,
+            'static_ready': False,
+            'rate_x_deg_s': 2.0,
+            'antisway_dvx': 0.1,
+            'guard_trips': 0,
+        },
+        {
+            't': 12.0,
+            'theta_peak_deg': 0.6,
+            'theta_ac_peak_deg': 0.55,
+            'rope_m': 2.4,
+            'lead_s_eff': 1.45,
+            'static_ready': True,
+            'rate_x_deg_s': 1.5,
+            'antisway_dvx': 0.0,
+            'guard_trips': 0,
+        },
+        {
+            't': 20.0,
+            'theta_peak_deg': 0.5,
+            'theta_ac_peak_deg': 0.4,
+            'rope_m': 2.4,
+            'lead_s_eff': 1.45,
+            'static_ready': True,
+            'rate_x_deg_s': 1.2,
+            'antisway_dvx': 0.0,
+            'guard_trips': 0,
+        },
+    ]
+    r = analyze_deepseek_settle_steps(
+        steps,
+        site={'hook_sway_angle_tol_deg': 0.05, 'anti_sway_deepseek_lead_rope_ref_m': 3.5},
+    )
+    assert r['ok']
+    assert r['tail_stall_frac'] > 0
+    assert any('lead' in h for h in r['hints'])
+
+
+def test_build_run_log_includes_deepseek_analysis():
+    cs = ControlState()
+    cs.begin_run(kind='settle', anti_sway_mode='deepseek_anti', sim=False)
+    cs.set_step({
+        't': 0.0,
+        'theta_x': 0.05,
+        'theta_y': 0.01,
+        'anti_sway_debug': {
+            'mode': 'deepseek_anti',
+            'ready': True,
+            'theta_ac_x_deg': 2.0,
+            'theta_ac_y_deg': 1.0,
+            'lead_s': 1.0,
+            'rope_m': 2.5,
+        },
+    })
+    cs.set_done()
+    doc = build_run_log_document(cs, site={'hook_sway_angle_tol_deg': 0.05})
+    assert doc['run']['steps_schema'] == SETTLE_STEPS_SCHEMA
+    assert doc['run']['deepseek_analysis']['ok'] is True
 
 
 def test_build_run_log_client_only_when_no_control_state():
