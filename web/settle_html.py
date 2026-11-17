@@ -15,14 +15,7 @@ _SETTLE_PAGE_BODY = """<body>
     <section class="stage">
       <canvas id="scene"></canvas>
       <div class="topbar">
-        <div class="topbar-left">
-          <h1>消摆测试</h1>
-          <div class="deepseek-card" id="staticAngleCard" hidden>
-            <span class="deepseek-card-title">静态角 θ*</span>
-            <span class="deepseek-stat"><i>θx*</i><b id="staticThetaX">--</b></span>
-            <span class="deepseek-stat"><i>θy*</i><b id="staticThetaY">--</b></span>
-          </div>
-        </div>
+        <h1>消摆测试</h1>
         <div class="top-actions platform-nav">
           __PLATFORM_NAV__
           <div class="badge" id="rate">—</div>
@@ -40,10 +33,8 @@ _SETTLE_PAGE_BODY = """<body>
       <section class="readout">
         <div class="phase" id="phase">Loading</div>
         <p class="settle-intro" id="settleIntro">
-          <strong>流程：</strong>大车/小车保持不动，人工推动抓钩晃起来；观察摆角衰减。
-          选择消摆算法后点击「开始消摆」（CraneRemote / 消摆基准）。
+          保持大车/小车不动，人工晃钩后点「开始消摆」；左侧看摆角靶标，右下角读倾角仪。
         </p>
-        <span class="settle-status-pill" id="backendPill">消摆基准算法已接入（/api/start-settle）</span>
       </section>
       <section class="command">
         <div class="command-title">Anti-sway / 消摆算法</div>
@@ -76,6 +67,23 @@ _SETTLE_PAGE_BODY = """<body>
             <div class="loco-val" id="thetaPeak">--</div>
             <div class="loco-val" id="swayAge">--</div>
           </div>
+          <div class="inclinometer-deepseek" id="deepseekInclinometerExtra" hidden>
+            <div class="inclinometer-deepseek-title">deepseek · θ* 与残余</div>
+            <div class="loco-table inclinometer-deepseek-table">
+              <div class="loco-hdr"></div>
+              <div class="loco-hdr">静态 θ*</div>
+              <div class="loco-hdr">θ_ac</div>
+              <div class="loco-axis">θx</div>
+              <div class="loco-val" id="thetaStaticX">--</div>
+              <div class="loco-val" id="thetaAcX">--</div>
+              <div class="loco-axis">θy</div>
+              <div class="loco-val" id="thetaStaticY">--</div>
+              <div class="loco-val" id="thetaAcY">--</div>
+              <div class="loco-axis">|θ_ac|</div>
+              <div class="loco-val" id="thetaAcPeak">--</div>
+              <div class="loco-val" id="deepseekReady">--</div>
+            </div>
+          </div>
         </div>
         <div class="tab-panel" id="tab-control">
           <div class="plc-status-bar">
@@ -107,48 +115,22 @@ _SETTLE_PAGE_BODY = """<body>
 """
 
 _SETTLE_EXTRA_CSS = """
-    .topbar-left {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      min-width: 0;
-      flex: 0 1 auto;
-      pointer-events: none;
+    .shell.settle-focus .bottom-panel {
+      margin-top: auto;
     }
-    .topbar-left h1 {
-      flex: 0 0 auto;
-      white-space: nowrap;   /* 不能被静态角卡片挤成竖排 */
+    .inclinometer-deepseek {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--line);
     }
-    .deepseek-card {
-      display: flex;
-      align-items: baseline;
-      gap: 10px;
-      padding: 5px 10px;
-      border: 1px solid #3f6f9c;
-      border-radius: 5px;
-      background: rgba(23, 33, 43, 0.92);
-      font-size: 12px;
-      white-space: nowrap;
-      overflow: hidden;
-      flex: 0 0 auto;   /* 不许被 platform-nav / h1 挤压没 */
-    }
-    @media (max-width: 1280px) {
-      .deepseek-card .deepseek-card-title { display: none; }
-    }
-    .deepseek-card[hidden] { display: none; }
-    .deepseek-card-title { color: #8fd3ff; font-weight: 700; }
-    .deepseek-stat { color: #8a9bab; }
-    .deepseek-stat i { font-style: normal; margin-right: 4px; }
-    .deepseek-stat b {
-      color: #dce7ee;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-weight: 700;
-    }
-    .deepseek-card-meta {
-      color: #6b7c8c;
+    .inclinometer-deepseek[hidden] { display: none; }
+    .inclinometer-deepseek-title {
       font-size: 11px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-weight: 700;
+      color: #8fd3ff;
+      margin-bottom: 6px;
     }
+    .inclinometer-deepseek-table { margin-top: 0; }
 """
 
 
@@ -184,15 +166,33 @@ _SETTLE_CANVAS_HELPERS = """
 """
 
 _SETTLE_DRAW = """
-    /** 与 drawHookSway() 内部布局保持一致，用于把 θ* 标到同一个十字靶标上。 */
+    /** 消摆页专用：全高摆角靶标，无画布底部倾角条。 */
+    function drawSettleHookSway(box) {
+      var swayTitle = box.w < 320 ? 'Hook Sway' : 'Hook Sway / 抓钩摆角';
+      drawPanel(box, swayTitle);
+      var sway = _liveSwayState;
+      var tol = (sway && sway.tol_deg != null) ? sway.tol_deg : SWAY_TOL_DEG;
+      var valid = !!(sway && sway.valid);
+      var thetaX = valid ? sway.theta_x_deg : null;
+      var thetaY = valid ? sway.theta_y_deg : null;
+      var pad = 8;
+      var crossArea = {
+        x: box.x + pad,
+        y: box.y + pad,
+        w: Math.max(60, box.w - pad * 2),
+        h: Math.max(60, box.h - pad * 2),
+      };
+      drawSwayCross(crossArea, thetaX, thetaY, tol);
+    }
+
+    /** 摆角靶标几何（与 drawSettleHookSway 一致）。 */
     function swayCrossGeometry(box) {
       var pad = 8;
-      var infoH = 40 + 6 + 3 * 14 + 10;
       var area = {
         x: box.x + pad,
         y: box.y + pad,
         w: Math.max(60, box.w - pad * 2),
-        h: Math.max(60, box.h - pad * 2 - infoH),
+        h: Math.max(60, box.h - pad * 2),
       };
       var leftGutter = Math.min(40, Math.max(30, area.w * 0.14));
       var topGutter = 16;
@@ -208,118 +208,196 @@ _SETTLE_DRAW = """
       };
     }
 
-    /** deepseek-anti：把估算的静态姿态 θ* 画在左侧摆角靶标上 + 数值卡片。 */
+    /** deepseek：绿菱形 θ* 标在十字靶标上（展示区右上角计时条不动）。 */
     function drawStaticPoseOverlay(box) {
       if (typeof getAntiSwayMode !== 'function') return;
       if (getAntiSwayMode() !== 'deepseek_anti') return;
       var g = swayCrossGeometry(box);
       var d = (typeof _staticAngleDebug !== 'undefined') ? _staticAngleDebug : null;
+      if (!d) return;
       var accent = '#6fe3b4';
+      var sxDeg = d.theta_static_y_deg || 0;
+      var syDeg = d.theta_static_x_deg || 0;
+      var tx = Math.max(-1, Math.min(1, sxDeg));
+      var ty = Math.max(-1, Math.min(1, syDeg));
+      var px = g.cx + tx * g.span;
+      var py = g.cy - ty * g.span;
 
-      if (d) {
-        var sxDeg = d.theta_static_y_deg || 0;
-        var syDeg = d.theta_static_x_deg || 0;
-        var tx = Math.max(-1, Math.min(1, sxDeg));
-        var ty = Math.max(-1, Math.min(1, syDeg));
-        var px = g.cx + tx * g.span;
-        var py = g.cy - ty * g.span;
+      ctx.save();
+      ctx.setLineDash([4, 4]);
+      ctx.strokeStyle = 'rgba(111, 227, 180, 0.75)';
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.moveTo(g.cx, g.cy);
+      ctx.lineTo(px, py);
+      ctx.stroke();
+      ctx.setLineDash([]);
 
-        ctx.save();
-        ctx.setLineDash([4, 4]);
-        ctx.strokeStyle = 'rgba(111, 227, 180, 0.75)';
-        ctx.lineWidth = 1.4;
+      var r = 7;
+      ctx.beginPath();
+      ctx.moveTo(px, py - r);
+      ctx.lineTo(px + r, py);
+      ctx.lineTo(px, py + r);
+      ctx.lineTo(px - r, py);
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(111, 227, 180, 0.22)';
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = accent;
+      ctx.stroke();
+
+      ctx.font = '700 11px system-ui, sans-serif';
+      ctx.fillStyle = accent;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('θ*', px + 11, py - 10);
+      ctx.restore();
+    }
+
+    /** 迷你十字靶：中心=θ*，圆点=θ_ac（仅图示，不标数值）。 */
+    function drawResidualMiniCross(plot, acXDeg, acYDeg, tol, opts) {
+      opts = opts || {};
+      var ready = !!opts.ready;
+      var hasAc = acXDeg != null && acYDeg != null && isFinite(acXDeg) && isFinite(acYDeg);
+      var peak = hasAc ? Math.max(Math.abs(acXDeg), Math.abs(acYDeg)) : 0;
+      var fullScaleDeg = Math.max(0.2, Math.min(1.0, Math.max(peak * 1.2, tol * 2, 0.15)));
+      var cx = plot.x + plot.w / 2;
+      var cy = plot.y + plot.h / 2;
+      var span = Math.max(14, Math.min(plot.w, plot.h) / 2 - 6);
+      var pxPerDeg = span / fullScaleDeg;
+      var toPx = function(deg) {
+        return Math.max(-span, Math.min(span, deg * pxPerDeg));
+      };
+
+      ctx.fillStyle = '#0c1218';
+      ctx.fillRect(plot.x, plot.y, plot.w, plot.h);
+      ctx.strokeStyle = '#2a3947';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(plot.x + 0.5, plot.y + 0.5, plot.w - 1, plot.h - 1);
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(plot.x + 1, plot.y + 1, plot.w - 2, plot.h - 2);
+      ctx.clip();
+
+      var ringDegs = [tol, tol * 2, fullScaleDeg];
+      var ringStyles = [
+        { stroke: '#5ebd72', dash: [] },
+        { stroke: '#f0a83b', dash: [4, 3] },
+        { stroke: '#e86850', dash: [3, 3] },
+      ];
+      for (var ri = 0; ri < ringDegs.length; ri++) {
+        var rp = ringDegs[ri] * pxPerDeg;
+        if (rp < 2 || rp > span + 1) continue;
+        ctx.strokeStyle = ringStyles[ri].stroke;
+        ctx.setLineDash(ringStyles[ri].dash);
+        ctx.lineWidth = ri === 0 ? 1.5 : 1;
         ctx.beginPath();
-        ctx.moveTo(g.cx, g.cy);
+        ctx.arc(cx, cy, rp, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+
+      ctx.strokeStyle = 'rgba(142, 163, 184, 0.35)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(cx - span, cy);
+      ctx.lineTo(cx + span, cy);
+      ctx.moveTo(cx, cy - span);
+      ctx.lineTo(cx, cy + span);
+      ctx.stroke();
+
+      // θ* 固定在原点
+      ctx.fillStyle = 'rgba(111, 227, 180, 0.35)';
+      ctx.beginPath();
+      ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#6fe3b4';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      if (hasAc) {
+        var px = cx + toPx(acYDeg);
+        var py = cy - toPx(acXDeg);
+        var col = swayAngleColor(peak, tol);
+        ctx.setLineDash([3, 3]);
+        ctx.strokeStyle = 'rgba(220, 231, 238, 0.35)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
         ctx.lineTo(px, py);
         ctx.stroke();
         ctx.setLineDash([]);
-
-        var r = 7;
+        dot({ x: px, y: py }, col, 5);
+      } else if (!ready) {
+        ctx.fillStyle = 'rgba(145, 163, 179, 0.25)';
         ctx.beginPath();
-        ctx.moveTo(px, py - r);
-        ctx.lineTo(px + r, py);
-        ctx.lineTo(px, py + r);
-        ctx.lineTo(px - r, py);
-        ctx.closePath();
-        ctx.fillStyle = 'rgba(111, 227, 180, 0.22)';
+        ctx.arc(cx, cy, 3, 0, Math.PI * 2);
         ctx.fill();
-        ctx.lineWidth = 2;
-        ctx.strokeStyle = accent;
-        ctx.stroke();
-
-        ctx.font = '700 11px system-ui, sans-serif';
-        ctx.fillStyle = accent;
-        ctx.textAlign = 'left';
-        ctx.textBaseline = 'middle';
-        ctx.fillText('θ*', px + 11, py - 10);
-        ctx.restore();
       }
 
-      var cw = 252;
-      var ch = 112;
-      var cx0 = g.area.x + g.area.w - cw - 8;
-      if (cx0 < g.area.x + 8) cx0 = g.area.x + 8;
-      var cy0 = g.area.y + 8;
+      ctx.restore();
+
+      // 图例：绿点=θ*，彩点=θ_ac
+      var legY = plot.y + plot.h - 5;
+      ctx.fillStyle = '#6fe3b4';
+      ctx.beginPath();
+      ctx.arc(plot.x + 10, legY, 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = hasAc ? swayAngleColor(peak, tol) : '#91a3b3';
+      ctx.beginPath();
+      ctx.arc(plot.x + 28, legY, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    /** 展示区右下角：θ_ac 迷你十字靶（deepseek）。 */
+    function drawStaticResidualOverlay(box) {
+      if (typeof getAntiSwayMode !== 'function') return;
+      if (getAntiSwayMode() !== 'deepseek_anti') return;
+      var g = swayCrossGeometry(box);
+      var d = (typeof _staticAngleDebug !== 'undefined') ? _staticAngleDebug : null;
+      var sway = _liveSwayState;
+      var tol = (sway && sway.tol_deg != null) ? sway.tol_deg : SWAY_TOL_DEG;
+      var panelSize = Math.min(172, Math.max(132, Math.min(g.area.w, g.area.h) * 0.36));
+      var titleH = 16;
+      var cx0 = g.area.x + g.area.w - panelSize - 8;
+      var cy0 = g.area.y + g.area.h - panelSize - titleH - 8;
+      var ready = !!(d && d.ready_x && d.ready_y);
+      var frameCol = !d ? '#2f5f80' : (ready ? '#5ebd72' : '#f0a83b');
 
       ctx.save();
-      ctx.fillStyle = 'rgba(6, 14, 20, 0.9)';
-      ctx.strokeStyle = '#2f5f80';
-      ctx.lineWidth = 1;
-      ctx.fillRect(cx0, cy0, cw, ch);
-      ctx.strokeRect(cx0 + 0.5, cy0 + 0.5, cw - 1, ch - 1);
+      ctx.fillStyle = 'rgba(6, 14, 20, 0.92)';
+      ctx.strokeStyle = frameCol;
+      ctx.lineWidth = ready ? 2 : 1;
+      ctx.fillRect(cx0, cy0, panelSize, panelSize + titleH);
+      ctx.strokeRect(cx0 + 0.5, cy0 + 0.5, panelSize - 1, panelSize + titleH - 1);
 
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'alphabetic';
-      ctx.font = '700 11px system-ui, sans-serif';
+      ctx.font = '700 10px system-ui, sans-serif';
       ctx.fillStyle = '#8fd3ff';
-      ctx.fillText('静态姿态 θ* · deepseek-anti', cx0 + 9, cy0 + 15);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('θ_ac', cx0 + 8, cy0 + 10);
 
-      var colW = (cw - 18) / 2;
-      var x1 = cx0 + 9;
-      var x2 = cx0 + 9 + colW;
-      function cell(label, value, x, y, color) {
-        ctx.font = '600 10px system-ui, sans-serif';
-        ctx.fillStyle = '#8a9bab';
-        ctx.fillText(label, x, y);
-        ctx.font = '700 12px ui-monospace, SFMono-Regular, Menlo, monospace';
-        ctx.fillStyle = color || '#dce7ee';
-        ctx.fillText(value, x + 40, y);
-      }
+      var plot = {
+        x: cx0 + 6,
+        y: cy0 + titleH + 2,
+        w: panelSize - 12,
+        h: panelSize - 12,
+      };
 
-      if (!d) {
-        ctx.font = '700 11px system-ui, sans-serif';
-        ctx.fillStyle = '#91a3b3';
-        ctx.fillText('开始消摆后估计', x1, cy0 + 38);
-      } else {
-        var ready = !!(d.ready_x && d.ready_y);
-        var amp = Math.max(d.amp_x_deg || 0, d.amp_y_deg || 0);
-        var cov = Math.min(1, Math.max(d.coverage_x || 0, d.coverage_y || 0));
-        cell('θx*', fmtSignedDeg(d.theta_static_x_deg), x1, cy0 + 34);
-        cell('θy*', fmtSignedDeg(d.theta_static_y_deg), x2, cy0 + 34);
-        cell('ωx', fmtSignedNum(d.rate_x_deg_s, 1) + '°/s', x1, cy0 + 54, '#59a7e8');
-        cell('Δvx', fmtSignedNum(d.dv_x, 3), x2, cy0 + 54, '#f0a83b');
-        cell('ωy', fmtSignedNum(d.rate_y_deg_s, 1) + '°/s', x1, cy0 + 74, '#59a7e8');
-        cell('Δvy', fmtSignedNum(d.dv_y, 3), x2, cy0 + 74, '#f0a83b');
-        var status;
-        var statusColor;
-        if (d.budget_blocked) {
-          status = '位移预算暂停 (' + (d.dist_xy || 0).toFixed(2) + ' m)';
-          statusColor = '#e05a47';
-        } else if (d.guard_x || d.guard_y) {
-          status = '增长保护暂停';
-          statusColor = '#e05a47';
-        } else if (ready) {
-          status = '已收敛 · 摆幅 ' + amp.toFixed(2) + '° · K ' + (d.gain_eff || 0).toFixed(2)
-            + ' · lead ' + (d.lead_s || 0).toFixed(1) + 's';
-          statusColor = '#5ebd72';
-        } else {
-          status = '估计中 ' + Math.round(cov * 100) + '% · 周期 ' + (d.period_s || 0).toFixed(1) + 's';
-          statusColor = '#f0a83b';
+      var acX = null;
+      var acY = null;
+      if (d) {
+        acX = d.theta_ac_x_deg;
+        acY = d.theta_ac_y_deg;
+        if (acX == null && sway && sway.valid) {
+          acX = (sway.theta_x_deg || 0) - (d.theta_static_x_deg || 0);
         }
-        ctx.font = '700 10px system-ui, sans-serif';
-        ctx.fillStyle = statusColor;
-        ctx.fillText(truncateText(status, cw - 18), x1, cy0 + 98);
+        if (acY == null && sway && sway.valid) {
+          acY = (sway.theta_y_deg || 0) - (d.theta_static_y_deg || 0);
+        }
       }
+      drawResidualMiniCross(plot, acX, acY, tol, { ready: ready });
       ctx.restore();
     }
 
@@ -328,15 +406,15 @@ _SETTLE_DRAW = """
       ctx.clearRect(0, 0, rect.width, rect.height);
       ctx.fillStyle = '#060a0e';
       ctx.fillRect(0, 0, rect.width, rect.height);
-      // 顶部留出 topbar（标题 + 静态角卡片）的高度，避免标题叠在一起
       var box = {
-        x: 14, y: 78,
+        x: 14, y: 52,
         w: Math.max(200, rect.width - 28),
-        h: Math.max(280, rect.height - 92),
+        h: Math.max(280, rect.height - 66),
       };
-      drawHookSway(box);
+      drawSettleHookSway(box);
       drawSettleBaselineOverlay(box);
       drawStaticPoseOverlay(box);
+      drawStaticResidualOverlay(box);
     }
 
     /** 消摆开始头几秒锁定的初始最大摆角：靶心上画参考圈 + 峰值时刻的方向点。 */
@@ -444,9 +522,13 @@ _SETTLE_BOOT = """
       ctrlGrip: document.getElementById('ctrlGrip'),
       btnStop: document.getElementById('btnStop'),
       btnReset: document.getElementById('btnReset'),
-      staticAngleCard: document.getElementById('staticAngleCard'),
-      staticThetaX: document.getElementById('staticThetaX'),
-      staticThetaY: document.getElementById('staticThetaY'),
+      deepseekInclinometerExtra: document.getElementById('deepseekInclinometerExtra'),
+      thetaStaticX: document.getElementById('thetaStaticX'),
+      thetaStaticY: document.getElementById('thetaStaticY'),
+      thetaAcX: document.getElementById('thetaAcX'),
+      thetaAcY: document.getElementById('thetaAcY'),
+      thetaAcPeak: document.getElementById('thetaAcPeak'),
+      deepseekReady: document.getElementById('deepseekReady'),
     };
 
     let _staticAngleDebug = null;
@@ -461,32 +543,42 @@ _SETTLE_BOOT = """
       return fmtSignedNum(v, 3) + '°';
     }
 
-    /** deepseek-anti 的静态倾角估计 → 左侧顶栏卡片。其它算法隐藏。 */
-    function updateStaticAngleCard() {
-      var card = els.staticAngleCard;
-      if (!card) return;
+    /** deepseek：倾角仪 Tab 右下角补充 θ* / θ_ac。 */
+    function updateDeepseekInclinometerPanel() {
+      var box = els.deepseekInclinometerExtra;
+      if (!box) return;
       var isDeepseek = getAntiSwayMode() === 'deepseek_anti';
-      card.hidden = !isDeepseek;
+      box.hidden = !isDeepseek;
       if (!isDeepseek) return;
       var d = _staticAngleDebug;
+      var sway = _liveSwayState;
+      var set = function(el, text) { if (el) el.textContent = text; };
       if (!d) {
-        els.staticThetaX.textContent = '--';
-        els.staticThetaY.textContent = '--';
-        card.title = _settleActive
-          ? '估计中…（需要累积约 1 个摆周期的数据）'
-          : 'θ* 需要先点「开始消摆」，运行中实时估计';
+        set(els.thetaStaticX, '--');
+        set(els.thetaStaticY, '--');
+        set(els.thetaAcX, '--');
+        set(els.thetaAcY, '--');
+        set(els.thetaAcPeak, '--');
+        set(els.deepseekReady, _settleActive ? '估计中' : '—');
         return;
       }
-      els.staticThetaX.textContent = fmtSignedDeg(d.theta_static_x_deg);
-      els.staticThetaY.textContent = fmtSignedDeg(d.theta_static_y_deg);
+      set(els.thetaStaticX, fmtSignedDeg(d.theta_static_x_deg));
+      set(els.thetaStaticY, fmtSignedDeg(d.theta_static_y_deg));
+      var acX = d.theta_ac_x_deg;
+      var acY = d.theta_ac_y_deg;
+      if (acX == null && sway && sway.valid) {
+        acX = (sway.theta_x_deg || 0) - (d.theta_static_x_deg || 0);
+      }
+      if (acY == null && sway && sway.valid) {
+        acY = (sway.theta_y_deg || 0) - (d.theta_static_y_deg || 0);
+      }
+      var peak = Math.max(Math.abs(acX || 0), Math.abs(acY || 0));
+      set(els.thetaAcX, acX == null ? '--' : fmtSignedDeg(acX));
+      set(els.thetaAcY, acY == null ? '--' : fmtSignedDeg(acY));
+      set(els.thetaAcPeak, peak.toFixed(3) + '°');
       var ready = !!(d.ready_x && d.ready_y);
       var cov = Math.min(1, Math.max(d.coverage_x || 0, d.coverage_y || 0));
-      var amp = Math.max(d.amp_x_deg || 0, d.amp_y_deg || 0);
-      var rms = Math.max(d.rms_x_deg || 0, d.rms_y_deg || 0);
-      var period = d.period_s ? d.period_s.toFixed(1) + 's' : '--';
-      card.title = ready
-        ? ('已收敛 · 摆幅 ' + amp.toFixed(2) + '° · 残差 ' + rms.toFixed(2) + '°')
-        : ('估计中 ' + Math.round(cov * 100) + '% · 周期 ' + period);
+      set(els.deepseekReady, ready ? '已收敛' : ('估计 ' + Math.round(cov * 100) + '%'));
     }
 
     function updateAntiSwayHint() {
@@ -517,11 +609,12 @@ _SETTLE_BOOT = """
     if (els.antiSwayMode) {
       els.antiSwayMode.addEventListener('change', function() {
         updateAntiSwayHint();
-        updateStaticAngleCard();
+        updateDeepseekInclinometerPanel();
+        draw();
         syncQueryAntiSwayMode();
       });
       updateAntiSwayHint();
-      updateStaticAngleCard();
+      updateDeepseekInclinometerPanel();
     }
 
     function syncQueryAntiSwayMode() {
@@ -537,7 +630,7 @@ _SETTLE_BOOT = """
       const asm = params.get('anti_sway_mode');
       if (asm) setAntiSwayMode(asm);
       else syncQueryAntiSwayMode();
-      updateStaticAngleCard();   // 模式可能来自 URL query，需在设置后刷新一次
+      updateDeepseekInclinometerPanel();
     })();
 
     function showCommandMsg(text, color) {
@@ -631,6 +724,7 @@ _SETTLE_BOOT = """
         els.rawPitch.textContent = s.pitch != null ? s.pitch.toFixed(3) : '--';
         els.rawRoll.textContent = s.roll != null ? s.roll.toFixed(3) : '--';
         els.swayAge.textContent = s.age_ms != null ? (s.age_ms + ' ms') : '--';
+        updateDeepseekInclinometerPanel();
       } else {
         els.swayStatus.textContent = s && s.stale ? '倾角仪断流' : '等待倾角仪...';
         els.swayStatus.style.color = '#e05a47';
@@ -690,7 +784,8 @@ _SETTLE_BOOT = """
           } else if (!s.running) {
             _staticAngleDebug = null;
           }
-          updateStaticAngleCard();
+          updateDeepseekInclinometerPanel();
+          draw();
           if (!PLC_MODE && d && d.theta_x != null && d.theta_y != null) {
             var k = 180 / Math.PI;
             syncSwayFromSnapshot({
@@ -728,7 +823,7 @@ _SETTLE_BOOT = """
       var mode = getAntiSwayMode();
       if (typeof resetRunLogReady === 'function') resetRunLogReady();
       _staticAngleDebug = null;
-      updateStaticAngleCard();
+      updateDeepseekInclinometerPanel();
       resetSettleMetrics();
       _swayFrames.length = 0;
       showCommandMsg('启动中...', '#91a3b3');

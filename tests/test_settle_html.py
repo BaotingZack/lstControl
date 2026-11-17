@@ -13,6 +13,10 @@ def test_settle_sim_page():
     assert 'settleElapsed' in html
     assert 'settleInitialPeak' in html
     assert 'drawSettleBaselineOverlay' in html
+    assert 'drawStaticResidualOverlay' in html
+    assert 'drawSettleHookSway' in html
+    assert 'deepseekInclinometerExtra' in html
+    assert 'staticAngleCard' not in html
     assert '初始最大' in html
     assert 'value="crane_remote"' in html
     assert 'value="baseline"' in html
