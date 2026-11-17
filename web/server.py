@@ -1780,7 +1780,7 @@ class _LiveRequestHandler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError):
             req = {}
 
-        anti_sway_mode = 'baseline'
+        anti_sway_mode = 'deepseek_anti'
         if isinstance(req, dict):
             raw = req.get('anti_sway_mode')
             if isinstance(raw, str) and raw.strip().lower() in SETTLE_ALGORITHM_IDS:

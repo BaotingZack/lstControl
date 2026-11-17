@@ -14,11 +14,20 @@ def test_settle_sim_page():
     assert 'settleInitialPeak' in html
     assert 'drawSettleBaselineOverlay' in html
     assert 'drawStaticResidualOverlay' in html
+    assert 'settleResidualWidget' in html
+    assert 'settleResidualResize' not in html
+    assert 'drawResidualMiniCross' in html
+    assert 'settle-stage-layout' in html
+    assert 'settleStageRail' in html
+    assert 'stageHudPeak' in html
+    assert 'updateStageHud' in html
+    assert 'syncSettleStageLayout' in html
     assert 'drawSettleHookSway' in html
     assert 'deepseekInclinometerExtra' in html
     assert 'staticAngleCard' not in html
     assert '初始最大' in html
-    assert 'value="crane_remote"' in html
+    assert 'value="deepseek_anti"' in html and ' selected>' in html.split('deepseek_anti', 1)[1]
+    assert 'btnSaveRunLog' not in html
     assert 'value="baseline"' in html
     assert 'value="gantry_settle"' in html
     assert 'value="overhead_settle"' in html
